@@ -1,10 +1,78 @@
-"""routes_market — SPEC 7.1. Mounted in a later phase (DECISIONS.md D-012).
+"""routes_market — SPEC §7.1 market endpoints (Phase 2).
 
-Phase 0 keeps this as an unmounted stub.
+GET /api/candles?tf=M15&limit=500  (auth) closed-bars OHLCV backfill
+GET /api/positions                 (auth) open MT5 positions
 """
 
-from fastapi import APIRouter
+from __future__ import annotations
 
-router = APIRouter()
+from fastapi import APIRouter, HTTPException, Query, Request
 
-# TODO(phase-1..4): implement endpoints per SPEC 7.1.
+from app.auth import CurrentUser
+from app.mt5.base import validate_tf
+
+router = APIRouter(prefix="/api", tags=["market"])
+
+
+@router.get("/candles")
+async def candles(
+    request: Request,
+    user: CurrentUser,
+    tf: str = Query(default="M15", max_length=4),
+    limit: int = Query(default=500, ge=10, le=1500),
+) -> dict:
+    try:
+        validate_tf(tf)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    mgr = request.app.state.mt5
+    if mgr.state.status != "connected" or not mgr.symbol:
+        raise HTTPException(
+            status_code=409,
+            detail="MT5 not connected — connect first (POST /api/mt5/connect)",
+        )
+    try:
+        df = await mgr.source.get_rates(mgr.symbol, tf, limit)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"get_rates failed: {exc}") from exc
+    bars = [
+        {
+            "t": int(ts.timestamp()),
+            "o": float(o),
+            "h": float(h),
+            "l": float(low),
+            "c": float(c),
+            "v": int(v),
+        }
+        for ts, o, h, low, c, v in zip(
+            df["time_utc"], df["o"], df["h"], df["l"], df["c"], df["v"], strict=True
+        )
+    ]
+    return {"symbol": mgr.symbol, "tf": tf, "count": len(bars), "candles": bars}
+
+
+@router.get("/positions")
+async def positions(request: Request, user: CurrentUser) -> dict:
+    mgr = request.app.state.mt5
+    if mgr.state.status != "connected":
+        return {"positions": []}
+    try:
+        rows = await mgr.get_positions()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"positions failed: {exc}") from exc
+    return {
+        "positions": [
+            {
+                "ticket": p.ticket,
+                "symbol": p.symbol,
+                "side": p.side,
+                "volume": p.volume,
+                "price_open": p.price_open,
+                "sl": p.sl,
+                "tp": p.tp,
+                "profit": p.profit,
+                "time": p.time.isoformat(),
+            }
+            for p in rows
+        ]
+    }

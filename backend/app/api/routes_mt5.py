@@ -1,10 +1,47 @@
-"""routes_mt5 — SPEC 7.1. Mounted in a later phase (DECISIONS.md D-012).
+"""routes_mt5 — SPEC §7.1 mt5 endpoints (Phase 2).
 
-Phase 0 keeps this as an unmounted stub.
+POST /api/mt5/connect     (admin) connect + discover symbol + start engine
+POST /api/mt5/disconnect  (admin) clean shutdown
+GET  /api/mt5/status      (auth)  {status, symbol, account, broker offset}
 """
 
-from fastapi import APIRouter
+from __future__ import annotations
 
-router = APIRouter()
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 
-# TODO(phase-1..4): implement endpoints per SPEC 7.1.
+from app.auth import CurrentUser, require_admin
+
+router = APIRouter(prefix="/api/mt5", tags=["mt5"])
+
+
+class ConnectBody(BaseModel):
+    server: str = Field(min_length=1, max_length=200)
+    login: str = Field(min_length=1, max_length=32)
+    password: str = Field(min_length=1, max_length=200)
+    terminal_path: str | None = Field(default=None, max_length=500)
+
+
+def _manager(request: Request):
+    return request.app.state.mt5
+
+
+@router.post("/connect", dependencies=[Depends(require_admin)])
+async def mt5_connect(body: ConnectBody, request: Request) -> dict:
+    mgr = _manager(request)
+    try:
+        return await mgr.connect(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — DataSourceError etc -> 502
+        raise HTTPException(status_code=502, detail=f"MT5 connect failed: {exc}") from exc
+
+
+@router.post("/disconnect", dependencies=[Depends(require_admin)])
+async def mt5_disconnect(request: Request) -> dict:
+    return await _manager(request).disconnect()
+
+
+@router.get("/status")
+async def mt5_status(request: Request, user: CurrentUser) -> dict:
+    return await _manager(request).status()

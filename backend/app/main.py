@@ -1,17 +1,21 @@
 """FastAPI application entrypoint (SPEC §7.1).
 
-Phase 1: public `GET /api/health`, authenticated `GET /api/me` (Supabase JWT
-via app.auth). Route modules from SPEC §5 mount in Phases 2–4 (D-012) — every
-new /api router MUST carry `dependencies=[Depends(get_current_user)]` (or
-per-route guards) so the "all /api except /health require Bearer JWT" rule
-from §7.1 stays true, and must be mounted BEFORE the SPA catch-all.
+Phase 2/3: market data (candles/WS streaming), MT5 connection manager with
+the engine runtime (tick -> bar -> SFP signal), signal/config/stats/logs REST
+routes. Every /api router (except /api/health) carries the CurrentUser guard;
+/ws authenticates via ?token= query param. All routers mount BEFORE the SPA
+catch-all.
 
 Deployment (D-016): when STATIC_DIR points at a built SPA, it is served at "/"
 with a history-mode fallback — the Railway single-service image.
+
+Demo mode (D-018): with DATA_SOURCE=mock the ConnectionManager auto-connects
+at startup so the dashboard streams immediately (Phase 2 mock AC).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,10 +26,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.api import (
+    routes_config,
+    routes_logs,
+    routes_market,
+    routes_mt5,
+    routes_signals,
+    routes_stats,
+    ws,
+)
 from app.auth import CurrentUser
 from app.config import Settings, get_settings
 from app.db import apply_schema, is_postgres_url, make_engine, promote_admins
+from app.engine.config import ConfigRepo
+from app.engine.repo import SignalRepo
 from app.mt5.connection import ConnectionManager, create_data_source
+from app.services.news import NewsService, NullNewsService
+from app.services.ws_hub import WSHub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("xauusd")
@@ -36,7 +53,7 @@ async def lifespan(app: FastAPI):
     settings: Settings = get_settings()
     app.state.settings = settings
 
-    # --- Database: persistent engine (auth role lookups; Phase 2+ state) ---
+    # --- Database: persistent engine (auth role lookups; signals/config state)
     app.state.db_engine = None
     app.state.db_ok = False
     if is_postgres_url(settings.database_url):
@@ -53,10 +70,49 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("DATABASE_URL not set — running without persistence (degraded mode)")
 
-    # --- Shared httpx client (Supabase auth checks; Phase 2+ external APIs) ---
+    # --- Shared httpx client (Supabase auth checks; external APIs)
     app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
 
-    app.state.mt5 = ConnectionManager(create_data_source(settings))
+    # --- Services: WS hub, news, repos, connection manager + engine runtime
+    app.state.hub = WSHub()
+    if settings.fmp_api_key:
+        app.state.news = NewsService(
+            http_factory=lambda: _get_http(app),
+            api_key=settings.fmp_api_key,
+        )
+    else:
+        app.state.news = NullNewsService()
+    app.state.config_repo = ConfigRepo()
+    app.state.signals = SignalRepo(app.state.db_engine)
+    app.state.mt5 = ConnectionManager(
+        source=create_data_source(settings),
+        settings=settings,
+        hub=app.state.hub,
+        db_engine=app.state.db_engine,
+        repo=app.state.signals,
+        news_service=app.state.news,
+        config_repo=app.state.config_repo,
+    )
+
+    # --- Structured logging -> logs table (best-effort, C6)
+    from app.api.routes_logs import DBLogHandler
+
+    root = logging.getLogger()
+    if not any(isinstance(h, DBLogHandler) for h in root.handlers):
+        root.addHandler(DBLogHandler(lambda: app.state.db_engine))
+
+    # --- D-018: mock auto-connect / mt5 stored-credential restore
+    if settings.data_source == "mock":
+        try:
+            await app.state.mt5.connect(
+                {"server": "MockServer", "login": "10000000", "password": "mock"}
+            )
+            logger.info("mock source auto-connected (D-018) — dashboard streams now")
+        except Exception:  # noqa: BLE001 — never block boot
+            logger.exception("mock auto-connect failed")
+    else:
+        asyncio.create_task(app.state.mt5.try_restore())
+
     logger.info(
         "startup complete: data_source=%s db=%s", settings.data_source, app.state.db_ok
     )
@@ -102,6 +158,20 @@ async def me(user: CurrentUser) -> dict:
     return user
 
 
+# --- Feature routers (all guarded per-route via CurrentUser deps) ---
+app.include_router(routes_mt5.router)
+app.include_router(routes_market.router)
+app.include_router(routes_signals.router)
+app.include_router(routes_config.router)
+app.include_router(routes_stats.router)
+app.include_router(routes_logs.router)
+app.include_router(ws.router)
+
+
+async def _get_http(app: FastAPI) -> httpx.AsyncClient:
+    return app.state.http
+
+
 class SPAStaticFiles(StaticFiles):
     """Serve the built SPA with history-mode fallback to index.html.
 
@@ -122,7 +192,7 @@ class SPAStaticFiles(StaticFiles):
 
 
 # Railway single-service deploy (D-016): serve the built SPA from the API
-# process. Mounted LAST — /api routes (and the future /ws) always win.
+# process. Mounted LAST — /api routes and /ws always win.
 _static_dir = _settings.static_dir
 if _static_dir and Path(_static_dir).is_dir():
     app.mount("/", SPAStaticFiles(directory=_static_dir, html=True), name="spa")

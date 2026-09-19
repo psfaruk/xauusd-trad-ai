@@ -97,6 +97,25 @@ class DataSource(ABC):
     async def get_rates(self, symbol: str, tf: str, count: int) -> pd.DataFrame:
         """Last `count` CLOSED bars of `tf` as a DataFrame with RATES_COLUMNS."""
 
+    def get_forming_bar(self, symbol: str, tf: str) -> dict | None:
+        """Current FORMING bar {t,o,h,l,c,v} or None (optional; sync or async).
+
+        Used by MarketStream to seed mid-bucket chart subscriptions.
+        """
+        return None
+
+    def account_info(self) -> dict | None:
+        """Account snapshot {login, server, balance, equity, currency, leverage}.
+
+        Optional (sync or async); None when not connected.
+        """
+        return None
+
+    @property
+    def broker_utc_offset_minutes(self) -> int:
+        """Broker server-time offset from UTC in minutes (C4; 0 for mock)."""
+        return 0
+
     @abstractmethod
     async def get_tick(self, symbol: str) -> Tick: ...
 

@@ -103,7 +103,11 @@ class MockDataSource(DataSource):
         self._anchor = (start_time or datetime.now(UTC)).replace(
             second=0, microsecond=0
         )
-        self._origin = self._anchor - timedelta(days=self.HISTORY_DAYS)
+        # Grid-align the origin to UTC midnight so M15/H1/D1 buckets share the
+        # SAME grid as epoch-aligned consumers (MarketStream, lightweight-charts)
+        # — otherwise buckets are offset by the anchor's minute-of-hour.
+        origin_raw = self._anchor - timedelta(days=self.HISTORY_DAYS)
+        self._origin = origin_raw.replace(hour=0, minute=0, second=0, microsecond=0)
         self._time_scale = float(time_scale)
         self._spread = float(spread)
         self._tick_interval = float(tick_interval)
@@ -320,6 +324,51 @@ class MockDataSource(DataSource):
 
     async def get_rates(self, symbol: str, tf: str, count: int) -> pd.DataFrame:
         return self._rates_sync(tf, count)
+
+    def get_forming_bar(self, symbol: str, tf: str) -> dict | None:
+        """Current forming tf-bar built from closed M1 minutes + live tick."""
+        tf_min = validate_tf(tf)
+        now = self._vnow()
+        cur_minute = int((now - self._origin).total_seconds() // 60)
+        bucket_start = cur_minute // tf_min * tf_min
+        self._ensure_m1(cur_minute - 1)
+        if cur_minute <= bucket_start:  # empty bucket edge
+            return None
+        o = self._o[bucket_start]
+        h = max(self._h[bucket_start:cur_minute])
+        low = min(self._l[bucket_start:cur_minute])
+        v = int(sum(self._v[bucket_start:cur_minute]))
+        # live forming minute: interpolate toward its target close
+        progress = min(max((now - self._origin).total_seconds() % 60.0 / 60.0, 0.0), 0.999)
+        rng = np.random.default_rng([self._seed, cur_minute])
+        z = rng.standard_normal(4)
+        sigma = self._sigma_for(cur_minute)
+        target = (
+            self._m1_overrides[cur_minute][3]
+            if cur_minute in self._m1_overrides
+            else self._c[cur_minute - 1] + sigma * float(z[0])
+        )
+        price = self._c[cur_minute - 1] + (target - self._c[cur_minute - 1]) * progress
+        return {
+            "t": int((self._origin + timedelta(minutes=bucket_start)).timestamp()),
+            "o": o,
+            "h": max(h, price),
+            "l": min(low, price),
+            "c": price,
+            "v": v,
+        }
+
+    def account_info(self) -> dict | None:
+        if not self._connected:
+            return None
+        return {
+            "login": "10000000",
+            "server": "MockServer",
+            "balance": self._account.balance,
+            "equity": self._account.equity,
+            "currency": self._account.currency,
+            "leverage": self._account.leverage,
+        }
 
     async def get_tick(self, symbol: str) -> Tick:
         now = self._vnow()
