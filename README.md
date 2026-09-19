@@ -9,12 +9,22 @@ recorded in [DECISIONS.md](./DECISIONS.md).
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 0 | Scaffold & infra | ✅ done (ACs verified) |
+| 0 | Scaffold & infra | ✅ done (ACs verified below) |
 | 1 | Auth (Supabase) | ⬜ next |
 | 2 | MT5 connection + chart | ⬜ |
 | 3 | Signal engine + panel | ⬜ |
 | 4 | Execution + risk | ⬜ |
 | 5 | Hardening + deploy | ⬜ |
+
+### Phase 0 — Acceptance Criteria verification
+
+| AC (SPEC §12 Phase 0) | Result |
+|---|---|
+| uvicorn boots | ✅ `scripts/start_backend.sh`, port 8000 |
+| `GET /api/health` → 200 | ✅ `{"status":"ok","version":"0.1.0","data_source":"mock","db":false}` |
+| Frontend dev server renders placeholder | ✅ Vite on :3000, browser-verified (dark/gold dashboard skeleton, live backend pill) |
+| pytest green on non-Windows machine | ✅ 23 passed, 0 failed (ruff clean; no `MetaTrader5` import at module load — covered by test) |
+| schema.sql applied idempotently | ✅ verified against embedded Postgres (pgserver) incl. §8.6 seed + `auto_trade=false` |
 
 ## Repository layout
 
@@ -57,7 +67,8 @@ npm run dev                      # http://localhost:3000 (/api proxied to :8000)
 ```bash
 cd backend
 source .venv/bin/activate
-pytest                           # schema test auto-skips without a reachable Postgres
+pytest        # schema test uses TEST_DATABASE_URL/DATABASE_URL (Postgres) or an
+              # embedded Postgres via pgserver; skips when neither is available
 ruff check .
 ```
 
