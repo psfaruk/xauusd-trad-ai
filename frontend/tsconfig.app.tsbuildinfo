@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/types.ts","./src/vite-env.d.ts","./src/components/TopBar.tsx","./src/lib/api.ts","./src/lib/supabase.ts","./src/lib/ws.ts","./src/pages/Dashboard.tsx","./src/pages/Login.tsx","./src/pages/ResetPassword.tsx"],"version":"5.9.3"}
