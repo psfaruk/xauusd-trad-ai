@@ -20,6 +20,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.auth import CurrentUser
 from app.config import Settings, get_settings
@@ -102,10 +103,19 @@ async def me(user: CurrentUser) -> dict:
 
 
 class SPAStaticFiles(StaticFiles):
-    """Serve the built SPA with history-mode fallback to index.html."""
+    """Serve the built SPA with history-mode fallback to index.html.
+
+    Newer Starlette raises HTTPException(404) from get_response instead of
+    returning a 404 response — catch it and retry with index.html.
+    """
 
     async def get_response(self, path: str, scope):  # type: ignore[override]
-        response = await super().get_response(path, scope)
+        try:
+            response = await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            response = await super().get_response("index.html", scope)
         if response.status_code == 404:
             response = await super().get_response("index.html", scope)
         return response
