@@ -15,3 +15,11 @@ export interface HealthInfo {
   data_source: "mock" | "mt5";
   db: boolean;
 }
+
+/** GET /api/me — profile + role (SPEC §7.1). */
+export interface MeInfo {
+  id: string;
+  email: string | null;
+  display_name: string | null;
+  role: "admin" | "viewer" | string;
+}

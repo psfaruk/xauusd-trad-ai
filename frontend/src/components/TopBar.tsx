@@ -1,14 +1,17 @@
 import { useEffect, useState } from "react";
 import { getHealth } from "../lib/api";
+import { useAuth } from "../lib/auth";
 
 type BackendState = "checking" | "up" | "down";
 
 /**
- * TopBar skeleton per SPEC §10: logo | symbol + status pill | balance/equity |
- * user | dot-menu. MT5 status, account numbers and the DotMenu arrive in
- * Phase 2/4.
+ * TopBar per SPEC §10: logo | symbol + status pill | balance/equity |
+ * user + sign-out | dot-menu. MT5 status, account numbers and the DotMenu
+ * arrive in Phase 2/4.
  */
 export default function TopBar() {
+  const { session, signOut } = useAuth();
+  const email = session?.user?.email ?? null;
   const [backend, setBackend] = useState<BackendState>("checking");
   const [source, setSource] = useState<string>("");
 
@@ -60,12 +63,20 @@ export default function TopBar() {
           balance <span className="font-semibold text-zinc-200">—</span> · equity{" "}
           <span className="font-semibold text-zinc-200">—</span>
         </span>
-        <span
-          aria-hidden
-          className="grid h-8 w-8 place-items-center rounded-full border border-zinc-700 bg-zinc-800 text-sm text-zinc-300"
-        >
-          👤
-        </span>
+        {email && (
+          <div className="flex items-center gap-2">
+            <span className="hidden max-w-[180px] truncate text-xs text-zinc-300 md:block">
+              {email}
+            </span>
+            <button
+              type="button"
+              onClick={() => void signOut()}
+              className="rounded-md border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 transition hover:border-gold/50 hover:text-gold"
+            >
+              Sign out
+            </button>
+          </div>
+        )}
         <span
           aria-hidden
           className="grid h-8 w-8 place-items-center rounded-full border border-zinc-700 bg-zinc-800 text-lg leading-none text-zinc-300"
