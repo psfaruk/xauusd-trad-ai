@@ -9,6 +9,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+.pgdata*/
 *.egg-info/
 
 # --- node ---
@@ -19,3 +20,4 @@ dist/
 # --- logs / misc ---
 *.log
 .DS_Store
+run/
