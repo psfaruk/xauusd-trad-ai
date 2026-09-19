@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
     app_version: str = "0.1.0"
 
+    # Deployment: directory of the built SPA (Railway single-service image,
+    # DECISIONS.md D-016). When set and present, FastAPI serves it at "/".
+    static_dir: str | None = None
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
