@@ -73,12 +73,15 @@ create table if not exists logs (
 );
 create index if not exists logs_ts_idx on logs (ts desc);
 
--- Auto-create profile on signup (Supabase trigger)
+-- Auto-create profile on signup (Supabase trigger). Idempotent: a profile
+-- row created by /api/me's ensure_auth_user on plain Postgres (D-017) must
+-- not make a re-insert fail.
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer as $$
 begin
   insert into public.profiles (id, display_name)
-  values (new.id, coalesce(new.raw_user_meta_data->>'full_name', new.email));
+  values (new.id, coalesce(new.raw_user_meta_data->>'full_name', new.email))
+  on conflict (id) do nothing;
   return new;
 end $$;
 drop trigger if exists on_auth_user_created on auth.users;

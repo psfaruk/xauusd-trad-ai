@@ -1,0 +1,15 @@
+# Keep the build context small and reproducible.
+.git
+**/node_modules
+**/dist
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pgdata-test
+**/.pytest_cache
+**/.ruff_cache
+run/
+*.log
+.env
+.env.*
+!.env.example

@@ -1,0 +1,6 @@
+# Dev/test dependencies: pip install -r requirements-dev.txt
+-r requirements.txt
+pytest>=8.2
+pytest-asyncio>=0.23
+ruff>=0.4
+pgserver>=0.0.5  # optional embedded Postgres for schema tests (skips if absent)

@@ -18,11 +18,13 @@ logger = logging.getLogger("xauusd.db")
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 # On plain Postgres (Railway, tests) `auth.users` does not exist; create a
-# minimal stub first so the `profiles` FK and signup trigger apply. On Supabase
-# both statements are no-ops — the objects already exist (DECISIONS.md D-017).
+# compatible stub first so the `profiles` FK, signup trigger and admin
+# promotion all work outside Supabase. On Supabase the statement is a no-op —
+# the table already exists (DECISIONS.md D-017).
 AUTH_STUB_STATEMENTS = (
     "create schema if not exists auth",
-    "create table if not exists auth.users (id uuid primary key)",
+    "create table if not exists auth.users ("
+    "id uuid primary key, email text, raw_user_meta_data jsonb)",
 )
 
 

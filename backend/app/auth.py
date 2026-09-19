@@ -95,6 +95,24 @@ async def verify_supabase_token(http: httpx.AsyncClient, token: str) -> dict | N
     return user
 
 
+async def _ensure_auth_user(engine, user_id: str, email: str | None) -> None:
+    """On plain Postgres (Railway, D-017) register the Supabase user in the
+    auth.users stub so the profiles FK can be satisfied. On Supabase this is
+    a no-op (row exists; ON CONFLICT DO NOTHING) or fails on auth-schema
+    permissions — either way harmless and best-effort."""
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "insert into auth.users (id, email) values (:uid, :email) "
+                    "on conflict (id) do nothing"
+                ),
+                {"uid": user_id, "email": (email or "").strip().lower() or None},
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort only
+        logger.debug("ensure_auth_user skipped: %s", exc)
+
+
 async def resolve_role(request: Request, user_id: str, email: str | None) -> str:
     """Resolve the role from `profiles` (SPEC §7.1).
 
@@ -110,6 +128,7 @@ async def resolve_role(request: Request, user_id: str, email: str | None) -> str
     engine = getattr(request.app.state, "db_engine", None)
     if engine is None:
         return role
+    await _ensure_auth_user(engine, user_id, email)
     try:
         async with engine.begin() as conn:
             await conn.execute(
