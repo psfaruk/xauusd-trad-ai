@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import TopBar from "../components/TopBar";
 import Chart from "../components/Chart";
 import TimeframeSwitcher from "../components/TimeframeSwitcher";
+import SymbolSwitcher from "../components/SymbolSwitcher";
 import SignalPanel, { type SignalPanelTab } from "../components/SignalPanel";
 import Mt5ConnectDialog from "../components/Mt5ConnectDialog";
 import SettingsDialog from "../components/SettingsDialog";
@@ -13,12 +14,12 @@ import LogViewer from "../components/LogViewer";
 import { useAuth } from "../lib/auth";
 import {
   getCandles, getMt5Status, getSignals, getStats, getHealth, getMe,
-  getTradingStatus, getTradingPositions,
+  getTradingStatus, getTradingPositions, getMt5Account, getMt5Positions,
 } from "../lib/api";
 import { WSClient } from "../lib/ws";
 import type {
-  Candle, Mt5Status, Signal, StatsResponse, Timeframe, TradingPosition,
-  TradingStatus, WsMessage, WsMt5StatusMsg,
+  Candle, Mt5Account, Mt5OpenPosition, Mt5Status, Signal, StatsResponse,
+  Timeframe, TradingPosition, TradingStatus, WsMessage, WsMt5StatusMsg,
 } from "../types";
 
 /**
@@ -32,6 +33,7 @@ export default function Dashboard() {
   const queryClient = useQueryClient();
 
   const [tf, setTf] = useState<Timeframe>("M15");
+  const [symbol, setSymbol] = useState("XAUUSD"); // D-035: selected instrument
   const [mt5, setMt5] = useState<Mt5Status | null>(null);
   const [dataSource, setDataSource] = useState<"mock" | "mt5" | "live" | "">("");
   const [liveBar, setLiveBar] = useState<Candle | null>(null);
@@ -59,7 +61,16 @@ export default function Dashboard() {
   const [logsOpen, setLogsOpen] = useState(false);
   const [panelTab, setPanelTab] = useState<SignalPanelTab>("signals");
 
-  const symbol = mt5?.symbol ?? null;
+  /* D-034/D-035: the REAL MT5 account (balance/equity/positions) shown right
+   * on the dashboard footer — polled every 10s while the bridge answers. */
+  const [mt5Acct, setMt5Acct] = useState<Mt5Account | null>(null);
+  const [mt5Pos, setMt5Pos] = useState<Mt5OpenPosition[]>([]);
+
+  const connectedSymbol = mt5?.symbol ?? null;
+  const symbols = useMemo(() => {
+    const list = mt5?.symbols?.length ? mt5.symbols : [connectedSymbol ?? "XAUUSD"];
+    return list.filter((s, i) => list.indexOf(s) === i);
+  }, [mt5?.symbols, connectedSymbol]);
   const [roleState, setRoleState] = useState<string>("viewer");
   const isAdmin = useMemo(() => roleState === "admin", [roleState]);
   const tradingConnected = trading?.connected === true;
@@ -69,7 +80,7 @@ export default function Dashboard() {
   const candlesQuery = useQuery({
     queryKey: ["candles", tf, symbol],
     enabled: !!token && !!symbol && mt5?.status === "connected",
-    queryFn: () => getCandles(token!, tf, 500),
+    queryFn: () => getCandles(token!, tf, 500, symbol),
     refetchOnWindowFocus: false,
     staleTime: Infinity,
   });
@@ -102,6 +113,7 @@ export default function Dashboard() {
     (msg: WsMessage) => {
       switch (msg.type) {
         case "tick":
+          if (msg.symbol !== symbol) return; // D-035: per-symbol frames
           setLastPrice({ bid: msg.bid, ask: msg.ask });
           setLastTickAt(Date.now());
           if (msg.tps != null) setTps(msg.tps);
@@ -109,7 +121,7 @@ export default function Dashboard() {
         case "bar_open":
         case "bar_update":
         case "bar_close":
-          if (msg.tf === tf) setLiveBar(msg.candle);
+          if (msg.tf === tf && msg.symbol === symbol) setLiveBar(msg.candle);
           break;
         case "signal":
         case "signal_update":
@@ -131,16 +143,15 @@ export default function Dashboard() {
                   ...prev,
                   status: msg.status,
                   symbol: msg.symbol ?? prev.symbol,
+                  symbols: (msg as WsMt5StatusMsg).symbols ?? prev.symbols,
                   feed: (msg as WsMt5StatusMsg).feed ?? prev.feed,
                 }
               : prev
           );
           {
-            const feedTps = (msg as WsMt5StatusMsg).feed?.tps;
+            const feedTps = (msg as WsMt5StatusMsg).feed?.symbols?.[symbol]?.tps
+              ?? (msg as WsMt5StatusMsg).feed?.tps;
             if (feedTps != null) setTps(feedTps);
-          }
-          if (msg.symbol) {
-            void queryClient.invalidateQueries({ queryKey: ["candles"] });
           }
           break;
         case "engine_log":
@@ -170,7 +181,7 @@ export default function Dashboard() {
           break;
       }
     },
-    [tf, queryClient]
+    [tf, symbol, queryClient]
   );
 
   useEffect(() => {
@@ -193,6 +204,55 @@ export default function Dashboard() {
     const ws = wsRef.current;
     if (ws && symbol && ws.connected) ws.subscribe(symbol, tf);
   }, [symbol, tf, wsState]);
+
+  // D-035: switching instruments resets the per-symbol live state (price,
+  // forming bar, tick rate) so the chart starts clean for the new symbol.
+  useEffect(() => {
+    setLiveBar(null);
+    setLastPrice(null);
+    setLastTickAt(null);
+    setTps(null);
+  }, [symbol]);
+
+  // D-035: refetch candles ONLY when the quote SOURCE for the selected
+  // symbol actually switches (MT5 terminal <-> crypto composite, e.g. the
+  // Monday open) — the 15s status heartbeat alone no longer thrashes the
+  // chart with full setData resets (the old "chart breaking" symptom).
+  const feedSourceRef = useRef<string>("");
+  useEffect(() => {
+    const fs = mt5?.feed?.symbols?.[symbol];
+    if (!fs) return;
+    const src = `${fs.provider}:${fs.mt5 ? "mt5" : "composite"}`;
+    if (feedSourceRef.current && feedSourceRef.current !== src) {
+      void queryClient.invalidateQueries({ queryKey: ["candles"] });
+    }
+    feedSourceRef.current = src;
+  }, [mt5?.feed, symbol, queryClient]);
+
+  // D-034/D-035: the REAL MT5 account (balance/equity/positions) — 10s poll,
+  // hidden honestly when the terminal bridge is offline.
+  useEffect(() => {
+    if (!token) return;
+    let alive = true;
+    const poll = () => {
+      getMt5Account(token)
+        .then((a) => {
+          if (!alive) return;
+          if (a.connected) setMt5Acct(a);
+          else setMt5Acct(null);
+        })
+        .catch(() => alive && setMt5Acct(null));
+      getMt5Positions(token)
+        .then((r) => alive && setMt5Pos(r.positions))
+        .catch(() => alive && setMt5Pos([]));
+    };
+    poll();
+    const timer = window.setInterval(poll, 10_000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [token]);
 
   // gap healing: on reconnect refetch candles + status (Phase 2 AC)
   useEffect(() => {
@@ -229,7 +289,8 @@ export default function Dashboard() {
 
   const signals: Signal[] = signalsQuery.data?.signals ?? [];
   const stats: StatsResponse | null = statsQuery.data ?? null;
-  const activeSignal = signals.find((s) => s.status === "active") ?? null;
+  const activeSignal =
+    signals.find((s) => s.status === "active" && s.symbol === symbol) ?? null;
 
   const menuActions = {
     onOpenTrading: () => setTradingOpen(true),
@@ -249,6 +310,10 @@ export default function Dashboard() {
     onOpenPlatformMt5: () => setConnectOpen(true),
   };
 
+  const onChartDesync = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: ["candles"] });
+  }, [queryClient]);
+
   return (
     <div className="flex min-h-screen flex-col bg-zinc-950">
       <TopBar
@@ -261,12 +326,14 @@ export default function Dashboard() {
         lastPrice={lastPrice}
         lastTickAt={lastTickAt}
         tps={tps}
+        symbol={symbol}
       />
 
       <main className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col gap-4 p-4 xl:flex-row">
         {/* CHART area */}
         <section className="flex min-w-0 flex-1 flex-col gap-3" aria-label="Chart">
           <div className="flex flex-wrap items-center gap-3">
+            <SymbolSwitcher symbols={symbols} value={symbol} onChange={setSymbol} mt5={mt5} />
             <TimeframeSwitcher tf={tf} onChange={setTf} />
             <div className="ml-auto flex items-center gap-3 text-xs">
               {lastPrice && (
@@ -298,6 +365,7 @@ export default function Dashboard() {
               liveBar={liveBar}
               activeSignal={activeSignal}
               tf={tf}
+              onDesync={onChartDesync}
             />
           </div>
 
@@ -343,6 +411,54 @@ export default function Dashboard() {
               {account ? account.equity.toFixed(2) : "—"}
             </span>
           </span>
+
+          {/* D-034/D-035: the REAL MT5 account — balance/equity/positions from
+           * the MetaTrader 5 terminal, visible right here after connect. */}
+          {mt5Acct && (
+            <button
+              type="button"
+              onClick={() => setMt5AccountOpen(true)}
+              className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-zinc-800/60"
+              title={`${mt5Acct.server ?? ""} · login ${mt5Acct.login ?? ""} — click for positions & trade history`}
+            >
+              <span
+                className={`rounded px-1.5 py-0.5 text-[10px] ${
+                  mt5Acct.connected
+                    ? "bg-emerald-500/15 text-emerald-400"
+                    : "bg-red-500/15 text-red-400"
+                }`}
+              >
+                MT5{mt5Acct.type ? ` · ${mt5Acct.type}` : ""}
+              </span>
+              <span className="font-semibold text-zinc-100">
+                {mt5Acct.balance?.toFixed(2) ?? "—"} {mt5Acct.currency ?? "USD"}
+              </span>
+              <span className="text-zinc-600">·</span>
+              <span>
+                eq{" "}
+                <span className="font-semibold text-zinc-200">
+                  {mt5Acct.equity?.toFixed(2) ?? "—"}
+                </span>
+              </span>
+              <span className="text-zinc-600">·</span>
+              <span
+                className={
+                  (mt5Acct.profit ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                }
+              >
+                {(mt5Acct.profit ?? 0) >= 0 ? "+" : ""}
+                {mt5Acct.profit?.toFixed(2) ?? "0.00"}
+              </span>
+              <span className="text-zinc-600">·</span>
+              <span>
+                {mt5Pos.length} open{mt5Pos.length > 0 && (
+                  <span className="ml-1 text-zinc-500">
+                    ({mt5Pos.map((p) => `${p.symbol} ${p.action} ${p.volume}`).join(", ")})
+                  </span>
+                )}
+              </span>
+            </button>
+          )}
 
           {/* own trading plane */}
           <span className="flex items-center gap-1">
@@ -457,6 +573,7 @@ export default function Dashboard() {
         open={mt5AccountOpen}
         onClose={() => setMt5AccountOpen(false)}
         token={token ?? ""}
+        defaultSymbol={symbol}
       />
 
       <LogViewer

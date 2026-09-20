@@ -1,37 +1,39 @@
-"""Real-time market data source from FREE public APIs (DATA_SOURCE=live, D-030).
+"""Real-time market data — MT5 TERMINAL FIRST, crypto composite 24/7 (D-035).
 
-Why: the MetaTrader5 package only runs on Windows (SPEC C1), so a Linux/Railway
-deployment cannot read MT5 directly — it used to fall back to the synthetic
-MockDataSource, which shows FAKE prices. This source streams REAL gold prices
-24/7 from key-less public APIs instead:
+The user's directive (D-035): market data must come from the FOREX market
+THROUGH MetaTrader 5 — real broker prices — with the weekend-closed logic
+handled gracefully. Provider priority per platform symbol:
 
-Provider chain (ordered failover, C6 graceful degrade):
-1. MULTI-VENUE WebSocket aggregate (D-033) — REAL tick-by-tick events from
-   five gold venues (Binance PAXG+USDC, Bybit XAUT, OKX PAXG+XAUT, Kraken
-   PAXG, Coinbase PAXG) via app.mt5.tick_feed. Every real market event
-   (book update / trade) becomes a tick the instant it happens — tens of
-   events per second in active sessions; forming candles absorb them all.
-2. Binance PAXG/USDT REST — quotes + candles fallback when WS is silent.
-   `bookTicker` -> real bid/ask every poll; `klines` -> authoritative
-   OHLCV for every timeframe (native Binance intervals map 1:1 onto M1..D1).
-3. gold-api.com — QUOTE fallback (spot XAU mid, synthetic 0.35 spread) when
-   Binance is unreachable (e.g. regional 451 geo-blocks on datacenter IPs).
-4. Yahoo Finance GC=F — HISTORY fallback (COMEX gold-futures candles).
-5. Tick-built candles — M1+ bars aggregated live from whatever quote
+1. MT5 TERMINAL (authority while its broker ticks are fresh) — the real
+   Exness feed polled from the terminal's built-in MCP server (D-034):
+   `get_chart_ticks_history` every second -> real bid/ask ticks;
+   `get_chart_history` -> AUTHORITATIVE M1..D1 candles incl. the forming bar.
+   XAUUSD -> XAUUSDm (real forex gold), BTCUSD -> BTCUSDm (24/7).
+2. CRYPTO COMPOSITE (automatic fallback while MT5 is not fresh — forex
+   closed on weekends, terminal down):
+   - GOLD (XAUUSD): the D-033 five-venue key-less WS aggregate (Binance
+     PAXG+USDC, Bybit XAUT, OKX PAXG+XAUT, Kraken PAXG, Coinbase PAXG)
+     + Binance PAXG/USDT REST + gold-api.com quote + Yahoo GC=F history.
+   - BTC (BTCUSD, new pair D-035): Binance BTC/USDT WS + REST + Yahoo
+     BTC-USD history.
+   When MT5 resumes (Monday open / terminal restart) it silently becomes
+   the authority again — the switch is surfaced in feed status so the UI
+   badge always tells the truth.
+3. Tick-built candles — M1+ bars aggregated live from whatever quote
    provider still answers (charts fill in over time).
 
-NEVER demo: there is NO mock fallback anymore (D-033, user directive) —
-when every provider is unreachable the platform shows "no feed" and keeps
-retrying; it never displays synthetic prices.
+NEVER demo: there is NO mock fallback (D-033, user directive) — when every
+provider is unreachable the platform shows "no feed" and keeps retrying; it
+never displays synthetic prices.
 
-Basis note (transparency, user req #5): candle/quote data is PAXG-based and
-can differ from a specific broker's XAUUSD feed by a few tenths of a percent.
-The active provider is surfaced everywhere (health, /api/mt5/status, WS
-mt5_status, TopBar LIVE badge) so users always know what they are looking at.
+Basis note (transparency): while the crypto composite is active, quotes are
+PAXG/BTC based and can differ from a specific broker's feed by a fraction of
+a percent; while MT5 is active they are the broker's own prices. The active
+provider is surfaced everywhere (health, /api/mt5/status, WS mt5_status,
+TopBar LIVE badge) so users always know what they are looking at.
 
-Paper trading: the platform plane and per-user demo planes run paper accounts
-(MockDataSource semantics) priced off the LIVE feed — real prices, simulated
-fills. Real MT5 execution stays on the Windows bridge (D-024).
+Paper trading: the platform plane and per-user demo planes run paper
+accounts priced off THIS feed — real prices, simulated fills.
 """
 
 from __future__ import annotations
@@ -71,8 +73,14 @@ BINANCE_INTERVALS = {
     "M1": "1m", "M5": "5m", "M15": "15m", "M30": "30m",
     "H1": "1h", "H4": "4h", "D1": "1d",
 }
-# Yahoo chart API (interval, range) per timeframe — GC=F = COMEX gold futures.
-YAHOO_SPECS = {
+# Yahoo chart API (interval, range) per timeframe — gold = GC=F futures,
+# BTC = BTC-USD spot.
+YAHOO_GOLD = {
+    "M1": ("1m", "5d"), "M5": ("5m", "1mo"), "M15": ("15m", "1mo"),
+    "M30": ("30m", "1mo"), "H1": ("60m", "3mo"), "H4": ("60m", "3mo"),
+    "D1": ("1d", "2y"),
+}
+YAHOO_BTC = {
     "M1": ("1m", "5d"), "M5": ("5m", "1mo"), "M15": ("15m", "1mo"),
     "M30": ("30m", "1mo"), "H1": ("60m", "3mo"), "H4": ("60m", "3mo"),
     "D1": ("1d", "2y"),
@@ -85,9 +93,13 @@ MIN_REFETCH_S = 5.0     # forced-refetch rate cap (session gaps must not hammer)
 M1_TICK_KEEP = 4320     # 3 days of tick-built M1 bars kept in memory
 WS_REST_REFRESH_S = 30.0  # WS healthy: REST only refreshes klines this often
 
-# Lot-sizing metadata mirrors a typical Exness XAUUSD standard account.
-LIVE_SYMBOL_INFO = SymbolInfo(
+# Lot-sizing metadata mirrors a typical Exness standard account.
+GOLD_SYMBOL_INFO = SymbolInfo(
     name="XAUUSD", point=0.01, contract_size=100.0,
+    volume_min=0.01, volume_max=100.0, volume_step=0.01,
+)
+BTC_SYMBOL_INFO = SymbolInfo(
+    name="BTCUSD", point=0.01, contract_size=1.0,
     volume_min=0.01, volume_max=100.0, volume_step=0.01,
 )
 
@@ -177,26 +189,56 @@ BINANCE_BASES_DEFAULT = (
 )
 
 
-class MarketFeed:
-    """Owns provider polling + candle caches.
+# =========================================================================
+# SymbolFeedCore — all real-time data for ONE platform symbol (D-035)
+# =========================================================================
 
-    One feed per process (the public market). Sibling paper planes share it,
-    so every user's demo orders are priced off the identical live market.
+@dataclass
+class SymbolSpec:
+    """Per-symbol provider configuration."""
+    key: str                          # platform symbol ("XAUUSD" / "BTCUSD")
+    binance_symbol: str               # Binance REST/WS symbol ("PAXGUSDT")
+    ws_venues: Any                    # tuple[VenueConfig, ...] | None
+    goldapi: bool = False             # gold-api.com quote fallback (gold only)
+    yahoo_specs: dict | None = None   # Yahoo history fallback per TF
+    yahoo_symbol: str = "GC=F"
+    mt5_symbol: str = ""              # platform key for the MT5 overlay
+
+
+GOLD_SPEC = SymbolSpec(
+    key="XAUUSD",
+    binance_symbol="PAXGUSDT",
+    ws_venues="GOLD",  # resolved to tick_feed.VENUES at runtime
+    goldapi=True,
+    yahoo_specs=YAHOO_GOLD,
+    yahoo_symbol="GC=F",
+)
+
+
+class SymbolFeedCore:
+    """Quote + candle pipeline for one symbol with the MT5-first policy.
+
+    Quote authority: MT5 terminal ticks while `mt5.fresh(key)`; otherwise the
+    crypto composite (venue WS events + REST poll chain). Candle authority:
+    MT5 chart history while fresh; otherwise Binance klines (+ Yahoo history
+    + tick-built fallbacks).
     """
 
     def __init__(
         self,
+        spec: SymbolSpec,
         http_factory: HttpFactory | None = None,
         poll_seconds: float = 2.0,
         binance_base: str = "",
         binance_bases: Sequence[str] | None = None,
         enable_ws: bool = True,
         ws_venues: Sequence[str] | None = None,
+        mt5: Any = None,  # McpMarketFeed | None
     ) -> None:
+        self.spec = spec
         self._http_factory = http_factory or _default_http_client
         self.poll_seconds = float(poll_seconds)
-        # Mirror chain with a sticky "currently working" index (D-032):
-        # try mirrors in rotation, remember the first one that answers.
+        # Mirror chain with a sticky "currently working" index (D-032)
         if binance_bases:
             bases = [b.rstrip("/") for b in binance_bases]
         else:
@@ -207,11 +249,11 @@ class MarketFeed:
         self._binance_idx = 0
 
         self.tick: Tick | None = None
-        self.provider = "init"  # init | binance | goldapi | degraded
+        self.provider = "init"  # init | mt5 | aggregate | binance | goldapi | degraded
         self.provider_detail = "waiting for first poll"
         self.last_data_monotonic = 0.0
 
-        # Authoritative M1 (from the 2-row kline poll)
+        # Authoritative M1 (from the 2-row kline poll / MT5 chart history)
         self._m1_recent_closed: list[dict] = []
         self._m1_forming: dict | None = None
         # Tick-built M1 (always maintained — powers forming bars + degrade)
@@ -226,37 +268,46 @@ class MarketFeed:
         self._stop = asyncio.Event()
         self._new_data: asyncio.Event = asyncio.Event()
 
-        # D-033 — multi-venue WebSocket tick aggregate (REAL events only).
-        # Created here, started by start(); on_event is fully sync + fast.
+        # D-033 venue WS aggregate (per-symbol venue set) + D-035 MT5 overlay
         self._agg: Any = None
         self._enable_ws = bool(enable_ws)
         self._ws_venue_names = tuple(ws_venues) if ws_venues else None
+        self._mt5 = mt5
 
-    def _make_aggregator(self) -> Any:
-        from app.mt5.tick_feed import TickAggregator
+    # ------------------------------------------------------------ mt5 policy
 
-        return TickAggregator(
-            on_event=self._on_ws_event,
-            enabled_venues=self._ws_venue_names,
+    def _mt5_fresh(self) -> bool:
+        return self._mt5 is not None and self._mt5.fresh(self.spec.key)
+
+    def on_mt5_tick(self, bid: float, ask: float, ts: float) -> None:
+        """A REAL broker tick from the terminal -> authoritative quote."""
+        now = datetime.fromtimestamp(ts, tz=UTC)
+        self.tick = Tick(bid=bid, ask=ask, time=now)
+        self.provider = "mt5"
+        self.provider_detail = (
+            f"MetaTrader 5 terminal · real broker feed ({self.spec.key})"
         )
-
-    def _agg_tps(self) -> float | None:
-        if self._agg is None:
-            return None
-        return round(self._agg.tps(), 1)
-
-    def _ws_healthy(self) -> bool:
-        return self._agg is not None and self._agg.healthy_venue_count() > 0
+        self.last_data_monotonic = time_mod.monotonic()
+        mid = (bid + ask) / 2
+        self._update_m1_tick(mid, 0.0, now)
+        self._wake_listeners()
 
     def _on_ws_event(self, ev: Any) -> None:
-        """One REAL market event from any venue -> tick + forming-bar update."""
+        """One REAL crypto market event -> tick + forming-bar update.
+
+        D-035: while the MT5 broker feed is fresh, crypto events only keep
+        the venue-health stats warm — they never move the quote or candles
+        (different price basis than the broker feed).
+        """
+        if self._mt5_fresh():
+            return
         now = datetime.fromtimestamp(ev.ts, tz=UTC)
         self.tick = Tick(bid=ev.bid, ask=ev.ask, time=now)
-        n_venues = self._agg.healthy_venue_count()
+        n_venues = self._agg.healthy_venue_count() if self._agg else 0
         self.provider = "aggregate"
         self.provider_detail = (
-            f"{n_venues}-venue real-time gold feed "
-            "(Binance/Bybit/OKX/Kraken/Coinbase)"
+            f"{n_venues}-venue real-time feed "
+            "(crypto composite — MT5 forex feed inactive)"
         )
         self.last_data_monotonic = time_mod.monotonic()
         mid = (ev.bid + ev.ask) / 2
@@ -265,17 +316,35 @@ class MarketFeed:
 
     # ------------------------------------------------------------- lifecycle
 
+    def _resolve_venues(self) -> Any:
+        from app.mt5.tick_feed import BTC_VENUES, VENUES
+
+        base = BTC_VENUES if self.spec.ws_venues == "BTC" else VENUES
+        if self._ws_venue_names is None:
+            return base
+        return tuple(v for v in base if v.name in self._ws_venue_names)
+
+    def _make_aggregator(self) -> Any:
+        from app.mt5.tick_feed import TickAggregator
+
+        return TickAggregator(
+            on_event=self._on_ws_event,
+            venues=self._resolve_venues(),
+        )
+
     async def start(self) -> None:
         if self.running:
             return
         self._stop.clear()
-        self._task = asyncio.create_task(self._poll_loop(), name="live-feed")
-        if self._enable_ws:
+        self._task = asyncio.create_task(
+            self._poll_loop(), name=f"live-feed-{self.spec.key}"
+        )
+        if self._enable_ws and self._resolve_venues():
             self._agg = self._make_aggregator()
             await self._agg.start()
             logger.info(
-                "tick aggregator started — %d venue stream(s) (D-033)",
-                len(self._agg.states),
+                "%s: crypto aggregate started — %d venue stream(s)",
+                self.spec.key, len(self._agg.states),
             )
 
     async def stop(self) -> None:
@@ -307,9 +376,13 @@ class MarketFeed:
                 try:
                     await self.poll_once()
                 except Exception:  # noqa: BLE001 — one bad cycle never kills the feed
-                    logger.debug("live poll cycle failed", exc_info=True)
-                # WS healthy -> REST only augments (30s); otherwise poll hard.
-                delay = WS_REST_REFRESH_S if self._ws_healthy() else self.poll_seconds
+                    logger.debug("%s poll cycle failed", self.spec.key, exc_info=True)
+                # MT5 or WS healthy -> REST only augments (30s)
+                delay = (
+                    WS_REST_REFRESH_S
+                    if (self._mt5_fresh() or self._ws_healthy())
+                    else self.poll_seconds
+                )
                 await asyncio.sleep(delay)
         except asyncio.CancelledError:
             raise
@@ -320,7 +393,7 @@ class MarketFeed:
         evt.set()
 
     async def next_data(self, timeout: float) -> bool:
-        """Wait for the next fresh poll result (True) or timeout (False)."""
+        """Wait for the next fresh event (True) or timeout (False)."""
         evt = self._new_data
         if evt.is_set():
             return True
@@ -330,10 +403,30 @@ class MarketFeed:
         except TimeoutError:
             return False
 
+    async def tick_stream(self) -> AsyncIterator[Tick]:
+        """Every quote update for this symbol (MT5 or crypto authority)."""
+        try:
+            if self.tick is None:
+                try:
+                    await self.poll_once()
+                except Exception:  # noqa: BLE001 — the loop below retries anyway
+                    pass
+            while True:
+                tick = self.tick
+                if tick is not None:
+                    yield tick
+                await self.next_data(
+                    timeout=max(2.0, self.poll_seconds * 2)
+                )
+        except asyncio.CancelledError:
+            return
+
     # -------------------------------------------------------------- providers
 
+    def _ws_healthy(self) -> bool:
+        return self._agg is not None and self._agg.healthy_venue_count() > 0
+
     async def _client(self) -> httpx.AsyncClient:
-        """Fetch the http client (factory may return it directly or awaited)."""
         c = self._http_factory()
         if asyncio.iscoroutine(c) or hasattr(c, "__await__"):
             c = await c
@@ -342,13 +435,7 @@ class MarketFeed:
     async def _binance_get(
         self, client: httpx.AsyncClient, path: str, params: dict, timeout: float
     ) -> httpx.Response:
-        """GET a Binance endpoint with mirror failover (D-032).
-
-        Tries the sticky mirror first, then rotates through the rest (e.g.
-        data-api.binance.vision when api.binance.com answers 451 from a
-        datacenter IP). The first mirror that responds becomes sticky so
-        healthy polls never pay the failover latency.
-        """
+        """GET a Binance endpoint with mirror failover (D-032)."""
         last_exc: Exception | None = None
         bases = self._binance_bases
         for offset in range(len(bases)):
@@ -367,13 +454,14 @@ class MarketFeed:
         raise last_exc
 
     async def poll_once(self) -> bool:
-        """One provider cycle. True when the feed has data (WS or REST).
+        """One provider cycle. True when the feed has data (MT5/WS/REST).
 
-        D-033: a healthy WS aggregate short-circuits the REST quote chain —
-        REST only refreshes the authoritative forming M1. When WS is silent
-        the original chain runs (binance -> gold-api). NEVER falls back to
-        demo data: failure is reported, not faked.
+        D-035: fresh MT5 broker ticks short-circuit the REST quote chain —
+        candles come from chart history on demand (ensure_tf). NEVER falls
+        back to demo data: failure is reported, not faked.
         """
+        if self._mt5_fresh():
+            return True
         ws = self._ws_healthy()
         try:
             await self._poll_binance()
@@ -382,11 +470,12 @@ class MarketFeed:
             logger.debug("binance poll failed: %s", exc)
         if ws:
             return True  # the WS aggregate carries the feed
-        try:
-            await self._poll_goldapi()
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("gold-api poll failed: %s", exc)
+        if self.spec.goldapi:
+            try:
+                await self._poll_goldapi()
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("gold-api poll failed: %s", exc)
         self.provider = "degraded"
         self.provider_detail = "all providers unreachable — retrying (never demo data)"
         return False
@@ -396,7 +485,8 @@ class MarketFeed:
         bid = ask = None
         if not self._ws_healthy():
             r = await self._binance_get(
-                client, "/api/v3/ticker/bookTicker", {"symbol": "PAXGUSDT"}, 4.0
+                client, "/api/v3/ticker/bookTicker",
+                {"symbol": self.spec.binance_symbol}, 4.0,
             )
             d = r.json()
             bid, ask = float(d["bidPrice"]), float(d["askPrice"])
@@ -407,7 +497,7 @@ class MarketFeed:
             rk = await self._binance_get(
                 client,
                 "/api/v3/klines",
-                {"symbol": "PAXGUSDT", "interval": "1m", "limit": 2},
+                {"symbol": self.spec.binance_symbol, "interval": "1m", "limit": 2},
                 4.0,
             )
             closed, forming = _parse_binance_klines(rk.json())
@@ -420,7 +510,7 @@ class MarketFeed:
             self._apply_tick(
                 bid, ask, datetime.now(tz=UTC),
                 provider="binance",
-                detail="Binance PAXG/USDT (tokenized gold · 24/7)",
+                detail=f"Binance {self.spec.binance_symbol} (crypto composite · 24/7)",
             )
 
     async def _poll_goldapi(self) -> None:
@@ -451,11 +541,7 @@ class MarketFeed:
         self._wake_listeners()
 
     def _update_m1_tick(self, mid: float, qty: float, now: datetime) -> None:
-        """Fold one real event into the tick-built M1 series (D-033).
-
-        `qty` is the traded base size (PAXG/XAUT units) when the event was a
-        trade; book events carry 0 -> count as one activity tick.
-        """
+        """Fold one real event into the tick-built M1 series (D-033)."""
         bucket = int(now.timestamp() // 60) * 60
         cur = self._m1_tick.pop(bucket, None)
         if cur is None:
@@ -477,13 +563,11 @@ class MarketFeed:
     # ------------------------------------------------------------ tf requests
 
     async def ensure_tf(self, tf: str, min_count: int) -> tuple[list[dict], dict | None]:
-        """(closed_rows, forming_row) for `tf` — cached, provider-failed-over."""
+        """(closed_rows, forming_row) for `tf` — MT5 first, then the chain."""
         tf_min = validate_tf(tf)
         now = time_mod.time()
         closed = self._tf_cache.get(tf, [])
         last_t = closed[-1]["t"] if closed else None
-        # The bucket that JUST closed — a cache missing it is stale (the
-        # bar-close reconcile path depends on this exactness).
         want_t = (int(now // (tf_min * 60)) - 1) * tf_min * 60
         age = now - self._tf_cache_ts.get(tf, 0.0)
         refetch_ok = now - self._tf_refetch_ts.get(tf, 0.0) >= MIN_REFETCH_S
@@ -495,20 +579,40 @@ class MarketFeed:
         if need:
             self._tf_refetch_ts[tf] = now
             fetched: list[dict] | None = None
-            try:
-                fetched = await self._fetch_binance_tf(tf, min_count)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("binance tf fetch failed (%s): %s", tf, exc)
+            mt5_authoritative = False
+            # 1) MT5 terminal chart history (real forex/broker candles, D-035)
+            if self._mt5_fresh():
+                try:
+                    rows, _ = await self._mt5.bars(self.spec.key, tf, min_count)
+                    if rows:
+                        fetched = rows
+                        mt5_authoritative = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("mt5 bars fetch failed (%s %s): %s",
+                                 self.spec.key, tf, exc)
+            # 2) Binance klines
             if fetched is None:
+                try:
+                    fetched = await self._fetch_binance_tf(tf, min_count)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("binance tf fetch failed (%s): %s", tf, exc)
+            # 3) Yahoo history fallback
+            if fetched is None and self.spec.yahoo_specs:
                 try:
                     fetched = await self._fetch_yahoo_tf(tf, min_count)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("yahoo tf fetch failed (%s): %s", tf, exc)
             if fetched is not None:
                 if fetched:
-                    self._tf_cache[tf] = _merge_rows(closed, fetched)[
-                        -max(min_count, 600):
-                    ]
+                    if mt5_authoritative:
+                        # Broker candles REPLACE the cache — different price
+                        # basis than the composite (never mix the two series);
+                        # the terminal carries years of history itself.
+                        self._tf_cache[tf] = fetched[-max(min_count, 600):]
+                    else:
+                        self._tf_cache[tf] = _merge_rows(closed, fetched)[
+                            -max(min_count, 600):
+                        ]
                 self._tf_cache_ts[tf] = now
             else:
                 # Last resort: top up from the tick-built series so charts
@@ -530,7 +634,7 @@ class MarketFeed:
             client,
             "/api/v3/klines",
             {
-                "symbol": "PAXGUSDT",
+                "symbol": self.spec.binance_symbol,
                 "interval": BINANCE_INTERVALS[tf],
                 "limit": limit,
             },
@@ -540,10 +644,12 @@ class MarketFeed:
         return closed
 
     async def _fetch_yahoo_tf(self, tf: str, min_count: int) -> list[dict]:
+        if not self.spec.yahoo_specs or tf not in self.spec.yahoo_specs:
+            return []
         client = await self._client()
-        interval, rng = YAHOO_SPECS[tf]
+        interval, rng = self.spec.yahoo_specs[tf]
         r = await client.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/GC=F",
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{self.spec.yahoo_symbol}",
             params={"interval": interval, "range": rng},
             headers={"User-Agent": "Mozilla/5.0 (xauusd-platform)"},
             timeout=6.0,
@@ -581,7 +687,12 @@ class MarketFeed:
     # ------------------------------------------------------- forming builders
 
     def _authoritative_forming(self, tf: str) -> dict | None:
-        """Binance's own forming M1 candle, when the poll cache is current."""
+        """Provider-native forming bar (MT5 any-TF, else Binance M1)."""
+        if self._mt5_fresh() and self._mt5 is not None:
+            try:
+                return self._mt5.forming(self.spec.key, tf)
+            except Exception:  # noqa: BLE001
+                return None
         if tf != "M1" or self._m1_forming is None:
             return None
         bucket = int(time_mod.time() // 60) * 60
@@ -633,14 +744,237 @@ class MarketFeed:
         }
 
 
-class LiveDataSource(DataSource):
-    """REAL-TIME free-API gold market + paper account (DATA_SOURCE=live).
+# =========================================================================
+# MarketFeed — the container: symbol cores + MT5 overlay + aggregators
+# =========================================================================
 
-    Shares one `MarketFeed` with its siblings so per-user demo planes price
-    orders off the identical public market (agent architecture, Phase 4).
+class MarketFeed:
+    """Owns provider polling + candle caches for every platform symbol.
+
+    One feed per process (the public market). Sibling paper planes share it,
+    so every user's demo orders are priced off the identical live market.
+    Back-compat: attribute access proxies to the GOLD core (D-030/D-033
+    tests + callers); multi-symbol callers use `feed_for()` / `ensure_tf_sym()`.
+    """
+
+    #: platform symbols served (D-035: XAUUSD + the new BTCUSD pair)
+    SYMBOLS = ("XAUUSD", "BTCUSD")
+
+    def __init__(
+        self,
+        http_factory: HttpFactory | None = None,
+        poll_seconds: float = 2.0,
+        binance_base: str = "",
+        binance_bases: Sequence[str] | None = None,
+        enable_ws: bool = True,
+        ws_venues: Sequence[str] | None = None,
+        mcp_market: Any = None,  # McpMarketFeed | None (D-035)
+    ) -> None:
+        # D-035 — the REAL broker overlay (None when the terminal is absent,
+        # e.g. Railway: crypto composite only, zero behavior change).
+        self.mcp = mcp_market
+        if self.mcp is None:
+            try:
+                from app.mt5.mcp_market import mcp_market_available
+
+                if mcp_market_available():
+                    from app.mt5.mcp import terminal_client
+                    from app.mt5.mcp_market import McpMarketFeed
+
+                    self.mcp = McpMarketFeed(
+                        client=terminal_client(), watch=list(self.SYMBOLS),
+                        on_tick=self._route_mt5_tick,
+                    )
+            except Exception:  # noqa: BLE001 — overlay is strictly optional
+                self.mcp = None
+
+        btc_spec = SymbolSpec(
+            key="BTCUSD", binance_symbol="BTCUSDT", ws_venues="BTC",
+            goldapi=False, yahoo_specs=YAHOO_BTC, yahoo_symbol="BTC-USD",
+        )
+        self.feeds: dict[str, SymbolFeedCore] = {
+            spec.key: SymbolFeedCore(
+                spec=spec,
+                http_factory=http_factory,
+                poll_seconds=poll_seconds,
+                binance_base=binance_base,
+                binance_bases=binance_bases,
+                enable_ws=enable_ws,
+                ws_venues=ws_venues if spec.key == "XAUUSD" else None,
+                mt5=self.mcp,
+            )
+            for spec in (GOLD_SPEC, btc_spec)
+        }
+
+    def _route_mt5_tick(self, key: str, bid: float, ask: float, ts: float) -> None:
+        feed = self.feeds.get(key)
+        if feed is not None:
+            feed.on_mt5_tick(bid, ask, ts)
+
+    # ------------------------------------------------------ symbol routing
+
+    def feed_for(self, symbol: str | None) -> SymbolFeedCore:
+        """Resolve a (possibly broker-suffixed) symbol to its feed core."""
+        if symbol:
+            if symbol in self.feeds:
+                return self.feeds[symbol]
+            base = symbol.rstrip("m.")  # XAUUSDm / BTCUSDm broker suffixes
+            if base in self.feeds:
+                return self.feeds[base]
+            for key in self.feeds:
+                if symbol.startswith(key):
+                    return self.feeds[key]
+        return self.feeds["XAUUSD"]
+
+    async def ensure_tf_sym(
+        self, symbol: str, tf: str, min_count: int
+    ) -> tuple[list[dict], dict | None]:
+        return await self.feed_for(symbol).ensure_tf(tf, min_count)
+
+    # ------------------------------------------------------------- lifecycle
+
+    async def start(self) -> None:
+        if self.mcp is not None and not self.mcp.running:
+            await self.mcp.start()
+        for feed in self.feeds.values():
+            await feed.start()
+
+    async def stop(self) -> None:
+        for feed in self.feeds.values():
+            await feed.stop()
+        if self.mcp is not None:
+            await self.mcp.stop()
+
+    @property
+    def running(self) -> bool:
+        return self.feeds["XAUUSD"].running
+
+    # ------------------------------------------- gold-core proxies (compat)
+
+    @property
+    def tick(self) -> Tick | None:
+        return self.feeds["XAUUSD"].tick
+
+    @property
+    def provider(self) -> str:
+        return self.feeds["XAUUSD"].provider
+
+    @property
+    def provider_detail(self) -> str:
+        return self.feeds["XAUUSD"].provider_detail
+
+    @property
+    def last_data_monotonic(self) -> float:
+        return self.feeds["XAUUSD"].last_data_monotonic
+
+    @last_data_monotonic.setter
+    def last_data_monotonic(self, v: float) -> None:
+        self.feeds["XAUUSD"].last_data_monotonic = v
+
+    @property
+    def _m1_tick(self) -> dict[int, dict]:
+        return self.feeds["XAUUSD"]._m1_tick  # noqa: SLF001 — compat proxy
+
+    @_m1_tick.setter
+    def _m1_tick(self, v: dict[int, dict]) -> None:
+        self.feeds["XAUUSD"]._m1_tick = v  # noqa: SLF001
+
+    @property
+    def _m1_tick_history(self) -> list[dict]:
+        return self.feeds["XAUUSD"]._m1_tick_history  # noqa: SLF001
+
+    @_m1_tick_history.setter
+    def _m1_tick_history(self, v: list[dict]) -> None:
+        self.feeds["XAUUSD"]._m1_tick_history = v  # noqa: SLF001
+
+    @property
+    def _m1_forming(self) -> dict | None:
+        return self.feeds["XAUUSD"]._m1_forming  # noqa: SLF001
+
+    @property
+    def _tf_cache(self) -> dict[str, list[dict]]:
+        return self.feeds["XAUUSD"]._tf_cache  # noqa: SLF001 — compat proxy
+
+    @property
+    def _tf_cache_ts(self) -> dict[str, float]:
+        return self.feeds["XAUUSD"]._tf_cache_ts  # noqa: SLF001
+
+    @property
+    def _tf_refetch_ts(self) -> dict[str, float]:
+        return self.feeds["XAUUSD"]._tf_refetch_ts  # noqa: SLF001
+
+    @_tf_refetch_ts.setter
+    def _tf_refetch_ts(self, v: dict[str, float]) -> None:
+        self.feeds["XAUUSD"]._tf_refetch_ts = v  # noqa: SLF001
+
+    @property
+    def data_age_s(self) -> float:
+        return self.feeds["XAUUSD"].data_age_s
+
+    async def poll_once(self) -> bool:
+        """One provider cycle for every symbol; returns the GOLD verdict."""
+        gold = True
+        try:
+            gold = await self.feeds["XAUUSD"].poll_once()
+        except Exception:  # noqa: BLE001
+            gold = False
+        try:
+            await self.feeds["BTCUSD"].poll_once()
+        except Exception:  # noqa: BLE001 — BTC failure never breaks gold
+            logger.debug("btc poll cycle failed", exc_info=True)
+        return gold
+
+    async def ensure_tf(self, tf: str, min_count: int) -> tuple[list[dict], dict | None]:
+        return await self.feeds["XAUUSD"].ensure_tf(tf, min_count)
+
+    async def next_data(self, timeout: float) -> bool:
+        return await self.feeds["XAUUSD"].next_data(timeout)
+
+    # -------------------------------------------------------------- status
+
+    def _agg_tps(self) -> float | None:
+        agg = self.feeds["XAUUSD"]._agg  # noqa: SLF001
+        return round(agg.tps(), 1) if agg is not None else None
+
+    def symbol_status(self, key: str) -> dict:
+        """Per-symbol transparency block (D-035)."""
+        f = self.feeds[key]
+        t = f.tick
+        mt5_on = f._mt5_fresh()  # noqa: SLF001
+        st: dict = {
+            "provider": f.provider,
+            "detail": f.provider_detail,
+            "mt5": mt5_on,
+            "last_price": round((t.bid + t.ask) / 2, 2) if t else None,
+            "spread": round(t.ask - t.bid, 2) if t else None,
+            "last_tick_age_s": (
+                round(f.data_age_s, 1) if f.last_data_monotonic > 0 else None
+            ),
+        }
+        if mt5_on and self.mcp is not None:
+            st["tps"] = self.mcp.tps(key) or 0.0
+        elif f._agg is not None:  # noqa: SLF001
+            st["tps"] = round(f._agg.tps(), 1)  # noqa: SLF001
+            st["venues"] = f._agg.stats()  # noqa: SLF001
+        return st
+
+
+# =========================================================================
+# LiveDataSource
+# =========================================================================
+
+class LiveDataSource(DataSource):
+    """REAL-TIME market + paper account (DATA_SOURCE=live).
+
+    MT5 terminal first (real broker prices, D-035), crypto composite 24/7
+    fallback; XAUUSD + BTCUSD pairs. Shares one `MarketFeed` with its
+    siblings so per-user demo planes price orders off the identical public
+    market (agent architecture, Phase 4).
     """
 
     SYMBOL = "XAUUSD"
+    SYMBOLS = ("XAUUSD", "BTCUSD")
+    SYMBOL_INFOS = {"XAUUSD": GOLD_SYMBOL_INFO, "BTCUSD": BTC_SYMBOL_INFO}
 
     def __init__(
         self,
@@ -653,6 +987,7 @@ class LiveDataSource(DataSource):
         connect_timeout_s: float = 15.0,
         enable_ws: bool = True,
         ws_venues: Sequence[str] | None = None,
+        mcp_market: Any = None,
     ) -> None:
         self.market = market or MarketFeed(
             http_factory=http_factory,
@@ -661,6 +996,7 @@ class LiveDataSource(DataSource):
             binance_bases=binance_bases,
             enable_ws=enable_ws,
             ws_venues=ws_venues,
+            mcp_market=mcp_market,
         )
         self._owns_market = market is None
         self._connect_timeout_s = float(connect_timeout_s)
@@ -691,8 +1027,8 @@ class LiveDataSource(DataSource):
             if self._owns_market:
                 await self.market.stop()
             raise DataSourceError(
-                "no live market provider reachable (5-venue WS + binance + "
-                "gold-api) — no demo fallback (D-033); retrying"
+                "no live market provider reachable (MT5 terminal + 5-venue WS "
+                "+ binance + gold-api) — no demo fallback (D-033); retrying"
             )
         self._connected = True
         logger.info(
@@ -728,10 +1064,15 @@ class LiveDataSource(DataSource):
         except Exception:  # noqa: BLE001
             return False
 
+    @property
+    def platform_symbols(self) -> list[str]:
+        """Symbols this source streams (ConnectionManager starts runtimes)."""
+        return list(self.market.feeds.keys())
+
     # ---------------------------------------------------------- market data
 
     async def get_rates(self, symbol: str, tf: str, count: int) -> pd.DataFrame:
-        closed, _ = await self.market.ensure_tf(tf, count)
+        closed, _ = await self.market.feed_for(symbol).ensure_tf(tf, count)
         rows = closed[-count:]
         if not rows:
             return empty_rates()
@@ -748,78 +1089,77 @@ class LiveDataSource(DataSource):
         )
 
     async def get_forming_bar(self, symbol: str, tf: str) -> dict | None:
-        _, forming = await self.market.ensure_tf(tf, 2)
+        _, forming = await self.market.feed_for(symbol).ensure_tf(tf, 2)
         return forming
 
     async def get_tick(self, symbol: str) -> Tick:
+        feed = self.market.feed_for(symbol)
         if (
-            self.market.tick is None
-            or self.market.data_age_s > max(3.0, self.market.poll_seconds * 1.5)
+            feed.tick is None
+            or feed.data_age_s > max(3.0, feed.poll_seconds * 1.5)
         ):
             try:
-                await self.market.poll_once()
+                await feed.poll_once()
             except Exception as exc:  # noqa: BLE001
                 raise DataSourceError(f"live quote unavailable: {exc}") from exc
-        tick = self.market.tick
+        tick = feed.tick
         if tick is None:
             raise DataSourceError("no live market data yet")
         return tick
 
     def subscribe_ticks(self, symbol: str) -> AsyncIterator[Tick]:
-        return self._tick_stream(symbol)
-
-    async def _tick_stream(self, symbol: str) -> AsyncIterator[Tick]:
-        try:
-            if self.market.tick is None:
-                try:
-                    await self.market.poll_once()
-                except Exception:  # noqa: BLE001 — the loop below retries anyway
-                    pass
-            while True:
-                tick = self.market.tick
-                if tick is not None:
-                    yield tick
-                await self.market.next_data(
-                    timeout=max(2.0, self.market.poll_seconds * 2)
-                )
-        except asyncio.CancelledError:
-            return
+        return self.market.feed_for(symbol).tick_stream()
 
     def discover_symbols(self, pattern: str = "*XAUUSD*") -> list[str]:
         return [self.SYMBOL]
 
     def symbol_info(self, symbol: str) -> SymbolInfo:
-        return LIVE_SYMBOL_INFO
+        feed = self.market.feed_for(symbol)
+        return self.SYMBOL_INFOS.get(feed.spec.key, GOLD_SYMBOL_INFO)
 
     def point_size(self, symbol: str) -> float:
-        return LIVE_SYMBOL_INFO.point
+        return self.symbol_info(symbol).point
 
     # ------------------------------------------------------- paper trading
 
     def feed_status(self) -> dict:
-        """Live-feed transparency (user req #5) — surfaced in status + WS."""
-        t = self.market.tick
+        """Live-feed transparency (user req #5) — surfaced in status + WS.
+
+        Top-level block = the GOLD feed (back-compat); `symbols` carries the
+        per-symbol D-035 view (incl. BTCUSD + MT5 authority flags) and `mt5`
+        exposes the terminal overlay state for honest weekend badges.
+        """
+        gold = self.market.symbol_status("XAUUSD")
         st: dict = {
-            "provider": self.market.provider,
-            "detail": self.market.provider_detail,
-            "last_price": round((t.bid + t.ask) / 2, 2) if t else None,
-            "spread": round(t.ask - t.bid, 2) if t else None,
-            "last_tick_age_s": (
-                round(self.market.data_age_s, 1)
-                if self.market.last_data_monotonic > 0 else None
-            ),
+            "provider": gold["provider"],
+            "detail": gold["detail"],
+            "last_price": gold["last_price"],
+            "spread": gold["spread"],
+            "last_tick_age_s": gold["last_tick_age_s"],
         }
-        # D-033: real-time tick rate + per-venue stream health
-        tps = self.market._agg_tps()
-        if tps is not None:
-            st["tps"] = tps
-            st["venues"] = self.market._agg.stats()
+        if "tps" in gold:
+            st["tps"] = gold["tps"]
+        if "venues" in gold:
+            st["venues"] = gold["venues"]
+        st["symbols"] = {
+            key: self.market.symbol_status(key) for key in self.market.feeds
+        }
+        if self.market.mcp is not None:
+            st["mt5"] = self.market.mcp.status()
+            if not gold.get("mt5"):
+                st["note"] = (
+                    "MT5 forex feed inactive (weekend/holiday or terminal down) "
+                    "— live crypto composite active; MT5 resumes automatically"
+                )
         return st
+
+    def _contract_for(self, symbol: str) -> float:
+        return self.symbol_info(symbol).contract_size
 
     def _floating_profit(self, p: Position, bid: float, ask: float) -> float:
         exit_price = bid if p.side == "BUY" else ask
         direction = 1.0 if p.side == "BUY" else -1.0
-        return (exit_price - p.price_open) * direction * 100.0 * p.volume
+        return (exit_price - p.price_open) * direction * self._contract_for(p.symbol) * p.volume
 
     async def place_order(self, order: Order) -> OrderResult:
         if not self._connected:
@@ -851,9 +1191,10 @@ class LiveDataSource(DataSource):
     async def get_positions(self) -> list[Position]:
         if not self._positions:
             return []
-        tick = self.market.tick
         out: list[Position] = []
         for p in self._positions:
+            feed = self.market.feed_for(p.symbol)
+            tick = feed.tick
             if tick is not None:
                 out.append(
                     dataclasses_replace(
@@ -889,9 +1230,10 @@ class LiveDataSource(DataSource):
             return None
         balance = self._account.balance
         floating = 0.0
-        tick = self.market.tick
-        if tick is not None:
-            for p in self._positions:
+        for p in self._positions:
+            feed = self.market.feed_for(p.symbol)
+            tick = feed.tick
+            if tick is not None:
                 floating += self._floating_profit(p, tick.bid, tick.ask)
         self._account.equity = balance + floating
         return {

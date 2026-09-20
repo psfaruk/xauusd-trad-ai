@@ -121,10 +121,22 @@ never simulated. The watchdog supervises Xvfb + openbox + the terminal and
 skips the whole stack automatically where it is not installed (e.g. Railway,
 which keeps serving real-time market DATA only).
 
-**LIVE mode (default, D-030/D-033) — real-time data without any MT5 terminal.**
-The backend aggregates five key-less public venues over WebSocket and pushes
-EVERY real market event the instant it happens — tens of ticks per second in
-active sessions; the forming candle absorbs all of them:
+**MT5 = the primary MARKET-DATA source too (D-035).** While the broker feed
+for a symbol is ticking (market open), quotes AND candles come from the real
+forex market through the terminal (1s tick poll + authoritative M1..D1 chart
+history). When forex closes (weekend) or the terminal is down, the platform
+transparently falls back to the 24/7 crypto composite and switches back to
+the broker feed automatically at the Monday open — the badge always shows
+which source is live (`LIVE · MT5 · broker feed` vs `LIVE · crypto composite`
++ a weekend note). **BTCUSD is a full second pair** (own chart, ticks,
+candles, signal engine, trading); XAUUSD ↔ BTCUSD switch with the instrument
+chips next to the timeframe switcher, and the real MT5 account balance /
+equity / open positions are always visible in the dashboard footer.
+
+**LIVE mode (default, D-030/D-033/D-035) — MT5 terminal first, crypto
+composite 24/7.** The backend pushes EVERY real market event the instant it
+happens — tens of ticks per second in active sessions; the forming candle
+absorbs all of them:
 
 - **Five-venue WS aggregate (D-033, primary)** — Binance `PAXG/USDT`+
   `PAXG/USDC` (bookTicker/aggTrade/depth@100ms via `data-stream.binance.vision`,

@@ -64,6 +64,7 @@ class ConnectionManager:
         self.trading_manager: Any = None  # Phase 4 — set by main.py wiring
         self.state = ConnectionState()
         self.runtime: Any = None  # EngineRuntime while connected
+        self.runtimes: dict[str, Any] = {}  # extra symbol engines (D-035)
         self._creds: dict | None = None  # last creds (memory) for reconnect
         self._heartbeat_task: asyncio.Task | None = None
         self._fernet: Any = None
@@ -170,6 +171,9 @@ class ConnectionManager:
         if self.runtime is not None:
             await self.runtime.stop()
             self.runtime = None
+        for rt in self.runtimes.values():
+            await rt.stop()
+        self.runtimes = {}
         if self._hub is None or self._repo is None:
             return  # bare mode (tests) — no streaming
         cfg = None
@@ -193,6 +197,33 @@ class ConnectionManager:
         )
         await self.runtime.start()
 
+        # D-035 — extra engine runtimes for the additional pairs the source
+        # streams (BTCUSD): every platform symbol gets its own signal engine.
+        extra_symbols = [
+            s for s in (getattr(self._source, "platform_symbols", None) or [])
+            if s and s != self.state.symbol
+        ]
+        for sym in extra_symbols:
+            point = 0.01
+            point_getter = getattr(self._source, "point_size", None)
+            if callable(point_getter):
+                try:
+                    point = point_getter(sym)
+                except Exception:  # noqa: BLE001 — default point is fine
+                    pass
+            rt = EngineRuntime(
+                source=self._source,
+                hub=self._hub,
+                repo=self._repo,
+                symbol=sym,
+                point_size=point,
+                cfg=cfg,
+                news_service=self._news,
+                trading_manager=self.trading_manager,
+            )
+            await rt.start()
+            self.runtimes[sym] = rt
+
     async def _stop_runtime(self) -> None:
         if self.runtime is not None:
             try:
@@ -200,6 +231,12 @@ class ConnectionManager:
             except Exception:  # noqa: BLE001
                 logger.warning("runtime stop raised", exc_info=True)
             self.runtime = None
+        for sym, rt in list(self.runtimes.items()):
+            try:
+                await rt.stop()
+            except Exception:  # noqa: BLE001
+                logger.warning("runtime %s stop raised", sym, exc_info=True)
+        self.runtimes = {}
 
     # ------------------------------------------------------------- persistence
 
@@ -401,6 +438,8 @@ class ConnectionManager:
         st = {
             "status": self.state.status,
             "symbol": self.state.symbol,
+            "symbols": [self.state.symbol] + list(self.runtimes.keys())
+            if self.state.status == "connected" else [],
             "account": {
                 "balance": account.get("balance") if account else None,
                 "equity": account.get("equity") if account else None,
@@ -411,6 +450,9 @@ class ConnectionManager:
             },
             "broker_time_utc_offset": offset,
             "engine_running": self.runtime is not None and self.runtime.running,
+            "extra_engines": {
+                sym: rt.running for sym, rt in self.runtimes.items()
+            },
         }
         # Live-feed transparency (D-030): provider + price + data age
         feed_status = getattr(self._source, "feed_status", None)
@@ -426,6 +468,8 @@ class ConnectionManager:
             return
         st = await self.status()
         payload = {"status": st["status"], "symbol": st["symbol"]}
+        if "symbols" in st:
+            payload["symbols"] = st["symbols"]
         if "feed" in st:
             payload["feed"] = st["feed"]
         await self._hub.broadcast_all("mt5_status", payload)

@@ -186,6 +186,32 @@ class MT5TerminalClient:
         res = self._call("get_marketwatch_symbols", timeout=30)
         return res.get("symbols", []) if isinstance(res, dict) else []
 
+    # ------------------------------------------------- market data (D-035)
+    def ticks(self, symbol: str, dt_from: str, dt_to: str) -> list[dict[str, Any]]:
+        """Recent tick history: [{time_ms, bid, ask}, ...] (terminal format)."""
+        res = self._call(
+            "get_chart_ticks_history",
+            {"datetime_from": dt_from, "datetime_to": dt_to,
+             "symbol": symbol, "limit": 100000},
+            timeout=10,
+        )
+        if isinstance(res, dict):
+            return res.get("history", []) or []
+        return []
+
+    def bars(self, symbol: str, period: str, dt_from: str, dt_to: str,
+             limit: int = 1000) -> list[dict[str, Any]]:
+        """Chart history bars: [{time, open, high, low, close, tick_volume}, ...]."""
+        res = self._call(
+            "get_chart_history",
+            {"datetime_from": dt_from, "datetime_to": dt_to,
+             "symbol": symbol, "period": period, "limit": limit},
+            timeout=25,
+        )
+        if isinstance(res, dict):
+            return res.get("history", []) or []
+        return []
+
     def market_order(self, symbol: str, side: str, volume: float,
                      sl: float | None = None, tp: float | None = None,
                      comment: str = "") -> dict[str, Any]:

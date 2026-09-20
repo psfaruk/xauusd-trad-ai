@@ -1,9 +1,8 @@
-"""routes_market — SPEC §7.1 market endpoints (Phase 2 + Phase 4 external).
+"""routes_market — SPEC §7.1 market endpoints (Phase 2 + Phase 4 + D-035).
 
-GET /api/candles?tf=M15&limit=500  (auth) closed-bars OHLCV backfill
-GET /api/positions                 (auth) open MT5 positions
-GET /api/market/external           (auth) free external reference data
-                                            (Binance PAXG gold, ECB FX)
+GET /api/candles?tf=M15&limit=500&symbol=BTCUSD  (auth) closed-bars backfill
+GET /api/positions                                (auth) open MT5 positions
+GET /api/market/external                          (auth) external references
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ async def candles(
     user: CurrentUser,
     tf: str = Query(default="M15", max_length=4),
     limit: int = Query(default=500, ge=10, le=1500),
+    symbol: str | None = Query(default=None, max_length=16),
 ) -> dict:
     try:
         validate_tf(tf)
@@ -33,8 +33,16 @@ async def candles(
             status_code=409,
             detail="MT5 not connected — connect first (POST /api/mt5/connect)",
         )
+    # D-035: any symbol the source streams is chartable (XAUUSD + BTCUSD)
+    sym = symbol or mgr.symbol
+    available = getattr(mgr.source, "platform_symbols", None) or []
+    if available and sym not in available and sym != mgr.symbol:
+        raise HTTPException(
+            status_code=404,
+            detail=f"symbol {sym} not served (available: {available})",
+        )
     try:
-        df = await mgr.source.get_rates(mgr.symbol, tf, limit)
+        df = await mgr.source.get_rates(sym, tf, limit)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"get_rates failed: {exc}") from exc
     bars = [
@@ -50,7 +58,7 @@ async def candles(
             df["time_utc"], df["o"], df["h"], df["l"], df["c"], df["v"], strict=True
         )
     ]
-    return {"symbol": mgr.symbol, "tf": tf, "count": len(bars), "candles": bars}
+    return {"symbol": sym, "tf": tf, "count": len(bars), "candles": bars}
 
 
 @router.get("/positions")

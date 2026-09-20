@@ -227,12 +227,15 @@ class SignalEngine:
         signal_id = await self._repo.insert(payload, symbol, tf)
         self._last_signal_bar = bar_open
         await self._hub.broadcast_all(
-            "signal", {**payload, "id": signal_id, "ts": bar_open.isoformat()}
+            "signal",
+            {**payload, "id": signal_id, "ts": bar_open.isoformat(),
+             "symbol": symbol, "tf": tf},
         )
         if self.on_signal is not None:
             try:
                 await self.on_signal(
-                    {**payload, "id": signal_id, "ts": bar_open.isoformat()},
+                    {**payload, "id": signal_id, "ts": bar_open.isoformat(),
+                     "symbol": symbol, "tf": tf},
                     symbol,
                     self._point_size,
                 )

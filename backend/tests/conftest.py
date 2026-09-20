@@ -17,6 +17,12 @@ import pytest
 # import app.main at collection time).
 os.environ.setdefault("DATA_SOURCE", "mock")
 os.environ.setdefault("ALLOW_DEMO", "1")
+# D-035: hermetic MT5 overlay — the sandbox runs a REAL terminal on
+# 127.0.0.1:22346, which unit tests must never touch. Point the MCP client
+# at a dead endpoint so MarketFeed stays crypto-composite-only in tests.
+os.environ["MT5_MCP_URL"] = "http://127.0.0.1:9/mcp"
+os.environ["MT5_MCP_KEY_FILE"] = "/nonexistent/mt5-key.txt"
+os.environ.setdefault("MT5_TIME_SHIFT_S", "0")
 
 from app.mt5.base import TIMEFRAME_MINUTES  # noqa: E402
 from app.mt5.mock_source import MockDataSource  # noqa: E402

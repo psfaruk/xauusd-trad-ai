@@ -51,8 +51,14 @@ export function getMe(token: string): Promise<MeInfo> {
 
 /* ------------------------------------------------------------- market data */
 
-export function getCandles(token: string, tf: string, limit = 500): Promise<CandlesResponse> {
-  return request<CandlesResponse>(`/api/candles?tf=${tf}&limit=${limit}`, {}, token);
+export function getCandles(
+  token: string,
+  tf: string,
+  limit = 500,
+  symbol?: string
+): Promise<CandlesResponse> {
+  const qs = symbol ? `&symbol=${encodeURIComponent(symbol)}` : "";
+  return request<CandlesResponse>(`/api/candles?tf=${tf}&limit=${limit}${qs}`, {}, token);
 }
 
 export function getPositions(token: string): Promise<{ positions: Position[] }> {

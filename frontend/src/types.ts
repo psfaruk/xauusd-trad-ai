@@ -83,11 +83,38 @@ export interface FeedStatus {
   /** D-033: real events/sec + per-venue stream health. */
   tps?: number | null;
   venues?: Record<string, { ok: boolean; events: number; age_s: number | null; err: string | null }>;
+  /** D-035: per-symbol view (XAUUSD + BTCUSD) — `mt5: true` = real broker
+   * feed from the MetaTrader 5 terminal is the authority for that symbol. */
+  symbols?: Record<string, SymbolFeedStatus>;
+  mt5?: Record<string, Mt5FeedVenueStatus>;
+  note?: string;
+}
+
+export interface SymbolFeedStatus {
+  provider: string;
+  detail: string;
+  mt5: boolean;
+  last_price: number | null;
+  spread: number | null;
+  last_tick_age_s: number | null;
+  tps?: number | null;
+  venues?: Record<string, { ok: boolean; events: number; age_s: number | null; err: string | null }>;
+}
+
+export interface Mt5FeedVenueStatus {
+  ok: boolean;
+  broker_symbol: string | null;
+  events: number;
+  age_s: number | null;
+  tps: number | null;
+  err: string | null;
 }
 
 export interface Mt5Status {
   status: "connected" | "disconnected" | "reconnecting";
   symbol: string | null;
+  /** D-035: every chartable symbol (XAUUSD + BTCUSD). */
+  symbols?: string[];
   account: {
     balance: number | null;
     equity: number | null;
@@ -314,6 +341,8 @@ export interface WsMt5StatusMsg {
   type: "mt5_status";
   status: Mt5Status["status"];
   symbol: string | null;
+  /** D-035: every chartable symbol (XAUUSD + BTCUSD). */
+  symbols?: string[];
   feed?: FeedStatus;
 }
 

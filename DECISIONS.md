@@ -192,3 +192,63 @@ zero console errors. 194 tests green, ruff/tsc/vite clean.
 **Secrets:** the MCP bearer key lives only in /home/z/mt5stack/mcp_key.txt
 (gitignored, outside the repo); the API reads it via MT5_MCP_KEY_FILE.
 Account credentials live in the terminal's encrypted profile only.
+
+---
+
+## D-035 — MT5-first market data, BTCUSD pair, chart hardening
+
+**Context (user directive):** "market data forex market theke asok, meta
+trader 5 theke" — data must come from the FOREX market through MetaTrader 5;
+the weekend-closed logic must be handled; candles were updating incorrectly
+and the chart broke; add BTCUSD as a second pair; show the MT5 account
+(balance/trades/history) directly in the frontend.
+
+**Decision:**
+1. **MT5 terminal = primary market-data source** (`app/mt5/mcp_market.py`):
+   a 1s poller per watched symbol pulls REAL broker ticks via the terminal
+   MCP `get_chart_ticks_history` (bid/ask), and `get_chart_history` becomes
+   the AUTHORITATIVE candle source (M1..D1 + forming bar) while the symbol's
+   broker ticks are fresh. Symbol mapping auto-discovered from Market Watch
+   (XAUUSD→XAUUSDm, BTCUSD→BTCUSDm). Terminal timestamps verified UTC
+   (one-time calibration against the 24/7 BTC feed; `MT5_TIME_SHIFT_S`
+   overrides).
+2. **Weekend logic (failover both ways, automatic):** while MT5 ticks are
+   FRESH the broker feed is the authority — crypto events are counted for
+   venue health but never move the quote or candles (different price
+   basis). When MT5 goes stale (forex closed Sat/Sun, terminal down) the
+   crypto composite takes over seamlessly; on the Monday open MT5 resumes
+   authority by itself. Honest `note` badge explains the state; the
+   source-switch also triggers exactly ONE candle refetch (see #4).
+3. **Per-symbol feeds (`SymbolFeedCore` in live_source.py):** XAUUSD (5-venue
+   gold composite fallback) + BTCUSD (new pair: Binance BTC/USDT composite
+   fallback + Yahoo BTC-USD history). Broker-suffix routing (BTCUSDm →
+   BTCUSD), per-symbol contract sizes (gold 100 / BTC 1), per-symbol
+   tick streams, candles REST `?symbol=`, and a SECOND EngineRuntime for
+   BTCUSD (its own SFP signal engine + tracker). Signal broadcasts now
+   carry `symbol` + `tf`.
+4. **Chart-breaking root causes fixed:**
+   - 15s heartbeat `mt5_status` invalidated candles on EVERY broadcast →
+     constant full setData resets racing live updates. Now refetch only on
+     a real symbol or SOURCE change (provider:mt5↔composite transition).
+   - `parse_terminal_time` required milliseconds; chart-history bars are
+     second-precision → every MT5 bar silently dropped → Binance fallback
+     (wrong volumes/basis). Now both formats parse; platform candles match
+     the terminal EXACTLY (O/C/V verified identical).
+   - Bars now track the MID price (was bid-only); `bar_close` reconcile
+     MERGES (h/l never move backward) instead of replacing.
+   - Chart.tsx hardened: sanitize (sort/dedupe/finite) before setData,
+     try/catch + `onDesync` self-heal refetch on rejected updates.
+5. **Frontend:** SymbolSwitcher chips (XAUUSD|BTCUSD with per-symbol feed
+   dot), TopBar shows the selected symbol + "LIVE · MT5 · broker feed"
+   badge + weekend note, and the REAL MT5 account (balance/equity/floating
+   P/L/open positions) sits in the dashboard footer (10s poll, click opens
+   the full panel) — visible immediately after MT5 connects.
+
+**Verification:** 206 tests green (12 new: tick/bar parsing incl.
+second-precision, dedupe, freshness, authority policy, weekend failover,
+multi-symbol routing, contract sizes); live sandbox e2e — BTCUSD provider
+`mt5` @ real Exness prices with platform M1s EXACTLY matching terminal bars
+(O 81208.64 C 81229.38 V 79 identical), XAUUSD composite 19 t/s on the
+Sunday, dual-symbol WS (ticks + bar frames per symbol), both engines
+running, browser e2e: symbol switch, LIVE · MT5 badge, weekend note, MT5
+footer strip, zero console errors.

@@ -17,6 +17,8 @@ interface TopBarProps {
   lastPrice: { bid: number; ask: number } | null;
   lastTickAt: number | null;
   tps: number | null;
+  /** D-035: the charted instrument (XAUUSD | BTCUSD). */
+  symbol?: string;
 }
 
 /**
@@ -25,7 +27,7 @@ interface TopBarProps {
  * 3-dot menu with every grouped function.
  */
 export default function TopBar({
-  mt5, dataSource, tradingConnected, menuActions, isAdmin, onOpenTrade, lastPrice, lastTickAt, tps,
+  mt5, dataSource, tradingConnected, menuActions, isAdmin, onOpenTrade, lastPrice, lastTickAt, tps, symbol,
 }: TopBarProps) {
   const { session } = useAuth();
   const email = session?.user?.email ?? null;
@@ -69,25 +71,32 @@ export default function TopBar({
 
   /* D-030 live-feed badge: real-time provider + freshness pulse.
    * Liveness is derived from ACTUAL WS tick recency (updates every ~2s);
-   * the status-payload feed age is the fallback before the first tick. */
+   * the status-payload feed age is the fallback before the first tick.
+   * D-035: the badge reflects the SELECTED symbol's feed — "MT5 · broker"
+   * when the terminal's broker ticks are the authority, the crypto
+   * composite label otherwise (forex closed / terminal down). */
   const feed = mt5?.feed;
+  const symFeed = symbol ? feed?.symbols?.[symbol] : undefined;
+  const effProvider = symFeed?.provider ?? feed?.provider ?? "";
   const tickAgeS =
     lastTickAt !== null ? Math.max(0, (Date.now() - lastTickAt) / 1000) : null;
-  const dataAgeS = tickAgeS ?? feed?.last_tick_age_s ?? null;
+  const dataAgeS = tickAgeS ?? symFeed?.last_tick_age_s ?? feed?.last_tick_age_s ?? null;
   const liveActive =
     dataSource === "live" &&
     status === "connected" &&
     !!feed &&
-    feed.provider !== "degraded" &&
+    effProvider !== "degraded" &&
     (dataAgeS ?? 999) < 15;
   const providerLabel =
-    feed?.provider === "aggregate"
-      ? "5-venue real-time"
-      : feed?.provider === "binance"
-        ? "Binance PAXG"
-        : feed?.provider === "goldapi"
-          ? "gold-api XAU"
-          : feed?.provider ?? "live";
+    symFeed?.mt5 || effProvider === "mt5"
+      ? "MT5 · broker feed"
+      : effProvider === "aggregate"
+        ? "crypto composite"
+        : effProvider === "binance"
+          ? "Binance composite"
+          : effProvider === "goldapi"
+            ? "gold-api XAU"
+            : effProvider || "live";
 
   /* price direction flash (up=green / down=red / flat=neutral) */
   const prevPrice = useRef<number | null>(null);
@@ -133,7 +142,7 @@ export default function TopBar({
 
       <span className={`rounded-full border px-2.5 py-0.5 text-xs font-medium ${pill}`}>
         {status === "connected" ? "● " : status === "reconnecting" ? "◌ " : "○ "}
-        {mt5?.symbol ?? "MT5"} · {status}
+        {symbol ?? mt5?.symbol ?? "MT5"} · {status}
         {dataSource === "mock" && <span className="ml-1 text-gold/80">(demo)</span>}
       </span>
 
@@ -176,7 +185,18 @@ export default function TopBar({
           className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-0.5 text-xs font-medium text-amber-300"
           title={feed?.detail ?? "waiting for live data"}
         >
-          live feed {feed?.provider === "degraded" ? "degraded — retrying" : "connecting…"}
+          live feed {effProvider === "degraded" ? "degraded — retrying" : "connecting…"}
+        </span>
+      )}
+
+      {/* D-035: honest weekend/terminal-down notice — only while the
+       * SELECTED symbol runs on the composite (XAU forex closed etc.) */}
+      {feed?.note && !symFeed?.mt5 && (
+        <span
+          className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2.5 py-0.5 text-[11px] text-sky-300"
+          title={feed.note}
+        >
+          {feed.note}
         </span>
       )}
 

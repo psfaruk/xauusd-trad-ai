@@ -150,6 +150,24 @@ VENUES: tuple[VenueConfig, ...] = (
     ),
 )
 
+#: BTC composite (D-035) — Binance BTC/USDT keeps the BTCUSD chart alive
+#: 24/7 whenever the MT5 terminal is unreachable (broker BTC trades 24/7,
+#: so MT5 stays the authority whenever the terminal is up).
+BTC_BINANCE_STREAMS = "/".join((
+    "btcusdt@bookTicker",
+    "btcusdt@aggTrade",
+))
+BTC_VENUES: tuple[VenueConfig, ...] = (
+    VenueConfig(
+        name="binance-btc",
+        urls=(
+            f"wss://data-stream.binance.vision/stream?streams={BTC_BINANCE_STREAMS}",
+            f"wss://stream.binance.com:9443/stream?streams={BTC_BINANCE_STREAMS}",
+        ),
+        subscribe=(),  # streams are in the URL
+    ),
+)
+
 
 # ------------------------------------------------------------------- parsing
 
@@ -267,6 +285,7 @@ def parse_coinbase(msg: dict, st: VenueState) -> tuple[float, float, float] | No
 
 PARSERS = {
     "binance": parse_binance,
+    "binance-btc": parse_binance,  # same combined-stream shape (D-035)
     "bybit": parse_bybit,
     "okx": parse_okx,
     "kraken": parse_kraken,

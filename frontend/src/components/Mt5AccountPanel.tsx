@@ -9,6 +9,8 @@ interface Mt5AccountPanelProps {
   open: boolean;
   onClose: () => void;
   token: string;
+  /** D-035: instrument selected on the dashboard (XAUUSD | BTCUSD). */
+  defaultSymbol?: string;
 }
 
 type Tab = "positions" | "history" | "order";
@@ -19,13 +21,13 @@ type Tab = "positions" | "history" | "order";
  * detailed trade history and manual market orders — all executed by the
  * genuine MT5 terminal, never simulated.
  */
-export default function Mt5AccountPanel({ open, onClose, token }: Mt5AccountPanelProps) {
+export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol }: Mt5AccountPanelProps) {
   const [tab, setTab] = useState<Tab>("positions");
   const [account, setAccount] = useState<Mt5Account | null>(null);
   const [positions, setPositions] = useState<Mt5OpenPosition[] | null>(null);
   const [history, setHistory] = useState<Mt5HistoryPosition[] | null>(null);
   const [symbols, setSymbols] = useState<Mt5Symbol[]>([]);
-  const [symbol, setSymbol] = useState("XAUUSDm");
+  const [symbol, setSymbol] = useState(defaultSymbol ?? "XAUUSDm");
   const [volume, setVolume] = useState("0.10");
   const [sl, setSl] = useState("");
   const [tp, setTp] = useState("");

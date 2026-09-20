@@ -123,6 +123,7 @@ class MarketStream:
         now_mono = time_mod.monotonic()
         self._event_times.append(now_mono)
         self._ticks_since_send += 1
+        mid = (tick.bid + tick.ask) / 2  # D-035: bars track the mid, not just bid
 
         # tick frames — throttled, latest-quote-wins, with the REAL rate.
         if now_mono - self._last_tick_sent >= TICK_SEND_MIN_S:
@@ -155,16 +156,16 @@ class MarketStream:
                 self._last_bar_sent[tf] = now_mono
             elif fb.t != bucket:
                 await self._close_bar(tf, fb)
-                nb = FormingBar(t=bucket, o=tick.bid, h=tick.bid, low=tick.bid, c=tick.bid, v=1)
+                nb = FormingBar(t=bucket, o=mid, h=mid, low=mid, c=mid, v=1)
                 self._forming[tf] = nb
                 await self._hub.broadcast_market(
                     "bar_open", self._symbol, tf, {"candle": nb.as_dict()}
                 )
                 self._last_bar_sent[tf] = now_mono
             else:
-                fb.h = max(fb.h, tick.bid)
-                fb.low = min(fb.low, tick.bid)
-                fb.c = tick.bid
+                fb.h = max(fb.h, mid)
+                fb.low = min(fb.low, mid)
+                fb.c = mid
                 fb.v += 1
                 # forming bar ALWAYS absorbs the tick; frames are throttled
                 if now_mono - self._last_bar_sent.get(tf, 0.0) >= BAR_SEND_MIN_S:
@@ -196,20 +197,33 @@ class MarketStream:
             return None
 
     async def _close_bar(self, tf: str, fb: FormingBar) -> None:
-        """Close + reconcile with the authoritative terminal bar, then notify."""
+        """Close + reconcile with the authoritative bar, then notify.
+
+        D-035: MERGE instead of replace — the authoritative OHLC wins on
+        open/close/volume, but high/low never move backward (a late quote
+        during the roll second must not shrink an already-seen extreme).
+        """
         bar = fb.as_dict()
         try:
             df = await self._source.get_rates(self._symbol, tf, 1)
             if len(df) == 1:
                 t = int(df["time_utc"].iloc[-1].timestamp())
                 if t == fb.t:
-                    bar = {
+                    auth = {
                         "t": t,
                         "o": float(df["o"].iloc[-1]),
                         "h": float(df["h"].iloc[-1]),
                         "l": float(df["l"].iloc[-1]),
                         "c": float(df["c"].iloc[-1]),
                         "v": int(df["v"].iloc[-1]),
+                    }
+                    bar = {
+                        "t": t,
+                        "o": auth["o"],
+                        "h": max(auth["h"], fb.h),
+                        "l": min(auth["l"], fb.low),
+                        "c": auth["c"],
+                        "v": max(auth["v"], fb.v),
                     }
         except Exception:  # noqa: BLE001 — fall back to the tick-built bar
             logger.debug("authoritative reconcile failed for %s close", tf)
