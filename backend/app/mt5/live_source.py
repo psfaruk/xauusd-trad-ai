@@ -6,17 +6,23 @@ MockDataSource, which shows FAKE prices. This source streams REAL gold prices
 24/7 from key-less public APIs instead:
 
 Provider chain (ordered failover, C6 graceful degrade):
-1. Binance PAXG/USDT — PRIMARY quotes + candles. PAXG is a regulated,
-   physical-gold-backed token (1 PAXG = 1 fine troy ounce, Paxos), so
-   PAXG/USDT tracks spot XAUUSD within a fraction of a percent and trades
-   around the clock. `bookTicker` -> real bid/ask every poll; `klines` ->
-   authoritative OHLCV for every timeframe (native Binance intervals map 1:1
-   onto M1..D1).
-2. gold-api.com — QUOTE fallback (spot XAU mid, synthetic 0.35 spread) when
+1. MULTI-VENUE WebSocket aggregate (D-033) — REAL tick-by-tick events from
+   five gold venues (Binance PAXG+USDC, Bybit XAUT, OKX PAXG+XAUT, Kraken
+   PAXG, Coinbase PAXG) via app.mt5.tick_feed. Every real market event
+   (book update / trade) becomes a tick the instant it happens — tens of
+   events per second in active sessions; forming candles absorb them all.
+2. Binance PAXG/USDT REST — quotes + candles fallback when WS is silent.
+   `bookTicker` -> real bid/ask every poll; `klines` -> authoritative
+   OHLCV for every timeframe (native Binance intervals map 1:1 onto M1..D1).
+3. gold-api.com — QUOTE fallback (spot XAU mid, synthetic 0.35 spread) when
    Binance is unreachable (e.g. regional 451 geo-blocks on datacenter IPs).
-3. Yahoo Finance GC=F — HISTORY fallback (COMEX gold-futures candles).
-4. Tick-built candles — last resort: M1+ bars aggregated live from whatever
-   quote provider still answers (charts fill in over time).
+4. Yahoo Finance GC=F — HISTORY fallback (COMEX gold-futures candles).
+5. Tick-built candles — M1+ bars aggregated live from whatever quote
+   provider still answers (charts fill in over time).
+
+NEVER demo: there is NO mock fallback anymore (D-033, user directive) —
+when every provider is unreachable the platform shows "no feed" and keeps
+retrying; it never displays synthetic prices.
 
 Basis note (transparency, user req #5): candle/quote data is PAXG-based and
 can differ from a specific broker's XAUUSD feed by a few tenths of a percent.
@@ -37,6 +43,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dataclasses_replace
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 import pandas as pd
@@ -76,6 +83,7 @@ STALE_DATA_S = 90.0     # is_connected -> False past this quote age
 CACHE_TTL_S = 15.0      # TF kline cache freshness
 MIN_REFETCH_S = 5.0     # forced-refetch rate cap (session gaps must not hammer)
 M1_TICK_KEEP = 4320     # 3 days of tick-built M1 bars kept in memory
+WS_REST_REFRESH_S = 30.0  # WS healthy: REST only refreshes klines this often
 
 # Lot-sizing metadata mirrors a typical Exness XAUUSD standard account.
 LIVE_SYMBOL_INFO = SymbolInfo(
@@ -182,6 +190,8 @@ class MarketFeed:
         poll_seconds: float = 2.0,
         binance_base: str = "",
         binance_bases: Sequence[str] | None = None,
+        enable_ws: bool = True,
+        ws_venues: Sequence[str] | None = None,
     ) -> None:
         self._http_factory = http_factory or _default_http_client
         self.poll_seconds = float(poll_seconds)
@@ -216,6 +226,43 @@ class MarketFeed:
         self._stop = asyncio.Event()
         self._new_data: asyncio.Event = asyncio.Event()
 
+        # D-033 — multi-venue WebSocket tick aggregate (REAL events only).
+        # Created here, started by start(); on_event is fully sync + fast.
+        self._agg: Any = None
+        self._enable_ws = bool(enable_ws)
+        self._ws_venue_names = tuple(ws_venues) if ws_venues else None
+
+    def _make_aggregator(self) -> Any:
+        from app.mt5.tick_feed import TickAggregator
+
+        return TickAggregator(
+            on_event=self._on_ws_event,
+            enabled_venues=self._ws_venue_names,
+        )
+
+    def _agg_tps(self) -> float | None:
+        if self._agg is None:
+            return None
+        return round(self._agg.tps(), 1)
+
+    def _ws_healthy(self) -> bool:
+        return self._agg is not None and self._agg.healthy_venue_count() > 0
+
+    def _on_ws_event(self, ev: Any) -> None:
+        """One REAL market event from any venue -> tick + forming-bar update."""
+        now = datetime.fromtimestamp(ev.ts, tz=UTC)
+        self.tick = Tick(bid=ev.bid, ask=ev.ask, time=now)
+        n_venues = self._agg.healthy_venue_count()
+        self.provider = "aggregate"
+        self.provider_detail = (
+            f"{n_venues}-venue real-time gold feed "
+            "(Binance/Bybit/OKX/Kraken/Coinbase)"
+        )
+        self.last_data_monotonic = time_mod.monotonic()
+        mid = (ev.bid + ev.ask) / 2
+        self._update_m1_tick(mid, ev.qty, now)
+        self._wake_listeners()
+
     # ------------------------------------------------------------- lifecycle
 
     async def start(self) -> None:
@@ -223,9 +270,19 @@ class MarketFeed:
             return
         self._stop.clear()
         self._task = asyncio.create_task(self._poll_loop(), name="live-feed")
+        if self._enable_ws:
+            self._agg = self._make_aggregator()
+            await self._agg.start()
+            logger.info(
+                "tick aggregator started — %d venue stream(s) (D-033)",
+                len(self._agg.states),
+            )
 
     async def stop(self) -> None:
         self._stop.set()
+        if self._agg is not None:
+            await self._agg.stop()
+            self._agg = None
         if self._task is not None:
             self._task.cancel()
             try:
@@ -251,7 +308,9 @@ class MarketFeed:
                     await self.poll_once()
                 except Exception:  # noqa: BLE001 — one bad cycle never kills the feed
                     logger.debug("live poll cycle failed", exc_info=True)
-                await asyncio.sleep(self.poll_seconds)
+                # WS healthy -> REST only augments (30s); otherwise poll hard.
+                delay = WS_REST_REFRESH_S if self._ws_healthy() else self.poll_seconds
+                await asyncio.sleep(delay)
         except asyncio.CancelledError:
             raise
 
@@ -308,30 +367,41 @@ class MarketFeed:
         raise last_exc
 
     async def poll_once(self) -> bool:
-        """One provider cycle (binance -> gold-api). True when data arrived."""
+        """One provider cycle. True when the feed has data (WS or REST).
+
+        D-033: a healthy WS aggregate short-circuits the REST quote chain —
+        REST only refreshes the authoritative forming M1. When WS is silent
+        the original chain runs (binance -> gold-api). NEVER falls back to
+        demo data: failure is reported, not faked.
+        """
+        ws = self._ws_healthy()
         try:
             await self._poll_binance()
             return True
         except Exception as exc:  # noqa: BLE001 — try the fallback
             logger.debug("binance poll failed: %s", exc)
+        if ws:
+            return True  # the WS aggregate carries the feed
         try:
             await self._poll_goldapi()
             return True
         except Exception as exc:  # noqa: BLE001
             logger.debug("gold-api poll failed: %s", exc)
         self.provider = "degraded"
-        self.provider_detail = "all free providers unreachable — retrying"
+        self.provider_detail = "all providers unreachable — retrying (never demo data)"
         return False
 
     async def _poll_binance(self) -> None:
         client = await self._client()
-        r = await self._binance_get(
-            client, "/api/v3/ticker/bookTicker", {"symbol": "PAXGUSDT"}, 4.0
-        )
-        d = r.json()
-        bid, ask = float(d["bidPrice"]), float(d["askPrice"])
-        if bid <= 0 or ask < bid:
-            raise DataSourceError(f"binance bookTicker invalid: {d!r}")
+        bid = ask = None
+        if not self._ws_healthy():
+            r = await self._binance_get(
+                client, "/api/v3/ticker/bookTicker", {"symbol": "PAXGUSDT"}, 4.0
+            )
+            d = r.json()
+            bid, ask = float(d["bidPrice"]), float(d["askPrice"])
+            if bid <= 0 or ask < bid:
+                raise DataSourceError(f"binance bookTicker invalid: {d!r}")
         # Authoritative forming M1 (klines weight 2 — cheap alongside quotes)
         try:
             rk = await self._binance_get(
@@ -346,11 +416,12 @@ class MarketFeed:
             self._m1_forming = forming
         except Exception:  # noqa: BLE001 — quotes are the critical path
             logger.debug("binance m1 klines failed (quotes still live)", exc_info=True)
-        self._apply_tick(
-            bid, ask, datetime.now(tz=UTC),
-            provider="binance",
-            detail="Binance PAXG/USDT (tokenized gold · 24/7)",
-        )
+        if bid is not None:
+            self._apply_tick(
+                bid, ask, datetime.now(tz=UTC),
+                provider="binance",
+                detail="Binance PAXG/USDT (tokenized gold · 24/7)",
+            )
 
     async def _poll_goldapi(self) -> None:
         client = await self._client()
@@ -368,15 +439,23 @@ class MarketFeed:
         )
 
     def _apply_tick(
-        self, bid: float, ask: float, now: datetime, provider: str, detail: str
+        self, bid: float, ask: float, now: datetime, provider: str, detail: str,
+        qty: float = 0.0,
     ) -> None:
         self.tick = Tick(bid=bid, ask=ask, time=now)
-        self.provider = provider
-        self.provider_detail = detail
+        if not (provider == "aggregate" and self._ws_healthy()):
+            self.provider = provider
+            self.provider_detail = detail
         self.last_data_monotonic = time_mod.monotonic()
+        self._update_m1_tick((bid + ask) / 2, qty, now)
+        self._wake_listeners()
 
-        # Maintain the tick-built M1 series (forming + rolled-closed history).
-        mid = (bid + ask) / 2
+    def _update_m1_tick(self, mid: float, qty: float, now: datetime) -> None:
+        """Fold one real event into the tick-built M1 series (D-033).
+
+        `qty` is the traded base size (PAXG/XAUT units) when the event was a
+        trade; book events carry 0 -> count as one activity tick.
+        """
         bucket = int(now.timestamp() // 60) * 60
         cur = self._m1_tick.pop(bucket, None)
         if cur is None:
@@ -384,14 +463,16 @@ class MarketFeed:
             for old_t in [t for t in self._m1_tick if t < bucket]:
                 self._m1_tick_history.append(self._m1_tick.pop(old_t))
             self._m1_tick_history = self._m1_tick_history[-M1_TICK_KEEP:]
-            self._m1_tick[bucket] = {"t": bucket, "o": mid, "h": mid, "l": mid, "c": mid, "v": 1}
+            self._m1_tick[bucket] = {
+                "t": bucket, "o": mid, "h": mid, "l": mid, "c": mid,
+                "v": max(1, int(round(qty))) if qty > 0 else 1,
+            }
         else:
             cur["h"] = max(cur["h"], mid)
             cur["l"] = min(cur["l"], mid)
             cur["c"] = mid
-            cur["v"] += 1
+            cur["v"] += max(1, int(round(qty))) if qty > 0 else 1
             self._m1_tick[bucket] = cur
-        self._wake_listeners()
 
     # ------------------------------------------------------------ tf requests
 
@@ -569,13 +650,17 @@ class LiveDataSource(DataSource):
         binance_bases: Sequence[str] | None = None,
         market: MarketFeed | None = None,
         starting_balance: float = DEMO_START_BALANCE,
-        connect_timeout_s: float = 10.0,
+        connect_timeout_s: float = 15.0,
+        enable_ws: bool = True,
+        ws_venues: Sequence[str] | None = None,
     ) -> None:
         self.market = market or MarketFeed(
             http_factory=http_factory,
             poll_seconds=poll_seconds,
             binance_base=binance_base,
             binance_bases=binance_bases,
+            enable_ws=enable_ws,
+            ws_venues=ws_venues,
         )
         self._owns_market = market is None
         self._connect_timeout_s = float(connect_timeout_s)
@@ -606,7 +691,8 @@ class LiveDataSource(DataSource):
             if self._owns_market:
                 await self.market.stop()
             raise DataSourceError(
-                "no live market provider reachable (binance + gold-api)"
+                "no live market provider reachable (5-venue WS + binance + "
+                "gold-api) — no demo fallback (D-033); retrying"
             )
         self._connected = True
         logger.info(
@@ -713,7 +799,7 @@ class LiveDataSource(DataSource):
     def feed_status(self) -> dict:
         """Live-feed transparency (user req #5) — surfaced in status + WS."""
         t = self.market.tick
-        return {
+        st: dict = {
             "provider": self.market.provider,
             "detail": self.market.provider_detail,
             "last_price": round((t.bid + t.ask) / 2, 2) if t else None,
@@ -723,6 +809,12 @@ class LiveDataSource(DataSource):
                 if self.market.last_data_monotonic > 0 else None
             ),
         }
+        # D-033: real-time tick rate + per-venue stream health
+        tps = self.market._agg_tps()
+        if tps is not None:
+            st["tps"] = tps
+            st["venues"] = self.market._agg.stats()
+        return st
 
     def _floating_profit(self, p: Position, bid: float, ask: float) -> float:
         exit_price = bid if p.side == "BUY" else ask

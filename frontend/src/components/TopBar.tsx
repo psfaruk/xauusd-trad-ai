@@ -16,6 +16,7 @@ interface TopBarProps {
   onOpenTrade: () => void;
   lastPrice: { bid: number; ask: number } | null;
   lastTickAt: number | null;
+  tps: number | null;
 }
 
 /**
@@ -24,13 +25,12 @@ interface TopBarProps {
  * 3-dot menu with every grouped function.
  */
 export default function TopBar({
-  mt5, dataSource, tradingConnected, menuActions, isAdmin, onOpenTrade, lastPrice, lastTickAt,
+  mt5, dataSource, tradingConnected, menuActions, isAdmin, onOpenTrade, lastPrice, lastTickAt, tps,
 }: TopBarProps) {
   const { session } = useAuth();
   const email = session?.user?.email ?? null;
   const [backend, setBackend] = useState<BackendState>("checking");
   const [source, setSource] = useState<string>("");
-  const [requested, setRequested] = useState<string>("");
 
   useEffect(() => {
     let alive = true;
@@ -40,7 +40,6 @@ export default function TopBar({
           if (!alive) return;
           setBackend(info.status === "ok" ? "up" : "down");
           setSource(info.data_source);
-          setRequested(info.requested_data_source ?? info.data_source);
         })
         .catch(() => alive && setBackend("down"));
     check();
@@ -82,7 +81,13 @@ export default function TopBar({
     feed.provider !== "degraded" &&
     (dataAgeS ?? 999) < 15;
   const providerLabel =
-    feed?.provider === "binance" ? "Binance PAXG" : feed?.provider === "goldapi" ? "gold-api XAU" : feed?.provider ?? "live";
+    feed?.provider === "aggregate"
+      ? "5-venue real-time"
+      : feed?.provider === "binance"
+        ? "Binance PAXG"
+        : feed?.provider === "goldapi"
+          ? "gold-api XAU"
+          : feed?.provider ?? "live";
 
   /* price direction flash (up=green / down=red / flat=neutral) */
   const prevPrice = useRef<number | null>(null);
@@ -132,26 +137,14 @@ export default function TopBar({
         {dataSource === "mock" && <span className="ml-1 text-gold/80">(demo)</span>}
       </span>
 
-      {/* D-032: unmistakable demo-data warning — mock prices are synthetic.
-       * Distinguish WHY: env-forced (DATA_SOURCE=mock) vs boot-degrade
-       * (recovery loop retries live every 60s). */}
+      {/* D-033: this banner can ONLY appear when a developer explicitly set
+       * ALLOW_DEMO=1 locally — deployments can never show demo prices. */}
       {source === "mock" && (
         <span
-          className={`rounded-full border px-2.5 py-0.5 text-xs font-semibold ${
-            requested === "live"
-              ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
-              : "border-red-500/40 bg-red-500/10 text-red-300"
-          }`}
-          title={
-            requested === "live"
-              ? "Live providers were unreachable at boot — auto-retrying every 60s (D-032)"
-              : "DATA_SOURCE=mock — synthetic demo prices. Set DATA_SOURCE=live (or remove the variable) and redeploy for REAL gold prices."
-          }
+          className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-0.5 text-xs font-semibold text-red-300"
+          title="ALLOW_DEMO=1 is set — synthetic dev prices. Unset ALLOW_DEMO and restart for the REAL live market."
         >
-          ⚠ DEMO DATA · synthetic prices
-          {requested === "live" && (
-            <span className="ml-1 font-normal text-amber-400/80">recovering…</span>
-          )}
+          ⚠ DEV DEMO · synthetic prices
         </span>
       )}
 
@@ -165,6 +158,14 @@ export default function TopBar({
             <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
           </span>
           LIVE · {providerLabel}
+          {tps != null && (
+            <span
+              className="rounded bg-emerald-500/20 px-1 font-mono tabular-nums text-[10px] font-bold text-emerald-200"
+              title="REAL market events per second (all venues, 5s window) — every one of them updates the forming candle"
+            >
+              ⚡ {Math.round(tps)} t/s
+            </span>
+          )}
           {dataAgeS !== null && (
             <span className="font-normal text-emerald-400/70">+{Math.round(dataAgeS)}s</span>
           )}

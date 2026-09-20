@@ -36,6 +36,7 @@ export default function Dashboard() {
   const [liveBar, setLiveBar] = useState<Candle | null>(null);
   const [lastPrice, setLastPrice] = useState<{ bid: number; ask: number } | null>(null);
   const [lastTickAt, setLastTickAt] = useState<number | null>(null);
+  const [tps, setTps] = useState<number | null>(null); // D-033: real ticks/sec
   const [account, setAccount] = useState<{
     balance: number; equity: number; currency: string;
     positions: { ticket: number; symbol: string; side: string; volume: number; profit: number }[];
@@ -101,6 +102,7 @@ export default function Dashboard() {
         case "tick":
           setLastPrice({ bid: msg.bid, ask: msg.ask });
           setLastTickAt(Date.now());
+          if (msg.tps != null) setTps(msg.tps);
           break;
         case "bar_open":
         case "bar_update":
@@ -131,6 +133,10 @@ export default function Dashboard() {
                 }
               : prev
           );
+          {
+            const feedTps = (msg as WsMt5StatusMsg).feed?.tps;
+            if (feedTps != null) setTps(feedTps);
+          }
           if (msg.symbol) {
             void queryClient.invalidateQueries({ queryKey: ["candles"] });
           }
@@ -251,6 +257,7 @@ export default function Dashboard() {
         onOpenTrade={() => (tradingConnected ? setTradePanelOpen(true) : setTradingOpen(true))}
         lastPrice={lastPrice}
         lastTickAt={lastTickAt}
+        tps={tps}
       />
 
       <main className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col gap-4 p-4 xl:flex-row">

@@ -9,8 +9,10 @@ catch-all.
 Deployment (D-016): when STATIC_DIR points at a built SPA, it is served at "/"
 with a history-mode fallback — the Railway single-service image.
 
-Demo mode (D-018): with DATA_SOURCE=mock the ConnectionManager auto-connects
-at startup so the dashboard streams immediately (Phase 2 mock AC).
+Demo mode (D-018, D-033): DATA_SOURCE=mock is a LOCAL-DEV-ONLY mode gated
+behind ALLOW_DEMO=1 — a deployment can never show synthetic prices. The
+default (and Railway image) runs DATA_SOURCE=live: real-time gold prices
+from five venue WebSocket streams, with NO demo fallback (D-033).
 """
 
 from __future__ import annotations
@@ -97,8 +99,10 @@ async def lifespan(app: FastAPI):
     )
 
     # --- Services: WS hub, news, repos, connection manager + engine runtime.
-    # D-030: DATA_SOURCE=live probes the free real-time provider chain once;
-    # on total failure it degrades to mock so the dashboard always streams.
+    # D-033: DATA_SOURCE=live is the only production mode — resolve returns a
+    # LiveDataSource even when no provider answers the boot probe; the feed
+    # keeps retrying (WS venue workers + REST loop) and NEVER substitutes
+    # demo prices.
     app.state.hub = WSHub()
     if settings.fmp_api_key:
         app.state.news = NewsService(
@@ -148,7 +152,10 @@ async def lifespan(app: FastAPI):
     if not any(isinstance(h, DBLogHandler) for h in root.handlers):
         root.addHandler(DBLogHandler(lambda: app.state.db_engine))
 
-    # --- D-018/D-030: mock + live auto-connect / mt5 stored-credential restore
+    # --- D-018/D-030/D-033: mock + live auto-connect / mt5 stored-credential
+    # restore. Live connect waits for the first REAL tick (WS or REST) — on
+    # total outage it raises, the status shows the no-feed state, and the
+    # ConnectionManager heartbeat retries connect() forever. NO demo data.
     if effective_data_source in ("mock", "live"):
         try:
             if effective_data_source == "live":
@@ -166,53 +173,14 @@ async def lifespan(app: FastAPI):
                 )
                 logger.info("mock source auto-connected (D-018) — dashboard streams now")
         except Exception:  # noqa: BLE001 — never block boot
-            logger.exception("%s auto-connect failed", effective_data_source)
+            logger.exception(
+                "%s auto-connect failed — status shows NO FEED until a "
+                "provider answers (no demo fallback, D-033); heartbeat "
+                "retries every ~5s",
+                effective_data_source,
+            )
     else:
         asyncio.create_task(app.state.mt5.try_restore())
-
-    # --- D-032: live-recovery loop. When the boot probe degraded live->mock
-    # (transient provider outage), re-probe every 60s and hot-swap the moment
-    # a provider answers — a bad boot minute must not pin the platform to
-    # synthetic prices forever. Explicit DATA_SOURCE=mock never enters here.
-    async def _live_recovery_loop() -> None:
-        from app.mt5.live_source import LiveDataSource
-
-        while True:
-            await asyncio.sleep(60)
-            try:
-                if app.state.data_source != "mock":
-                    return  # recovered / reconfigured — stop
-                candidate = LiveDataSource(
-                    http_factory=lambda: _get_http(app),
-                    poll_seconds=settings.live_poll_seconds,
-                )
-                if not await candidate.quick_check():
-                    continue
-                logger.warning("live providers RECOVERED — swapping mock -> live")
-                was_connected = app.state.mt5.state.status == "connected"
-                if was_connected:
-                    try:
-                        await app.state.mt5.disconnect()
-                    except Exception:  # noqa: BLE001
-                        logger.debug("disconnect during recovery failed", exc_info=True)
-                app.state.mt5.set_source(candidate)
-                app.state.trading._public = candidate  # new demo planes price live
-                app.state.data_source = "live"
-                if getattr(app.state, "source_resolution", None):
-                    app.state.source_resolution = None  # no longer degraded
-                if was_connected:
-                    await app.state.mt5.connect(
-                        {"server": "LiveMarket", "login": "REALTIME", "password": "none"}
-                    )
-                logger.warning("mock -> live hot-swap complete — REAL prices now")
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 — the loop must survive anything
-                logger.debug("live recovery probe failed", exc_info=True)
-
-    if resolution.degraded:
-        recovery_task = asyncio.create_task(_live_recovery_loop(), name="live-recovery")
-        app.state._live_recovery_task = recovery_task
 
     # --- Phase 4: arm the admin platform executor per persisted auto_trade;
     # restore user demo planes (multi-user agent).
@@ -240,9 +208,6 @@ async def lifespan(app: FastAPI):
         "startup complete: data_source=%s db=%s", effective_data_source, app.state.db_ok
     )
     yield
-    recovery = getattr(app.state, "_live_recovery_task", None)
-    if recovery is not None:
-        recovery.cancel()
     await app.state.http.aclose()
     await app.state.trading.shutdown()
     await app.state.mt5.shutdown()
@@ -279,26 +244,35 @@ app.add_middleware(
 async def health() -> dict:
     """Liveness probe (SPEC §7.1) — no auth required.
 
-    D-032: `data_source` is what RUNS; `requested_data_source` is what the
-    environment asked for. "mock" + requested "live" + degraded=true means a
-    boot-time provider outage (recovery loop retries every 60s); "mock" +
-    requested "mock" means the DATA_SOURCE env var forces demo prices.
+    D-033: `data_source` reports what RUNS plus the live-feed state —
+    provider, tick rate (tps) and per-venue stream health — so a remote
+    deployment is fully diagnosable without shell access. Demo data can
+    never silently appear: it requires ALLOW_DEMO=1 (local dev only).
     """
     settings: Settings = app.state.settings
     resolution: SourceResolution | None = getattr(
         app.state, "source_resolution", None
     )
     effective = getattr(app.state, "data_source", None) or settings.data_source
-    return {
+    out: dict = {
         "status": "ok",
         "version": app.version,
         "data_source": effective,
         "requested_data_source": (
             resolution.requested if resolution else settings.data_source
         ),
-        "degraded": bool(resolution and resolution.degraded),
+        "degraded": False,
         "db": app.state.db_ok,
     }
+    # D-033: feed introspection (provider, tps, venue health)
+    try:
+        source = app.state.mt5.source
+        feed_status = getattr(source, "feed_status", None)
+        if callable(feed_status):
+            out["feed"] = feed_status()
+    except Exception:  # noqa: BLE001 — health must never fail
+        pass
+    return out
 
 
 @app.get("/api/me")

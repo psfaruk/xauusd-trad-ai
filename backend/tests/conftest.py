@@ -11,9 +11,12 @@ import pytest
 
 # Hermetic tests (D-030): DATA_SOURCE defaults to "live" (free real-time
 # APIs) since the real-data switch — force mock for the whole suite so unit
-# tests NEVER touch the network. Must run before any app import that loads
-# Settings (test modules import app.main at collection time).
+# tests NEVER touch the network. D-033: mock is gated behind ALLOW_DEMO=1
+# (deployments can never show demo prices) — set it here so the suite keeps
+# working. Must run before any app import that loads Settings (test modules
+# import app.main at collection time).
 os.environ.setdefault("DATA_SOURCE", "mock")
+os.environ.setdefault("ALLOW_DEMO", "1")
 
 from app.mt5.base import TIMEFRAME_MINUTES  # noqa: E402
 from app.mt5.mock_source import MockDataSource  # noqa: E402

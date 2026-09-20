@@ -1,9 +1,13 @@
 """MarketStream — the tick-by-tick core (SPEC §7.2 events, Phase 2 AC).
 
 Subscribes to the DataSource tick stream and:
-- broadcasts `tick` events (bid/ask/ts ms),
+- broadcasts `tick` events (bid/ask/ts ms) — D-033: the feed now emits
+  every REAL market event (20-50+/s in active sessions); WS frames are
+  throttled to 10/s per client (latest-quote-wins) with `tps` + `n` fields
+  so the UI shows the true event rate without re-rendering 50x/s,
 - builds FORMING bars for every watched timeframe (client subscriptions ∪
-  the engine timeframe) from ticks -> `bar_open` / `bar_update`,
+  the engine timeframe) from EVERY tick (full tick resolution, D-033) ->
+  `bar_open` / `bar_update` (throttled to 4/s per TF — charts look instant),
 - on bucket roll: reconciles the closed bar with the AUTHORITATIVE
   get_rates() bar (terminal-built OHLC wins over tick-built approximation),
   broadcasts `bar_close`, then fires the engine's on_bar_close callback,
@@ -15,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time as time_mod
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -22,6 +28,12 @@ from typing import Any
 from app.mt5.base import TIMEFRAME_MINUTES, DataSource, Tick
 
 logger = logging.getLogger("xauusd.market")
+
+# D-033 — real-time broadcast budgets (the candle itself absorbs EVERY tick;
+# these only cap how often frames hit each browser client):
+TICK_SEND_MIN_S = 0.10   # ≤10 tick frames/s per client (latest quote wins)
+BAR_SEND_MIN_S = 0.25    # ≤4 bar_update frames/s per TF (bar_open/close always go)
+TPS_WINDOW_S = 5.0       # trailing window for the real events/sec metric
 
 
 @dataclass
@@ -55,9 +67,21 @@ class MarketStream:
         self._forming: dict[str, FormingBar] = {}
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # D-033 — broadcast throttling + real tick-rate meter
+        self._last_tick_sent = 0.0
+        self._ticks_since_send = 0
+        self._last_bar_sent: dict[str, float] = {}
+        self._event_times: deque[float] = deque(maxlen=512)
         # async callbacks (wired by EngineRuntime)
         self.on_bar_close: Any = None  # async (tf: str, bar: dict) -> None
         self.on_tick: Any = None  # async (tick: Tick) -> None
+
+    def _tps(self) -> float:
+        """Real feed events per second over the trailing window."""
+        now = time_mod.monotonic()
+        while self._event_times and now - self._event_times[0] > TPS_WINDOW_S:
+            self._event_times.popleft()
+        return len(self._event_times) / TPS_WINDOW_S
 
     # ------------------------------------------------------------- lifecycle
 
@@ -96,12 +120,24 @@ class MarketStream:
             raise
 
     async def _handle_tick(self, tick: Tick) -> None:
-        await self._hub.broadcast_ticks(
-            "tick",
-            self._symbol,
-            {"bid": round(tick.bid, 2), "ask": round(tick.ask, 2),
-             "ts": int(tick.time.timestamp() * 1000)},
-        )
+        now_mono = time_mod.monotonic()
+        self._event_times.append(now_mono)
+        self._ticks_since_send += 1
+
+        # tick frames — throttled, latest-quote-wins, with the REAL rate.
+        if now_mono - self._last_tick_sent >= TICK_SEND_MIN_S:
+            self._last_tick_sent = now_mono
+            payload = {
+                "bid": round(tick.bid, 2),
+                "ask": round(tick.ask, 2),
+                "ts": int(tick.time.timestamp() * 1000),
+                "n": self._ticks_since_send,        # real events in this frame
+                "tps": round(self._tps(), 1),       # real events/sec (5s window)
+            }
+            self._ticks_since_send = 0
+            await self._hub.broadcast_ticks("tick", self._symbol, payload)
+
+        # the engine + SL/TP tracker see EVERY real tick (full resolution)
         if self.on_tick is not None:
             await self.on_tick(tick)
 
@@ -116,6 +152,7 @@ class MarketStream:
                 await self._hub.broadcast_market(
                     "bar_open", self._symbol, tf, {"candle": fb.as_dict()}
                 )
+                self._last_bar_sent[tf] = now_mono
             elif fb.t != bucket:
                 await self._close_bar(tf, fb)
                 nb = FormingBar(t=bucket, o=tick.bid, h=tick.bid, low=tick.bid, c=tick.bid, v=1)
@@ -123,14 +160,18 @@ class MarketStream:
                 await self._hub.broadcast_market(
                     "bar_open", self._symbol, tf, {"candle": nb.as_dict()}
                 )
+                self._last_bar_sent[tf] = now_mono
             else:
                 fb.h = max(fb.h, tick.bid)
                 fb.low = min(fb.low, tick.bid)
                 fb.c = tick.bid
                 fb.v += 1
-                await self._hub.broadcast_market(
-                    "bar_update", self._symbol, tf, {"candle": fb.as_dict()}
-                )
+                # forming bar ALWAYS absorbs the tick; frames are throttled
+                if now_mono - self._last_bar_sent.get(tf, 0.0) >= BAR_SEND_MIN_S:
+                    self._last_bar_sent[tf] = now_mono
+                    await self._hub.broadcast_market(
+                        "bar_update", self._symbol, tf, {"candle": fb.as_dict()}
+                    )
 
     async def _seed_forming(self, tf: str, bucket: int, tick: Tick) -> FormingBar:
         """Mid-bucket subscribe: seed from the source's forming bar if available."""

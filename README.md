@@ -108,23 +108,32 @@ React SPA ── REST /api/candles · /api/mt5/* ──► FastAPI backend
                                 DATA_SOURCE=mt5  │ MT5DataSource  → MetaTrader5 pkg → Exness terminal (Windows only, C1)
 ```
 
-**LIVE mode (default, D-030) — real-time data without any MT5 terminal.**
-The backend polls free key-less public APIs every 2 seconds and streams REAL
-gold prices 24/7:
+**LIVE mode (default, D-030/D-033) — real-time data without any MT5 terminal.**
+The backend aggregates five key-less public venues over WebSocket and pushes
+EVERY real market event the instant it happens — tens of ticks per second in
+active sessions; the forming candle absorbs all of them:
 
-- **Binance `PAXG/USDT`** (primary) — PAXG is a regulated, physical-gold-backed
-  token (1 PAXG = 1 fine troy ounce, Paxos); it tracks spot XAUUSD within a
-  fraction of a percent and trades around the clock. Real bid/ask quotes via
-  `bookTicker`, authoritative OHLCV candles via `klines` for every timeframe.
+- **Five-venue WS aggregate (D-033, primary)** — Binance `PAXG/USDT`+
+  `PAXG/USDC` (bookTicker/aggTrade/depth@100ms via `data-stream.binance.vision`,
+  geo-robust), Bybit `XAUT/USDT`, OKX `PAXG/USDT`+`XAUT/USDT`, Kraken `PAXG/USD`,
+  Coinbase `PAXG-USD`. PAXG/XAUT each redeem for exactly 1 troy ounce of
+  physical gold, so all five venues price the same underlying as spot XAUUSD.
+  Consolidated best bid/ask across venues; per-venue health + a real
+  **ticks/sec meter** surface in the TopBar LIVE badge and `/api/health`.
+- **Binance `PAXG/USDT` REST** (quotes + authoritative `klines` OHLCV when WS
+  is silent).
 - **gold-api.com XAU spot** (quote fallback when Binance is geo-blocked).
 - **Yahoo Finance `GC=F`** (history fallback — COMEX gold futures candles).
 - **Tick-built candles** (last resort — bars aggregate live from quotes).
 
-If every provider is unreachable the app degrades to mock and says so via
-`/api/health` (`data_source` flips to `mock`) — the dashboard always streams.
-The active provider + price age is shown in the TopBar **LIVE badge**, the
-MT5 status (`feed` block) and the **Market Data tab** (basis vs spot XAU is
-disclosed there too). Demo/paper trading planes fill at the SAME live prices.
+**NO demo fallback (D-033, user directive).** If every provider is unreachable
+the platform shows an honest "no feed / retrying" state and keeps retrying
+forever — it NEVER substitutes synthetic prices. Demo data exists only for
+local development behind `ALLOW_DEMO=1` (never set in the Docker image), so a
+deployment physically cannot display fake prices. The active provider + price
+age + t/s rate is shown in the TopBar **LIVE badge**, the MT5 status (`feed`
+block) and the **Market Data tab** (basis vs spot XAU is disclosed there too).
+Demo/paper trading planes fill at the SAME live prices.
 
 1. Admin opens **MT5 connect** in the 3-dot menu (Settings → Platform MT5) →
    `POST /api/mt5/connect` `{server, login, password, terminal_path?}`.

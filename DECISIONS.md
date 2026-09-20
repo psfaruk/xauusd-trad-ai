@@ -101,3 +101,47 @@ external test re-based on the vision domain), ruff/tsc/vite clean; live stack
 restarted — health `{data_source: live, requested: live, degraded: false}`,
 uvicorn log shows data-api.binance.vision 200s, real feed 4362.59 @ 0.2s tick
 age, browser LIVE badge + ticker 4362.58/4362.59, zero console errors.
+
+## D-033 — Real ticks only: five-venue WS aggregate, demo data abolished
+
+**User directive (verbatim intent):** "demo data must be completely OFF the
+site — only real data, real price, real market; candles must update on every
+tick (20–50 ticks/sec in active sessions)."
+
+**Problem.** D-030/D-032 still degraded `live → mock` when no provider
+answered at boot — a Railway boot-time outage silently showed SYNTHETIC
+prices (the exact thing the user complained about). And REST polling capped
+the feed at one quote per 2s — nothing near real tick flow.
+
+**Decision.**
+1. **Demo fallback abolished.** `resolve_data_source` NEVER returns mock.
+   On total outage the platform stays on `LiveDataSource`, shows an honest
+   "no feed — retrying" state, and retries forever (WS venue workers +
+   REST poll + ConnectionManager heartbeat). `DATA_SOURCE=mock` is honored
+   ONLY with `ALLOW_DEMO=1` (local dev/tests; the Docker image never sets
+   it) — deployments physically cannot display fake prices.
+2. **Five-venue WebSocket aggregate (new `app/mt5/tick_feed.py`).**
+   Binance PAXG/USDT+USDC (bookTicker/aggTrade/depth@100ms via
+   data-stream.binance.vision — probe-verified that the classic
+   stream.binance.com times out from this egress), Bybit XAUT/USDT
+   (PAXGUSDT does NOT exist on Bybit — probe-verified), OKX PAXG+XAUT bbo-tbt,
+   Kraken PAXG/USD book+trade, Coinbase PAXG-USD ticker. Every real event
+   (book update or trade) → consolidated best bid/ask (max-bid/min-ask,
+   freshest-venue fallback on cross) → tick → forming-candle update. Venue
+   workers reconnect with backoff forever; per-venue health + a real t/s
+   meter surface in /api/health, /api/mt5/status and the TopBar LIVE badge
+   (`⚡ N t/s`). US-geo robustness: vision mirror + Kraken + Coinbase.
+3. **Broadcast budgets (backend-only throttling of FRAMES, never of data):**
+   tick frames ≤10/s per client (latest-quote-wins, carry `n` + `tps`),
+   bar_update ≤4/s per TF; the forming candle itself + engine + SL/TP tracker
+   see EVERY event at full resolution. REST poll drops to 30s while WS is
+   healthy (kline authority only).
+
+**Rejected:** synthesizing 20–50 fake ticks/sec to hit the number — violates
+the "real data only" directive; the t/s meter shows the true market rate
+(quiet Sunday ≈ 1–5/s, active sessions tens/s).
+
+**Verification:** probes of all 5 venues (REST + WS + 30s rate samples);
+offline unit tests for every venue parser + consolidation + the emit path;
+resolve tests updated for the no-degrade contract (incl. ALLOW_DEMO gating);
+193 tests green; ruff/tsc/vite clean.

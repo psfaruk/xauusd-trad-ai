@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     # Engine / data (SPEC C7; live = free real-time APIs, DECISIONS.md D-030)
     data_source: Literal["mock", "mt5", "live"] = "live"
     live_poll_seconds: float = 2.0
+    # D-033: demo data is OFF by default and can never appear on a deploy.
+    # ALLOW_DEMO=1 (local dev/tests only) re-enables DATA_SOURCE=mock.
+    allow_demo: bool = False
+    # D-033: multi-venue WebSocket tick aggregator kill-switch.
+    live_ws: bool = True
     fmp_api_key: str | None = None
     mt5_terminal_path: str | None = None
 

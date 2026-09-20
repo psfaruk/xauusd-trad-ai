@@ -480,12 +480,14 @@ def create_data_source(settings: Settings) -> DataSource:
 
 @dataclass(frozen=True)
 class SourceResolution:
-    """Boot-time data-source decision (D-032), fully introspectable.
+    """Boot-time data-source decision (D-032/D-033), fully introspectable.
 
     `requested` is what the environment asked for (DATA_SOURCE), `effective`
-    is what actually runs. They differ ONLY when live was requested but every
-    free provider was unreachable at boot (honest degrade, D-030) — surfaced
-    via /api/health so a remote deployment is diagnosable without shell access.
+    is what actually runs. They differ ONLY when mock was requested without
+    ALLOW_DEMO (D-033: demo data is impossible on deployments — mock is
+    coerced to live). A live source with no provider answering is still
+    "live" (the feed retries forever; /api/health surfaces the no-feed state
+    via `reason` + the feed introspection).
     """
 
     source: Any
@@ -498,47 +500,59 @@ class SourceResolution:
 async def resolve_data_source(
     settings: Settings, http_factory: Any
 ) -> SourceResolution:
-    """Boot-time source resolution (D-030/D-032).
+    """Boot-time source resolution (D-030/D-032/D-033).
 
-    DATA_SOURCE=live probes the free provider chain ONCE (Binance PAXG
-    mirrors -> gold-api, ~4s timeouts). When every provider is unreachable
-    the platform degrades to the mock source so the dashboard still streams;
-    the resolution carries requested/effective/degraded for /api/health and
-    the recovery loop in main.py.
+    DATA_SOURCE=live is the ONLY production mode (user directive D-033):
+    there is NO demo/mock fallback — when no provider answers at boot the
+    platform stays on the live source, shows "no feed", and keeps retrying
+    (WS venue workers + REST poll loop reconnect forever; the ConnectionManager
+    heartbeat re-runs connect() every ~5s). Demo prices are IMPOSSIBLE in a
+    deployment unless ALLOW_DEMO=1 is explicitly set for local development.
     """
-    if settings.data_source != "live":
-        if settings.data_source == "mock":
-            logger.warning(
-                "DATA_SOURCE=mock requested — running SYNTHETIC demo prices "
-                "(~2715 range). Set DATA_SOURCE=live (or remove the variable "
-                "to use the image default) for REAL gold prices."
-            )
+    if settings.data_source == "mt5":
         return SourceResolution(
             source=create_data_source(settings),
-            effective=settings.data_source,
-            requested=settings.data_source,
+            effective="mt5",
+            requested="mt5",
         )
+    if settings.data_source == "mock":
+        if not settings.allow_demo:
+            logger.warning(
+                "DATA_SOURCE=mock ignored (ALLOW_DEMO not set) — demo data is "
+                "DISABLED; running the REAL live market instead (D-033)"
+            )
+        else:
+            logger.warning(
+                "ALLOW_DEMO=1 — running SYNTHETIC demo prices for local "
+                "development. NEVER set this on a deployment."
+            )
+            return SourceResolution(
+                source=create_data_source(settings),
+                effective="mock",
+                requested="mock",
+            )
     from app.mt5.live_source import LiveDataSource
 
+    requested = "live"
     candidate = LiveDataSource(
-        http_factory=http_factory, poll_seconds=settings.live_poll_seconds
+        http_factory=http_factory,
+        poll_seconds=settings.live_poll_seconds,
+        enable_ws=settings.live_ws,
     )
     if await candidate.quick_check():
-        logger.info("live providers reachable — real-time market data ON")
-        return SourceResolution(candidate, "live", "live")
+        logger.info("live providers reachable — REAL-TIME market data ON")
+        return SourceResolution(candidate, "live", requested)
+    # No provider answered the REST probe — still run live: the WS venue
+    # workers and the poll loop keep retrying and connect() waits for the
+    # first real tick (D-033: NEVER substitute demo prices).
     logger.warning(
-        "live providers unreachable — degrading DATA_SOURCE to mock (D-030); "
-        "a recovery probe retries every 60s (D-032)"
+        "live providers not answering yet — staying on live with no feed "
+        "until a provider answers (NO demo fallback, D-033); "
+        "WS + REST retry forever in the background"
     )
-    from app.mt5.mock_source import MockDataSource
-
     return SourceResolution(
-        source=MockDataSource(),
-        effective="mock",
-        requested="live",
-        degraded=True,
-        reason=(
-            "no free provider reachable at boot "
-            "(binance data-api/api mirrors + gold-api)"
-        ),
+        source=candidate,
+        effective="live",
+        requested=requested,
+        reason="no provider answered the boot probe — feed retries in background",
     )

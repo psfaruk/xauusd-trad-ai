@@ -80,6 +80,9 @@ export interface FeedStatus {
   last_price: number | null;
   spread: number | null;
   last_tick_age_s: number | null;
+  /** D-033: real events/sec + per-venue stream health. */
+  tps?: number | null;
+  venues?: Record<string, { ok: boolean; events: number; age_s: number | null; err: string | null }>;
 }
 
 export interface Mt5Status {
@@ -265,6 +268,9 @@ export interface WsTickMsg {
   bid: number;
   ask: number;
   ts: number;
+  /** D-033: real market events batched into this frame + trailing rate. */
+  n?: number;
+  tps?: number;
 }
 
 export interface WsBarMsg {

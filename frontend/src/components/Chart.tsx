@@ -165,7 +165,7 @@ export default function Chart({ candles, liveBar, activeSignal, tf }: ChartProps
       {candles.length === 0 && (
         <div className="pointer-events-none absolute inset-0 grid place-items-center">
           <p className="rounded-lg border border-zinc-800 bg-zinc-900/80 px-4 py-2 text-xs text-zinc-400">
-            waiting for candles… (connect MT5 / demo data)
+            waiting for live market data… (real feed — no demo data)
           </p>
         </div>
       )}

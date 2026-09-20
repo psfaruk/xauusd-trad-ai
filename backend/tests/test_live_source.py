@@ -106,6 +106,7 @@ def yahoo_chart(tf_sec: int, n: int, base: float = 4000.0) -> dict:
 def make_source(client: FakeClient, **kw) -> LiveDataSource:
     kw.setdefault("poll_seconds", 0.05)
     kw.setdefault("connect_timeout_s", 0.4)
+    kw.setdefault("enable_ws", False)  # hermetic: no real venue WS in tests
     return LiveDataSource(http_factory=lambda: client, **kw)
 
 
@@ -428,15 +429,18 @@ async def test_resolve_data_source_live_and_fallback(monkeypatch):
     assert res.requested == "live" and res.degraded is False
     await res.source.market.stop()
 
-    # providers dead -> honest mock fallback (dashboard still streams)
+    # providers dead -> STILL live (D-033: NO demo fallback — the feed keeps
+    # retrying; the platform shows "no feed" instead of synthetic prices)
     dead = FakeClient()
     dead.fail.add("binance")
     dead.fail.add("gold-api")
     settings2 = Settings(data_source="live")
     res2 = await resolve_data_source(settings2, lambda: dead)
-    assert res2.effective == "mock" and isinstance(res2.source, MockDataSource)
-    assert res2.requested == "live" and res2.degraded is True
+    assert res2.effective == "live" and isinstance(res2.source, LiveDataSource)
+    assert res2.requested == "live" and res2.degraded is False
     assert res2.reason  # diagnosable via /api/health
+    assert res2.source.market.provider == "degraded"  # honest no-feed state
+    await res2.source.market.stop()
 
     # explicit non-live mode untouched (not degraded — user asked for it)
     settings3 = Settings(data_source="mt5")
@@ -444,11 +448,20 @@ async def test_resolve_data_source_live_and_fallback(monkeypatch):
     assert res3.effective == "mt5" and res3.requested == "mt5"
     assert res3.degraded is False
 
-    # explicit mock: requested mock (health surfaces it; UI shows DEMO banner)
-    settings4 = Settings(data_source="mock")
+    # explicit mock WITHOUT ALLOW_DEMO -> coerced to live (D-033: demo data
+    # is impossible on a deployment). NOTE: the suite env sets ALLOW_DEMO=1,
+    # so the gate is tested with an explicit override.
+    settings4 = Settings(data_source="mock", allow_demo=False)
     res4 = await resolve_data_source(settings4, lambda: dead)
-    assert res4.effective == "mock" and res4.requested == "mock"
-    assert res4.degraded is False
+    assert res4.effective == "live" and isinstance(res4.source, LiveDataSource)
+    assert res4.requested == "live" and res4.degraded is False
+    await res4.source.market.stop()
+
+    # explicit mock WITH ALLOW_DEMO -> mock (local dev only)
+    settings5 = Settings(data_source="mock", allow_demo=True)
+    res5 = await resolve_data_source(settings5, lambda: dead)
+    assert res5.effective == "mock" and isinstance(res5.source, MockDataSource)
+    assert res5.requested == "mock" and res5.degraded is False
 
 
 async def test_binance_mirror_failover_451():
