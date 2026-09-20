@@ -52,7 +52,7 @@ def _reachable(url: str) -> bool:
         return False
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def db_url():
     """Reachable Postgres URL for schema tests, else None (test skips).
 

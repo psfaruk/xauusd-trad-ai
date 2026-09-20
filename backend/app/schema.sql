@@ -22,6 +22,10 @@ create table if not exists mt5_connections (
   created_at timestamptz not null default now()
 );
 
+-- Multi-user trading planes (Phase 4): one row per user, plus per-user arm.
+alter table mt5_connections add column if not exists mode text not null default 'demo';
+alter table mt5_connections add column if not exists auto_trade boolean not null default false;
+
 create table if not exists engine_config (
   id int primary key default 1 check (id = 1),   -- single row
   config jsonb not null,

@@ -27,8 +27,9 @@ def test_split_sql_handles_the_real_schema() -> None:
     schema = (Path(__file__).parent.parent / "app" / "schema.sql").read_text()
     stmts = split_sql(schema)
     # 6 create tables + 2 create index + 1 function + 1 drop trigger + 1 trigger
-    # + 1 seed insert = 12 statements.
-    assert len(stmts) == 12, stmts
+    # + 1 seed insert + 2 Phase-4 alter statements (mt5_connections columns)
+    # = 14 statements.
+    assert len(stmts) == 14, stmts
     assert all(s for s in stmts)
     # The trigger statement survives as one piece.
     trigger = [s for s in stmts if s.startswith("create trigger")]

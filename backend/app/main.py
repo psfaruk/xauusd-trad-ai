@@ -33,6 +33,7 @@ from app.api import (
     routes_mt5,
     routes_signals,
     routes_stats,
+    routes_trading,
     ws,
 )
 from app.auth import CurrentUser
@@ -94,6 +95,22 @@ async def lifespan(app: FastAPI):
         config_repo=app.state.config_repo,
     )
 
+    # --- Phase 4: per-user trading planes (agent architecture) + the admin's
+    # own platform executor (armed by engine_config.auto_trade).
+    from app.engine.executor import OrderExecutor, TradeRepo
+    from app.services.trading import UserTradingManager
+
+    app.state.trades_repo = TradeRepo(app.state.db_engine)
+    app.state.trading = UserTradingManager(
+        settings=settings,
+        public_source=app.state.mt5.source,
+        hub=app.state.hub,
+        db_engine=app.state.db_engine,
+        config_repo=app.state.config_repo,
+        platform_manager=app.state.mt5,
+    )
+    app.state.mt5.trading_manager = app.state.trading  # runtime relay hook
+
     # --- Structured logging -> logs table (best-effort, C6)
     from app.api.routes_logs import DBLogHandler
 
@@ -113,11 +130,34 @@ async def lifespan(app: FastAPI):
     else:
         asyncio.create_task(app.state.mt5.try_restore())
 
+    # --- Phase 4: arm the admin platform executor per persisted auto_trade;
+    # restore user demo planes (multi-user agent).
+    try:
+        cfg0, auto0 = await app.state.config_repo.load(app.state.db_engine)
+        platform_executor = OrderExecutor(
+            source=app.state.mt5.source,
+            cfg=cfg0,
+            repo=app.state.trades_repo,
+            hub=app.state.hub,
+            owner=None,
+        )
+        if auto0:
+            platform_executor.arm(True)
+        app.state.trading.attach_platform_executor(platform_executor)
+        if auto0:
+            logger.warning("platform auto_trade=TRUE at boot — executor ARMED")
+        restored = await app.state.trading.try_restore_planes()
+        if restored:
+            logger.info("restored %d user trading plane(s)", restored)
+    except Exception:  # noqa: BLE001 — trading plane boot issues must not kill API
+        logger.exception("trading plane init failed")
+
     logger.info(
         "startup complete: data_source=%s db=%s", settings.data_source, app.state.db_ok
     )
     yield
     await app.state.http.aclose()
+    await app.state.trading.shutdown()
     await app.state.mt5.shutdown()
     if app.state.db_engine is not None:
         await app.state.db_engine.dispose()
@@ -165,6 +205,7 @@ app.include_router(routes_signals.router)
 app.include_router(routes_config.router)
 app.include_router(routes_stats.router)
 app.include_router(routes_logs.router)
+app.include_router(routes_trading.router)
 app.include_router(ws.router)
 
 

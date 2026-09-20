@@ -154,6 +154,10 @@ class SignalEngine:
         self._lock = asyncio.Lock()
         self._last_signal_bar: datetime | None = None  # cooldown anchor
         self._last_spread_points: float = 0.0
+        # Phase 4: async callback fired with (payload, signal_id) right after a
+        # signal is persisted+ broadcast — the runtime routes it into the
+        # per-user trading planes (copy-trading agent relay).
+        self.on_signal: Any | None = None
 
     @property
     def cfg(self) -> EngineConfig:
@@ -225,6 +229,15 @@ class SignalEngine:
         await self._hub.broadcast_all(
             "signal", {**payload, "id": signal_id, "ts": bar_open.isoformat()}
         )
+        if self.on_signal is not None:
+            try:
+                await self.on_signal(
+                    {**payload, "id": signal_id, "ts": bar_open.isoformat()},
+                    symbol,
+                    self._point_size,
+                )
+            except Exception:  # noqa: BLE001 — relay must never kill the engine
+                logger.exception("on_signal relay callback failed")
         await self._log(
             "info",
             f"SIGNAL {payload['direction']} {symbol} @ {payload['entry']} "

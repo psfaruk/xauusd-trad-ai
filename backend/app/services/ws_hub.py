@@ -84,6 +84,17 @@ class WSHub:
         for client in list(self._clients):
             await self._send(client, msg)
 
+    async def broadcast_user(self, user_id: str, event_type: str, payload: dict) -> None:
+        """Per-user trading-plane events -> only that user's sockets (Phase 4).
+
+        Event names carry a `trading_` prefix upstream so the frontend can
+        distinguish plane events (positions/equity/logs) from the public feed.
+        """
+        msg = {"type": event_type, **payload}
+        for client in list(self._clients):
+            if client.user.get("id") == user_id:
+                await self._send(client, msg)
+
     async def heartbeat_loop(self, client: Client) -> None:
         """Per-client heartbeat — exits when the socket dies."""
         try:

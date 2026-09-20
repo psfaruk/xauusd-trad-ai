@@ -52,4 +52,10 @@ async def set_auto_trade(body: AutoTradeBody, request: Request) -> dict:
         )
     cfg, _ = await app.state.config_repo.load(app.state.db_engine)
     await app.state.config_repo.save(app.state.db_engine, cfg, body.enabled)
+    # Phase 4 — arm/disarm the admin's own platform executor (SPEC §9:
+    # auto_trade gates real order execution on the platform account).
+    trading = getattr(app.state, "trading", None)
+    executor = getattr(trading, "platform_executor", None) if trading else None
+    if executor is not None:
+        executor.arm(body.enabled)
     return {"auto_trade": body.enabled}

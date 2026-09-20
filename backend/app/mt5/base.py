@@ -72,6 +72,18 @@ class Position:
     time: datetime  # UTC
 
 
+@dataclass(frozen=True)
+class SymbolInfo:
+    """Lot-sizing inputs (SPEC §9): contract size + broker volume limits."""
+
+    name: str
+    point: float = 0.01
+    contract_size: float = 100.0  # XAUUSD standard: 1 lot = 100 oz
+    volume_min: float = 0.01
+    volume_max: float = 100.0
+    volume_step: float = 0.01
+
+
 class DataSourceError(RuntimeError):
     """Raised by data sources on unrecoverable errors."""
 
@@ -131,6 +143,14 @@ class DataSource(ABC):
 
     @abstractmethod
     async def get_positions(self) -> list[Position]: ...
+
+    def symbol_info(self, symbol: str) -> SymbolInfo | None:
+        """Lot-sizing metadata (optional; sync or async). None -> defaults."""
+        return None
+
+    async def close_position(self, ticket: int, deviation: int = 30) -> OrderResult:
+        """Close an open position by ticket (optional; default: unsupported)."""
+        return OrderResult(ok=False, retcode=None, comment="close not supported")
 
 
 def validate_tf(tf: str) -> int:

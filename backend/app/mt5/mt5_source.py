@@ -34,6 +34,7 @@ from app.mt5.base import (
     Order,
     OrderResult,
     Position,
+    SymbolInfo,
     Tick,
     validate_tf,
 )
@@ -64,6 +65,7 @@ class MT5DataSource(DataSource):
         self._mt5: Any | None = None  # lazy MetaTrader5 module reference
         self._connected = False
         self._symbol_point: dict[str, float] = {}
+        self._symbol_info_cache: dict[str, SymbolInfo] = {}
         self._offset_minutes = 0  # broker server time - UTC (C4)
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5")
 
@@ -300,6 +302,62 @@ class MT5DataSource(DataSource):
         if flags & mt5.SYMBOL_FILLING_IOC:
             return mt5.ORDER_FILLING_IOC
         return mt5.ORDER_FILLING_RETURN
+
+    async def symbol_info(self, symbol: str) -> SymbolInfo | None:  # type: ignore[override]
+        """Lot-sizing metadata from the terminal (SPEC §9); cached per symbol."""
+        if symbol in self._symbol_info_cache:
+            return self._symbol_info_cache[symbol]
+        try:
+            mt5 = self._import_mt5()
+            info = await self._run(mt5.symbol_info, symbol)
+            if info is None:
+                return None
+            result = SymbolInfo(
+                name=symbol,
+                point=float(info.point),
+                contract_size=float(getattr(info, "trade_contract_size", 100.0)),
+                volume_min=float(info.volume_min),
+                volume_max=float(info.volume_max),
+                volume_step=float(info.volume_step),
+            )
+            self._symbol_info_cache[symbol] = result
+            return result
+        except Exception:  # noqa: BLE001 — executor falls back to defaults
+            return None
+
+    async def close_position(self, ticket: int, deviation: int = 30) -> OrderResult:
+        """Close an open position by ticket with an opposite DEAL (SPEC §9)."""
+        mt5 = self._import_mt5()
+        positions = await self.get_positions()
+        pos = next((p for p in positions if p.ticket == ticket), None)
+        if pos is None:
+            return OrderResult(ok=False, retcode=10036, comment="position not found")
+        tick = await self.get_tick(pos.symbol)
+        # Closing BUY -> sell at bid; closing SELL -> buy at ask
+        price = tick.bid if pos.side == "BUY" else tick.ask
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pos.symbol,
+            "volume": float(pos.volume),
+            "type": mt5.ORDER_TYPE_SELL if pos.side == "BUY" else mt5.ORDER_TYPE_BUY,
+            "position": int(ticket),  # identifies the position being closed
+            "price": float(price),
+            "deviation": int(deviation),
+            "magic": 0,
+            "comment": "xauai-close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": await self._filling_mode(pos.symbol),
+        }
+        result = await self._run(mt5.order_send, request)
+        if result is None:
+            return OrderResult(ok=False, retcode=None, comment="order_send returned None")
+        return OrderResult(
+            ok=result.retcode == TRADE_RETCODE_DONE,
+            ticket=int(result.order) if result.order else None,
+            price=float(result.price) if result.price else price,
+            retcode=int(result.retcode),
+            comment=str(result.comment),
+        )
 
     async def get_positions(self) -> list[Position]:
         mt5 = self._import_mt5()

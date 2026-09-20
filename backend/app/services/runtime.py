@@ -36,15 +36,18 @@ class EngineRuntime:
         point_size: float,
         cfg: EngineConfig,
         news_service: Any | None = None,
+        trading_manager: Any | None = None,  # Phase 4 signal relay
     ) -> None:
         self._source = source
         self._hub = hub
         self._symbol = symbol
+        self.trading_manager = trading_manager
         self.tracker = SignalTracker()
         self.engine = SignalEngine(
             cfg=cfg, hub=hub, repo=repo, news_service=news_service,
             point_size=point_size,
         )
+        self.engine.on_signal = self._relay_signal
         self.stream = MarketStream(
             source=source, hub=hub, symbol=symbol,
             engine_tf=cfg.timeframe, point_size=point_size,
@@ -90,6 +93,14 @@ class EngineRuntime:
         """Live config update (PUT /api/config) — engine + stream TF follow."""
         await self.engine.apply_config(cfg)
         self.stream._engine_tf = cfg.timeframe  # noqa: SLF001 — same package glue
+        if self.trading_manager is not None:
+            await self.trading_manager.apply_config(cfg)
+
+    async def _relay_signal(self, payload: dict, symbol: str, point_size: float) -> None:
+        """Engine signal -> every armed trading plane (agent core, Phase 4)."""
+        if self.trading_manager is None:
+            return
+        await self.trading_manager.relay_signal(payload, symbol, point_size)
 
     # -------------------------------------------------------------- callbacks
 

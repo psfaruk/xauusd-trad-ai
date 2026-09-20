@@ -163,6 +163,11 @@ async def test_roles_persist_in_profiles(db_url) -> None:
         pytest.skip("no reachable Postgres — role persistence test skipped (D-002)")
     engine = make_engine(db_url)
     try:
+        # Apply the schema first — must NOT rely on a previous test run having
+        # populated the (persistent) pgserver data dir (fresh-DB regression).
+        from app.db import apply_schema
+
+        assert await apply_schema(engine)
         # auth.users stub has only `id` (D-017) — widen it so the signup
         # trigger (handle_new_user) can run, mirroring real Supabase.
         async with engine.begin() as conn:

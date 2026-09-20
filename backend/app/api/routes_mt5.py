@@ -26,11 +26,15 @@ def _manager(request: Request):
     return request.app.state.mt5
 
 
-@router.post("/connect", dependencies=[Depends(require_admin)])
-async def mt5_connect(body: ConnectBody, request: Request) -> dict:
+@router.post("/connect")
+async def mt5_connect(body: ConnectBody, request: Request, user: CurrentUser) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="admin role required")
     mgr = _manager(request)
+    creds = body.model_dump()
+    creds["mode"] = "platform"
     try:
-        return await mgr.connect(body.model_dump())
+        return await mgr.connect(creds, owner=user["id"])
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 — DataSourceError etc -> 502

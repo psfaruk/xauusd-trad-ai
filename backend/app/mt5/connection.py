@@ -60,6 +60,7 @@ class ConnectionManager:
         self._repo = repo
         self._news = news_service
         self._config_repo = config_repo
+        self.trading_manager: Any = None  # Phase 4 — set by main.py wiring
         self.state = ConnectionState()
         self.runtime: Any = None  # EngineRuntime while connected
         self._creds: dict | None = None  # last creds (memory) for reconnect
@@ -105,8 +106,12 @@ class ConnectionManager:
 
     # ---------------------------------------------------------------- connect
 
-    async def connect(self, creds: dict) -> dict:
-        """Connect + discover symbol + start engine runtime (SPEC §7.1)."""
+    async def connect(self, creds: dict, owner: str | None = None) -> dict:
+        """Connect + discover symbol + start engine runtime (SPEC §7.1).
+
+        `owner` scopes the persisted credential row (multi-user Phase 4);
+        None = the platform/admin plane.
+        """
         async with self._connecting:
             info = await self._source.connect(creds)
             self._creds = dict(creds)
@@ -130,7 +135,7 @@ class ConnectionManager:
                 point_getter(symbol) if callable(point_getter) else 0.01
             )
 
-            await self._persist_connection(creds)
+            await self._persist_connection(creds, owner=owner)
             await self._start_runtime()
             await self._broadcast_status()
             self._ensure_heartbeat()
@@ -183,6 +188,7 @@ class ConnectionManager:
             point_size=self.state.point_size,
             cfg=cfg,
             news_service=self._news,
+            trading_manager=self.trading_manager,
         )
         await self.runtime.start()
 
@@ -196,8 +202,11 @@ class ConnectionManager:
 
     # ------------------------------------------------------------- persistence
 
-    async def _persist_connection(self, creds: dict) -> None:
-        if self._db is None:
+    async def _persist_connection(self, creds: dict, owner: str | None = None) -> None:
+        if self._db is None or owner is None:
+            # owner is NOT NULL in the schema — the platform plane only
+            # persists when an admin user initiated the connect (route passes
+            # their profile id); the D-018 mock auto-connect stays in memory.
             return
         enc = self._encrypt(str(creds.get("password", "")))
         if enc is None:
@@ -209,14 +218,21 @@ class ConnectionManager:
             from sqlalchemy import text
 
             async with self._db.begin() as conn:
-                await conn.execute(text("delete from mt5_connections"))
+                # One row per owner (multi-user Phase 4) — never wipe other
+                # users' credentials.
+                if owner:
+                    await conn.execute(
+                        text("delete from mt5_connections where owner = :owner"),
+                        {"owner": owner},
+                    )
                 await conn.execute(
                     text(
                         """
                         insert into mt5_connections
                             (server, login, enc_password, terminal_path, symbol, status,
-                             last_heartbeat)
-                        values (:server, :login, :enc, :tp, :symbol, 'connected', now())
+                             last_heartbeat, owner, mode)
+                        values (:server, :login, :enc, :tp, :symbol, 'connected', now(),
+                                :owner, :mode)
                         """
                     ),
                     {
@@ -225,6 +241,8 @@ class ConnectionManager:
                         "enc": enc,
                         "tp": creds.get("terminal_path"),
                         "symbol": self.state.symbol,
+                        "owner": owner,
+                        "mode": creds.get("mode", "demo"),
                     },
                 )
         except Exception as exc:  # noqa: BLE001
@@ -246,7 +264,7 @@ class ConnectionManager:
         except Exception as exc:  # noqa: BLE001
             logger.debug("stored status update failed: %s", exc)
 
-    async def try_restore(self) -> bool:
+    async def try_restore(self, owner: str | None = None) -> bool:
         """Startup reconnect from the stored (encrypted) credentials."""
         if self._db is None:
             return False
@@ -254,14 +272,26 @@ class ConnectionManager:
             from sqlalchemy import text
 
             async with self._db.connect() as conn:
-                row = (
-                    await conn.execute(
-                        text(
-                            "select server, login, enc_password, terminal_path, symbol"
-                            " from mt5_connections order by created_at desc limit 1"
+                if owner:
+                    row = (
+                        await conn.execute(
+                            text(
+                                "select server, login, enc_password, terminal_path, symbol"
+                                " from mt5_connections where owner = :o"
+                                " order by created_at desc limit 1"
+                            ),
+                            {"o": owner},
                         )
-                    )
-                ).first()
+                    ).first()
+                else:
+                    row = (
+                        await conn.execute(
+                            text(
+                                "select server, login, enc_password, terminal_path, symbol"
+                                " from mt5_connections order by created_at desc limit 1"
+                            )
+                        )
+                    ).first()
         except Exception as exc:  # noqa: BLE001
             logger.warning("credential restore failed: %s", exc)
             return False
@@ -279,7 +309,8 @@ class ConnectionManager:
                     "password": password,
                     "terminal_path": row[3],
                     "symbol": row[4],
-                }
+                },
+                owner=owner,
             )
             return True
         except Exception as exc:  # noqa: BLE001

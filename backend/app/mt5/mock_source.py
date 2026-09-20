@@ -21,6 +21,7 @@ import asyncio
 import time as time_mod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from dataclasses import replace as dataclasses_replace
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -32,12 +33,19 @@ from app.mt5.base import (
     Order,
     OrderResult,
     Position,
+    SymbolInfo,
     Tick,
     empty_rates,
     validate_tf,
 )
 
 TRADE_RETCODE_DONE = 10009
+
+# Mock lot-sizing metadata mirrors a typical Exness XAUUSD standard account.
+MOCK_SYMBOL_INFO = SymbolInfo(
+    name="XAUUSDm", point=0.01, contract_size=100.0,
+    volume_min=0.01, volume_max=100.0, volume_step=0.01,
+)
 
 
 @dataclass(frozen=True)
@@ -97,6 +105,7 @@ class MockDataSource(DataSource):
         vol_regimes: list[VolRegime] | None = None,
         spread: float = 0.20,
         tick_interval: float = 0.25,
+        origin: datetime | None = None,
     ) -> None:
         self._seed = int(seed)
         self._base_price = float(base_price)
@@ -106,8 +115,13 @@ class MockDataSource(DataSource):
         # Grid-align the origin to UTC midnight so M15/H1/D1 buckets share the
         # SAME grid as epoch-aligned consumers (MarketStream, lightweight-charts)
         # — otherwise buckets are offset by the anchor's minute-of-hour.
-        origin_raw = self._anchor - timedelta(days=self.HISTORY_DAYS)
-        self._origin = origin_raw.replace(hour=0, minute=0, second=0, microsecond=0)
+        # An explicit `origin` (market sibling) pins this to the PUBLIC source's
+        # grid so per-user demo accounts price off the identical market.
+        if origin is not None:
+            self._origin = origin
+        else:
+            origin_raw = self._anchor - timedelta(days=self.HISTORY_DAYS)
+            self._origin = origin_raw.replace(hour=0, minute=0, second=0, microsecond=0)
         self._time_scale = float(time_scale)
         self._spread = float(spread)
         self._tick_interval = float(tick_interval)
@@ -134,6 +148,35 @@ class MockDataSource(DataSource):
         self._manual_seconds = 0.0
 
     # ------------------------------------------------------------------ clock
+
+    def market_params(self) -> dict:
+        """Clock/market identity — consumed by `sibling()` so a per-user demo
+        account prices positions off the SAME market as the public chart."""
+        return {
+            "seed": self._seed,
+            "base_price": self._base_price,
+            "origin": self._origin,
+            "time_scale": self._time_scale,
+            "spread": self._spread,
+        }
+
+    @classmethod
+    def sibling(cls, public: MockDataSource) -> MockDataSource:
+        """A new source sharing the public market (same seed/origin/clock).
+
+        The anchor is rebased to the public source's CURRENT virtual now, so
+        both clocks advance in lockstep and every price lookup returns the
+        same value as the public chart at the same wall-clock moment.
+        """
+        p = public.market_params()
+        return cls(
+            seed=p["seed"],
+            base_price=p["base_price"],
+            start_time=public._vnow(),
+            time_scale=p["time_scale"],
+            spread=p["spread"],
+            origin=p["origin"],
+        )
 
     def _vnow(self) -> datetime:
         elapsed = (time_mod.monotonic() - self._t0) * self._time_scale
@@ -358,34 +401,8 @@ class MockDataSource(DataSource):
             "v": v,
         }
 
-    def account_info(self) -> dict | None:
-        if not self._connected:
-            return None
-        return {
-            "login": "10000000",
-            "server": "MockServer",
-            "balance": self._account.balance,
-            "equity": self._account.equity,
-            "currency": self._account.currency,
-            "leverage": self._account.leverage,
-        }
-
     async def get_tick(self, symbol: str) -> Tick:
-        now = self._vnow()
-        m = int((now - self._origin).total_seconds() // 60)
-        self._ensure_m1(m - 1)
-        o_prev = self._c[m - 1]
-        rng = np.random.default_rng([self._seed, m])
-        z = rng.standard_normal(4)
-        sigma = self._sigma_for(m)
-        if m in self._m1_overrides:
-            target_c = self._m1_overrides[m][3]
-        else:
-            target_c = o_prev + sigma * float(z[0])
-        bar_start = self._origin + timedelta(minutes=m)
-        progress = min(max((now - bar_start).total_seconds() / 60.0, 0.0), 0.999)
-        price = o_prev + (target_c - o_prev) * progress
-        return Tick(bid=price - self._spread / 2, ask=price + self._spread / 2, time=now)
+        return self._tick_from_now(symbol)
 
     def subscribe_ticks(self, symbol: str) -> AsyncIterator[Tick]:
         return self._tick_stream(symbol)
@@ -426,4 +443,91 @@ class MockDataSource(DataSource):
         )
 
     async def get_positions(self) -> list[Position]:
-        return list(self._positions)
+        """Open positions with LIVE floating P/L priced off the current tick."""
+        if not self._positions:
+            return []
+        out: list[Position] = []
+        for p in self._positions:
+            tick = await self.get_tick(p.symbol)
+            out.append(
+                dataclasses_replace(
+                    p, profit=self._floating_profit(p, tick.bid, tick.ask)
+                )
+            )
+        return out
+
+    def _floating_profit(self, p: Position, bid: float, ask: float) -> float:
+        """P/L in account currency: (exit - entry) x contract x lots (USD for XAUUSD)."""
+        exit_price = bid if p.side == "BUY" else ask  # close BUY at bid, SELL at ask
+        direction = 1.0 if p.side == "BUY" else -1.0
+        info = self.symbol_info(p.symbol) or SymbolInfo(name=p.symbol)
+        return (exit_price - p.price_open) * direction * info.contract_size * p.volume
+
+    async def close_position(self, ticket: int, deviation: int = 30) -> OrderResult:
+        """Close by ticket: realize floating P/L into the balance."""
+        if not self._connected:
+            return OrderResult(ok=False, retcode=0, comment="mock: not connected")
+        pos = next((p for p in self._positions if p.ticket == ticket), None)
+        if pos is None:
+            return OrderResult(ok=False, retcode=10036, comment="mock: position not found")
+        tick = await self.get_tick(pos.symbol)
+        exit_price = tick.bid if pos.side == "BUY" else tick.ask
+        profit = self._floating_profit(pos, tick.bid, tick.ask)
+        self._account.balance += profit
+        self._positions = [p for p in self._positions if p.ticket != ticket]
+        return OrderResult(
+            ok=True, ticket=ticket, price=exit_price,
+            retcode=TRADE_RETCODE_DONE,
+            comment=f"mock close profit={profit:.2f}",
+        )
+
+    def symbol_info(self, symbol: str) -> SymbolInfo:
+        return MOCK_SYMBOL_INFO
+
+    # ------------------------------------------------------- account simulation
+
+    def account_info(self) -> dict | None:  # type: ignore[override]
+        """Balance + floating equity (called by the 5s account poller)."""
+        if not self._connected:
+            return None
+        balance = self._account.balance
+        floating = 0.0
+        for p in self._positions:
+            tick = self.get_tick_sync(p.symbol)
+            floating += self._floating_profit(p, tick.bid, tick.ask)
+        self._account.equity = balance + floating
+        return {
+            "login": "10000000",
+            "server": "MockServer",
+            "balance": self._account.balance,
+            "equity": self._account.equity,
+            "currency": self._account.currency,
+            "leverage": self._account.leverage,
+        }
+
+    def get_tick_sync(self, symbol: str) -> Tick:
+        """Sync tick for internal simulation loops (account_info is sync)."""
+        return self._tick_from_now(symbol)
+
+    def _tick_from_now(self, symbol: str) -> Tick:
+        """Pure-sync tick computation (no awaits) reusing get_tick's math."""
+        now = self._vnow()
+        m = int((now - self._origin).total_seconds() // 60)
+        self._ensure_m1(m - 1)
+        o_prev = self._c[m - 1]
+        rng = np.random.default_rng([self._seed, m])
+        z = rng.standard_normal(4)
+        sigma = self._sigma_for(m)
+        if m in self._m1_overrides:
+            target_c = self._m1_overrides[m][3]
+        else:
+            target_c = o_prev + sigma * float(z[0])
+        bar_start = self._origin + timedelta(minutes=m)
+        progress = min(max((now - bar_start).total_seconds() / 60.0, 0.0), 0.999)
+        price = o_prev + (target_c - o_prev) * progress
+        return Tick(bid=price - self._spread / 2, ask=price + self._spread / 2, time=now)
+
+    def set_starting_balance(self, balance: float) -> None:
+        """Test helper — deterministic account seeding."""
+        self._account.balance = float(balance)
+        self._account.equity = float(balance)
