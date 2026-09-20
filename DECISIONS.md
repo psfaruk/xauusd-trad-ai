@@ -252,3 +252,65 @@ multi-symbol routing, contract sizes); live sandbox e2e — BTCUSD provider
 Sunday, dual-symbol WS (ticks + bar frames per symbol), both engines
 running, browser e2e: symbol switch, LIVE · MT5 badge, weekend note, MT5
 footer strip, zero console errors.
+
+## D-036 — AI signal → auto-order on the REAL MetaTrader 5 terminal
+
+**User request:** "AI signal → auto-order (MT5 execution) যুক্ত করা" — wire the
+AI signal engine to automatic order execution through the real MT5 terminal.
+
+**Decision:** A dedicated LIVE execution plane (`McpAutoTrader`) reusing the
+UNCHANGED §9 OrderExecutor risk core, bound to the terminal via a new
+execution-only DataSource adapter — plus a separate, explicit live arm.
+
+1. **`McpTradingSource`** (`app/mt5/mcp_source.py`): DataSource adapter over
+   the terminal MCP bridge (execution half only): `account_info`,
+   `get_positions` (terminal `stop_loss`/`take_profit` field names map to
+   Position.sl/tp), `symbol_info` from Market Watch discovery (REAL contract
+   size + volume limits: XAUUSDm 100/0.01–200, BTCUSDm 1/0.01–200),
+   `place_order` (retcode 10009 → ok, ticket/price/volume captured),
+   `close_position` (symbol resolved from live positions; already-closed
+   positions are a clean ok — broker SL/TP may have exited first). Market
+   data methods are honest errors: the platform feed stays on LiveDataSource
+   with the MT5-first overlay (D-035).
+2. **`McpAutoTrader`** (`app/mt5/auto_trader.py`): owns the arm + the
+   executor. Every order runs the full §9 pipeline on the REAL account:
+   idempotency per signal_id, daily-loss/max-positions/spread kill switches
+   (daily loss closes ALL terminal positions + disarms), size_lot on real
+   equity with real contract specs, 1x retry. Orders carry broker-side
+   SL/TP + `xauai-<signal>` comment.
+3. **Safety = never silent, never queued:**
+   - Separate `auto_trade_live` arm (engine_config column, typed "ENABLE"
+     confirm, admin-only, 409 when the terminal is down or trading is not
+     allowed) — distinct from the paper `auto_trade` kill switch.
+   - Forex weekend logic: a `market_state` callable (from the live feed's
+     MT5 overlay freshness) skips closed-market signals honestly
+     ("weekend/holiday — signal kept, order skipped"); without it the broker
+     rejection (10018 "Market closed") is reported as an honest event.
+     BTCUSD trades 24/7 regardless.
+   - Terminal down at signal time → skip event, NO queueing.
+   - Exit sync: signal EXPIRY closes the linked terminal position
+     (`trade_close_single_position`); won/lost are broker-side SL/TP exits —
+     the trades record is reconciled.
+4. **Wiring:** `UserTradingManager.relay_signal` fans engine signals to the
+   live plane; `EngineRuntime._on_signal_status` routes tracker outcomes to
+   it; `PUT /api/config` now reaches EVERY engine runtime (gold + BTC, was
+   gold-only) and the live executor. REST: `GET/POST /api/mt5/auto-trade`.
+   WS: structured `mt5_auto` events (arm/order/skip/close) to all clients.
+5. **Frontend:** "AI AUTO" tab in the MT5 Account panel — arm state card
+   (red ARMED + REAL MONEY warning), terminal readiness, §9 risk summary,
+   typed-ENABLE arm/disarm, and the live execution feed (WS `mt5_auto`);
+   dashboard footer shows a pulsing "● AI AUTO ARMED" chip while armed.
+
+**Verification:** 224 tests green (18 new: source mapping incl. terminal
+SL/TP field names, specs, order result mapping, close-resolution, arm
+guards, weekend skip, broker-rejection honesty, terminal-down skip,
+idempotency, daily-loss disarm, expiry close, won/lost reconcile, relay
+fan-out, ConfigRepo round-trip, routes 400/200/409); live REST e2e
+(same-origin proxy: status → typed-confirm arm → disarm); LIVE round-trip
+on the real Exness account through the exact relay path: arm → synthetic
+BTCUSD signal → BUY 0.01 BTCUSDm filled @ 81077.15 retcode 10009 with
+SL 80880.12 / TP 81480.12 attached (verified on the terminal position) →
+duplicate relay idempotently skipped → expiry closed @ 81067.15 → disarm
+(-$0.10 spread cost, real broker behavior). Browser e2e: AI AUTO tab,
+ENABLE→ARM flow, red ARMED badge + footer chip, WS event feed showing the
+ARMED event in real time, zero console errors.

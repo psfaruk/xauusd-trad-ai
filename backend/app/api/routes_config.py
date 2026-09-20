@@ -28,9 +28,12 @@ async def put_config(body: EngineConfig, request: Request) -> dict:
     app = request.app
     _, auto_trade = await app.state.config_repo.load(app.state.db_engine)
     await app.state.config_repo.save(app.state.db_engine, body, auto_trade)
-    # live-apply to the running engine (no restart needed)
+    # live-apply to EVERY running engine (gold + extra pairs, D-035) and the
+    # trading planes (incl. the D-036 live auto-trader) — no restart needed
     if app.state.mt5.runtime is not None:
         await app.state.mt5.runtime.apply_config(body)
+    for rt in list(getattr(app.state.mt5, "runtimes", {}).values()):
+        await rt.apply_config(body)
     return {"config": body.model_dump(), "auto_trade": auto_trade}
 
 

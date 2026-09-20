@@ -112,6 +112,9 @@ class ConfigRepo:
     def __init__(self) -> None:
         self._mem_config: EngineConfig = DEFAULT_CONFIG.model_copy(deep=True)
         self._mem_auto_trade: bool = False
+        # D-036 — AI-signal -> auto-order on the REAL MT5 terminal (live arm)
+        self._mem_auto_live: bool = False
+        self._mem_auto_live_by: str | None = None
 
     async def load(self, db_engine: Any) -> tuple[EngineConfig, bool]:
         if db_engine is None:
@@ -161,3 +164,55 @@ class ConfigRepo:
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("config persist failed (kept in memory): %s", exc)
+
+    # ------------------------------------------------- D-036 live MT5 auto arm
+
+    async def load_auto_live(self, db_engine: Any) -> tuple[bool, str | None]:
+        """(armed, armed_by) of the REAL-terminal auto-execution arm."""
+        if db_engine is None:
+            return self._mem_auto_live, self._mem_auto_live_by
+        try:
+            from sqlalchemy import text
+
+            async with db_engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            "select auto_trade_live, auto_trade_live_by"
+                            " from engine_config where id = 1"
+                        )
+                    )
+                ).first()
+            if row is None:
+                return self._mem_auto_live, self._mem_auto_live_by
+            self._mem_auto_live = bool(row[0])
+            self._mem_auto_live_by = str(row[1]) if row[1] else None
+            return self._mem_auto_live, self._mem_auto_live_by
+        except Exception as exc:  # noqa: BLE001 — degrade, never crash (C6)
+            logger.warning("auto_live load failed, using cached state: %s", exc)
+            return self._mem_auto_live, self._mem_auto_live_by
+
+    async def save_auto_live(
+        self, db_engine: Any, enabled: bool, armed_by: str | None = None
+    ) -> None:
+        self._mem_auto_live, self._mem_auto_live_by = enabled, armed_by
+        if db_engine is None:
+            return
+        try:
+            from sqlalchemy import text
+
+            async with db_engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        """
+                        update engine_config
+                           set auto_trade_live = :enabled,
+                               auto_trade_live_by = :by,
+                               updated_at = now()
+                         where id = 1
+                        """
+                    ),
+                    {"enabled": enabled, "by": armed_by},
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("auto_live persist failed (kept in memory): %s", exc)

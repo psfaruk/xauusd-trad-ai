@@ -15,11 +15,13 @@ import { useAuth } from "../lib/auth";
 import {
   getCandles, getMt5Status, getSignals, getStats, getHealth, getMe,
   getTradingStatus, getTradingPositions, getMt5Account, getMt5Positions,
+  getMt5AutoTrade,
 } from "../lib/api";
 import { WSClient } from "../lib/ws";
 import type {
   Candle, Mt5Account, Mt5OpenPosition, Mt5Status, Signal, StatsResponse,
-  Timeframe, TradingPosition, TradingStatus, WsMessage, WsMt5StatusMsg,
+  Timeframe, TradingPosition, TradingStatus, WsMessage, WsMt5AutoMsg,
+  WsMt5StatusMsg,
 } from "../types";
 
 /**
@@ -65,6 +67,9 @@ export default function Dashboard() {
    * on the dashboard footer — polled every 10s while the bridge answers. */
   const [mt5Acct, setMt5Acct] = useState<Mt5Account | null>(null);
   const [mt5Pos, setMt5Pos] = useState<Mt5OpenPosition[]>([]);
+  /* D-036: live AI auto-execution — armed state + real-time event feed. */
+  const [mt5AutoArmed, setMt5AutoArmed] = useState(false);
+  const [mt5AutoEvents, setMt5AutoEvents] = useState<WsMt5AutoMsg[]>([]);
 
   const connectedSymbol = mt5?.symbol ?? null;
   const symbols = useMemo(() => {
@@ -157,6 +162,15 @@ export default function Dashboard() {
         case "engine_log":
           setEngineLogs((prev) => [...prev.slice(-7), { level: msg.level, message: msg.message }]);
           break;
+        case "mt5_auto": {
+          // D-036 — AI signal -> auto-order events (arm/order/skip/close)
+          const ev = msg as WsMt5AutoMsg;
+          setMt5AutoEvents((prev) => [...prev.slice(-29), ev]);
+          if (ev.event === "armed" || ev.event === "disarmed") {
+            setMt5AutoArmed(ev.event === "armed");
+          }
+          break;
+        }
         case "trading_account":
           setTrading((prev) => ({
             ...prev,
@@ -231,6 +245,7 @@ export default function Dashboard() {
 
   // D-034/D-035: the REAL MT5 account (balance/equity/positions) — 10s poll,
   // hidden honestly when the terminal bridge is offline.
+  // D-036: the AI auto-trade arm state rides the same poll.
   useEffect(() => {
     if (!token) return;
     let alive = true;
@@ -245,6 +260,9 @@ export default function Dashboard() {
       getMt5Positions(token)
         .then((r) => alive && setMt5Pos(r.positions))
         .catch(() => alive && setMt5Pos([]));
+      getMt5AutoTrade(token)
+        .then((s) => alive && setMt5AutoArmed(s.armed))
+        .catch(() => alive && setMt5AutoArmed(false));
     };
     poll();
     const timer = window.setInterval(poll, 10_000);
@@ -414,6 +432,18 @@ export default function Dashboard() {
 
           {/* D-034/D-035: the REAL MT5 account — balance/equity/positions from
            * the MetaTrader 5 terminal, visible right here after connect. */}
+          {mt5AutoArmed && (
+            <button
+              type="button"
+              onClick={() => setMt5AccountOpen(true)}
+              className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-zinc-800/60"
+              title="AI signal → auto-order is ARMED on the real account — click to manage"
+            >
+              <span className="animate-pulse rounded bg-red-500/20 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-red-300">
+                ● AI AUTO ARMED
+              </span>
+            </button>
+          )}
           {mt5Acct && (
             <button
               type="button"
@@ -574,6 +604,8 @@ export default function Dashboard() {
         onClose={() => setMt5AccountOpen(false)}
         token={token ?? ""}
         defaultSymbol={symbol}
+        autoEvents={mt5AutoEvents}
+        isAdmin={isAdmin}
       />
 
       <LogViewer

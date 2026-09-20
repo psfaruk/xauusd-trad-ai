@@ -210,6 +210,95 @@ class TradeRepo:
         except Exception as exc:  # noqa: BLE001
             logger.warning("trade persist failed (kept in memory): %s", exc)
 
+    async def open_trade_for_signal(
+        self, signal_id: str, owner: str | None = None
+    ) -> dict | None:
+        """The still-open trade linked to a signal (D-036 exit sync)."""
+        if self._db is not None:
+            try:
+                from sqlalchemy import text
+
+                async with self._db.connect() as conn:
+                    if owner:
+                        row = (
+                            await conn.execute(
+                                text(
+                                    "select * from trades where signal_id = :s"
+                                    " and owner = :o and closed_at is null"
+                                    " order by opened_at desc limit 1"
+                                ),
+                                {"s": signal_id, "o": owner},
+                            )
+                        ).mappings().first()
+                    else:
+                        row = (
+                            await conn.execute(
+                                text(
+                                    "select * from trades where signal_id = :s"
+                                    " and closed_at is null"
+                                    " order by opened_at desc limit 1"
+                                ),
+                                {"s": signal_id},
+                            )
+                        ).mappings().first()
+                if row is not None:
+                    d = dict(row)
+                    d["opened_at"] = (
+                        d["opened_at"].isoformat() if d.get("opened_at") else None
+                    )
+                    return d
+            except Exception:  # noqa: BLE001 — fall through to memory
+                pass
+        for t in reversed(self._mem):
+            if (
+                t.get("signal_id") == signal_id
+                and (owner is None or t.get("owner") == owner)
+                and not t.get("closed_at")
+            ):
+                return t
+        return None
+
+    async def mark_closed(
+        self,
+        signal_id: str,
+        owner: str | None = None,
+        price_close: float | None = None,
+        profit: float | None = None,
+    ) -> None:
+        """Record the exit of a linked trade (best-effort, D-036)."""
+        for t in reversed(self._mem):
+            if (
+                t.get("signal_id") == signal_id
+                and (owner is None or t.get("owner") == owner)
+                and not t.get("closed_at")
+            ):
+                t["closed_at"] = datetime.now(tz=UTC).isoformat()
+                if price_close is not None:
+                    t["price_close"] = price_close
+                if profit is not None:
+                    t["profit"] = profit
+                break
+        if self._db is None:
+            return
+        try:
+            from sqlalchemy import text
+
+            async with self._db.begin() as conn:
+                await conn.execute(
+                    text(
+                        """
+                        update trades set closed_at = now(),
+                            price_close = coalesce(:pc, price_close),
+                            profit = coalesce(:p, profit)
+                         where signal_id = :s and closed_at is null
+                           and (:o is null or owner = :o)
+                        """
+                    ),
+                    {"s": signal_id, "o": owner, "pc": price_close, "p": profit},
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("trade close persist failed: %s", exc)
+
     async def list_for_owner(self, owner: str, limit: int = 100) -> list[dict]:
         if self._db is not None:
             try:
@@ -260,15 +349,22 @@ class OrderExecutor:
         self._day_start_equity = day_start_equity
         self._lock = asyncio.Lock()
         self.auto_trade = False  # armed by the owner of the plane
+        self.last_skip_reason: str | None = None  # D-036 — surfaced to the UI
 
     async def apply_config(self, cfg: EngineConfig) -> None:
         self._cfg = cfg
 
     def arm(self, enabled: bool) -> None:
         self.auto_trade = enabled
+        self.last_skip_reason = None
         if enabled:
             # reset the daily-loss anchor on arming
             self._day_start_equity = None
+
+    def set_owner(self, owner: str | None) -> None:
+        """D-036 — re-scope the trades-table linkage (live plane: the arming
+        admin's profile id) without rebuilding the executor."""
+        self._owner = owner
 
     async def _ensure_day_anchor(self) -> None:
         if self._day_start_equity is None:
@@ -288,9 +384,11 @@ class OrderExecutor:
         """
         async with self._lock:
             if not self.auto_trade:
+                self.last_skip_reason = "auto-trade disarmed"
                 return None
             signal_id = signal.get("id")
             if signal_id and await self._repo.has_trade_for_signal(signal_id, self._owner):
+                self.last_skip_reason = f"duplicate signal {str(signal_id)[:8]} (idempotency)"
                 logger.info("duplicate signal %s skipped (idempotency)", str(signal_id)[:8])
                 return None
 
@@ -303,6 +401,7 @@ class OrderExecutor:
                 positions=positions,
             )
             if not verdict.allowed:
+                self.last_skip_reason = verdict.reason
                 if verdict.kill_daily_loss:
                     await self._emergency_stop()
                 else:

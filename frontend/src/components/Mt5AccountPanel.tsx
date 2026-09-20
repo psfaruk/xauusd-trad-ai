@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  getMt5Account, getMt5History, getMt5Positions, getMt5Symbols,
-  postMt5Close, postMt5Order,
+  getMt5Account, getMt5AutoTrade, getMt5History, getMt5Positions, getMt5Symbols,
+  postMt5AutoTrade, postMt5Close, postMt5Order,
 } from "../lib/api";
-import type { Mt5Account, Mt5HistoryPosition, Mt5OpenPosition, Mt5Symbol } from "../types";
+import type {
+  Mt5Account, Mt5AutoTradeStatus, Mt5HistoryPosition, Mt5OpenPosition, Mt5Symbol,
+  WsMt5AutoMsg,
+} from "../types";
 
 interface Mt5AccountPanelProps {
   open: boolean;
@@ -11,17 +14,24 @@ interface Mt5AccountPanelProps {
   token: string;
   /** D-035: instrument selected on the dashboard (XAUUSD | BTCUSD). */
   defaultSymbol?: string;
+  /** D-036: live AI auto-execution events (WS mt5_auto feed). */
+  autoEvents?: WsMt5AutoMsg[];
+  /** D-036: only admins may arm/disarm the REAL auto-executor. */
+  isAdmin?: boolean;
 }
 
-type Tab = "positions" | "history" | "order";
+type Tab = "positions" | "history" | "order" | "auto";
 
 /**
  * Mt5AccountPanel — the REAL Exness trading account, live through the
  * MetaTrader 5 terminal bridge (D-034). Balance/equity, open positions,
  * detailed trade history and manual market orders — all executed by the
  * genuine MT5 terminal, never simulated.
+ *
+ * D-036 "AI AUTO" tab: AI signal -> auto-order on the REAL account —
+ * arm/disarm (typed confirm), risk summary and the live execution feed.
  */
-export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol }: Mt5AccountPanelProps) {
+export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol, autoEvents = [], isAdmin = false }: Mt5AccountPanelProps) {
   const [tab, setTab] = useState<Tab>("positions");
   const [account, setAccount] = useState<Mt5Account | null>(null);
   const [positions, setPositions] = useState<Mt5OpenPosition[] | null>(null);
@@ -34,6 +44,18 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol }:
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // D-036 — AI AUTO tab state
+  const [auto, setAuto] = useState<Mt5AutoTradeStatus | null>(null);
+  const [confirmText, setConfirmText] = useState("");
+  const [autoBusy, setAutoBusy] = useState(false);
+
+  const refreshAuto = useCallback(async () => {
+    try {
+      setAuto(await getMt5AutoTrade(token));
+    } catch {
+      setAuto(null);
+    }
+  }, [token]);
 
   const refresh = useCallback(async () => {
     try {
@@ -64,7 +86,14 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol }:
     getMt5History(token, 90)
       .then((r) => setHistory(r.positions))
       .catch(() => setHistory([]));
-  }, [open, token]);
+    void refreshAuto();
+  }, [open, token, refreshAuto]);
+
+  useEffect(() => {
+    if (!open || tab !== "auto") return;
+    const id = setInterval(() => void refreshAuto(), 5000);
+    return () => clearInterval(id);
+  }, [open, tab, refreshAuto]);
 
   if (!open) return null;
 
@@ -122,6 +151,29 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol }:
     }
   };
 
+  const setArmed = async (enabled: boolean) => {
+    setAutoBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await postMt5AutoTrade(token, {
+        enabled,
+        confirm: enabled ? confirmText.trim() : undefined,
+      });
+      if (res.armed) {
+        setNotice("LIVE AUTO-TRADE ARMED — every AI signal now places a REAL order");
+      } else {
+        setNotice("live auto-trade disarmed");
+      }
+      setConfirmText("");
+      await refreshAuto();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "arm/disarm failed");
+    } finally {
+      setAutoBusy(false);
+    }
+  };
+
   const fmt = (n: number | null | undefined, d = 2) =>
     n === null || n === undefined ? "—" : n.toFixed(d);
 
@@ -156,17 +208,22 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol }:
           </div>
           <div className="flex items-center gap-2">
             <div className="flex rounded-md border border-zinc-700 p-0.5 text-xs">
-              {(["positions", "history", "order"] as Tab[]).map((t) => (
+              {(["positions", "history", "order", "auto"] as Tab[]).map((t) => (
                 <button
                   key={t}
                   type="button"
                   onClick={() => setTab(t)}
                   className={`rounded px-3 py-1 ${tab === t ? "bg-gold/15 text-gold" : "text-zinc-400 hover:text-zinc-200"}`}
                 >
-                  {t}
+                  {t === "auto" ? "AI AUTO" : t}
                 </button>
               ))}
             </div>
+            {auto?.armed && (
+              <span className="rounded-full bg-red-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-red-300">
+                ● ai auto armed
+              </span>
+            )}
             <button type="button" onClick={onClose} className="text-zinc-500 hover:text-zinc-300">✕</button>
           </div>
         </div>
@@ -432,6 +489,202 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol }:
                 {" "}{account?.server ?? "your broker"}. Demo account funds are virtual, but
                 execution, fills and history are 100% real broker behavior.
               </p>
+            </div>
+          )}
+
+          {tab === "auto" && (
+            <div className="space-y-4">
+              {/* arm state */}
+              <div
+                className={`rounded-xl border p-4 ${
+                  auto?.armed
+                    ? "border-red-500/40 bg-red-500/5"
+                    : "border-zinc-800 bg-zinc-950/60"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p
+                      className={`text-sm font-bold uppercase tracking-wider ${
+                        auto?.armed ? "text-red-300" : "text-zinc-400"
+                      }`}
+                    >
+                      {auto === null
+                        ? "AI SIGNAL → AUTO-ORDER (loading…)"
+                        : auto.armed
+                          ? "● AI AUTO-TRADE ARMED"
+                          : "AI AUTO-TRADE DISARMED"}
+                    </p>
+                    <p className="mt-1 text-xs text-zinc-500">
+                      {auto?.armed
+                        ? `Every AI signal (XAUUSD + BTCUSD, ${auto.risk.timeframe} engine) now places a REAL market order on this account — SL/TP attached, §9 risk guards enforced.`
+                        : "When armed, every AI signal places a REAL order through the MetaTrader 5 terminal with the risk guards below."}
+                    </p>
+                  </div>
+                  {auto?.terminal.available ? (
+                    <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300">
+                      terminal ready
+                    </span>
+                  ) : (
+                    <span className="rounded-full bg-red-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-red-300">
+                      terminal offline
+                    </span>
+                  )}
+                </div>
+                {auto && (
+                  <p className="mt-2 text-[11px] text-zinc-500">
+                    {auto.terminal.server ?? "—"} · login{" "}
+                    <span className="font-mono">{auto.terminal.login ?? "—"}</span> ·
+                    equity <span className="font-mono">{fmt(auto.terminal.equity)}</span>{" "}
+                    {auto.terminal.currency ?? "USD"}
+                    {auto.terminal.available && !auto.terminal.trade_allowed && (
+                      <span className="text-amber-300"> · automated trading disabled in the terminal</span>
+                    )}
+                    {auto.armed_at && (
+                      <> · armed {new Date(auto.armed_at).toLocaleString()}</>
+                    )}
+                  </p>
+                )}
+                {auto?.armed && (
+                  <p className="mt-2 rounded-md border border-red-500/30 bg-red-500/10 p-2 text-[11px] text-red-200">
+                    REAL MONEY MODE — orders execute on the live Exness account. The
+                    daily-loss kill switch closes everything and disarms automatically.
+                  </p>
+                )}
+              </div>
+
+              {/* risk summary + controls */}
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
+                  <h4 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                    Risk guards (§9 · engine config)
+                  </h4>
+                  {auto ? (
+                    <dl className="space-y-1.5 text-xs">
+                      <div className="flex justify-between">
+                        <dt className="text-zinc-500">Risk per trade</dt>
+                        <dd className="font-mono text-zinc-200">
+                          {auto.risk.risk_mode === "percent"
+                            ? `${auto.risk.risk_percent}% of equity`
+                            : `${auto.risk.fixed_lot} lots fixed`}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between">
+                        <dt className="text-zinc-500">Max open positions</dt>
+                        <dd className="font-mono text-zinc-200">{auto.risk.max_positions}</dd>
+                      </div>
+                      <div className="flex justify-between">
+                        <dt className="text-zinc-500">Daily loss kill switch</dt>
+                        <dd className="font-mono text-zinc-200">-{auto.risk.daily_max_loss_pct}%</dd>
+                      </div>
+                      <div className="flex justify-between">
+                        <dt className="text-zinc-500">Max spread</dt>
+                        <dd className="font-mono text-zinc-200">{auto.risk.max_spread_points} pts</dd>
+                      </div>
+                      <div className="flex justify-between">
+                        <dt className="text-zinc-500">Signal engine</dt>
+                        <dd className="font-mono text-zinc-200">{auto.risk.timeframe} SFP</dd>
+                      </div>
+                    </dl>
+                  ) : (
+                    <p className="text-xs text-zinc-500">loading…</p>
+                  )}
+                  <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
+                    Lot size is computed from the REAL account equity and the signal's
+                    SL distance. Broker-side SL/TP ride with every order; signal expiry
+                    closes the position; forex weekends are skipped honestly (BTCUSD
+                    trades 24/7).
+                  </p>
+                </div>
+
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
+                  <h4 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                    Arm / disarm (admin)
+                  </h4>
+                  {!isAdmin ? (
+                    <p className="text-xs text-zinc-500">
+                      Only admins can arm live auto-execution.
+                    </p>
+                  ) : auto?.armed ? (
+                    <button
+                      type="button"
+                      disabled={autoBusy}
+                      onClick={() => void setArmed(false)}
+                      className="w-full rounded-md border border-zinc-500/50 bg-zinc-500/10 px-3 py-2.5 text-sm font-bold text-zinc-200 hover:bg-zinc-500/20 disabled:opacity-40"
+                    >
+                      DISARM AUTO-TRADE
+                    </button>
+                  ) : (
+                    <>
+                      <label className="text-xs text-zinc-400">
+                        Type <span className="font-mono font-bold text-gold">ENABLE</span> to arm
+                        <input
+                          value={confirmText}
+                          onChange={(e) => setConfirmText(e.target.value)}
+                          placeholder="ENABLE"
+                          className="mt-1 w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 font-mono text-sm text-zinc-200 focus:border-red-500/60 focus:outline-none"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        disabled={autoBusy || confirmText.trim() !== "ENABLE" || !auto?.terminal.available || !auto?.terminal.trade_allowed}
+                        onClick={() => void setArmed(true)}
+                        className="mt-2 w-full rounded-md border border-red-500/50 bg-red-500/15 px-3 py-2.5 text-sm font-bold text-red-300 hover:bg-red-500/25 disabled:opacity-40"
+                      >
+                        ARM LIVE AUTO-TRADE
+                      </button>
+                      <p className="mt-2 text-[11px] text-zinc-500">
+                        Requires the terminal bridge to be online and automated trading
+                        allowed in MetaTrader 5.
+                      </p>
+                    </>
+                  )}
+                  {auto?.last_skip_reason && (
+                    <p className="mt-2 text-[11px] text-amber-300/90">
+                      last skip: {auto.last_skip_reason}
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {/* live execution feed */}
+              <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
+                <h4 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                  AI execution feed (live)
+                </h4>
+                {autoEvents.length === 0 ? (
+                  <p className="text-xs text-zinc-500">
+                    No auto-execution events yet. Orders, skips (weekend/market-closed,
+                    risk guards) and closes will appear here in real time.
+                  </p>
+                ) : (
+                  <ul className="max-h-56 space-y-1.5 overflow-y-auto text-xs">
+                    {autoEvents.map((ev, i) => (
+                      <li key={`${ev.ts}-${i}`} className="flex items-start gap-2">
+                        <span
+                          className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${
+                            ev.event === "order" && ev.ok
+                              ? "bg-emerald-400"
+                              : ev.event === "order" || ev.event === "skip"
+                                ? "bg-amber-400"
+                                : ev.event === "close"
+                                  ? "bg-sky-400"
+                                  : "bg-red-400"
+                          }`}
+                        />
+                        <div>
+                          <p className="text-zinc-300">{ev.message}</p>
+                          <p className="text-[10px] text-zinc-600">
+                            {new Date(ev.ts).toLocaleTimeString()} ·{" "}
+                            {ev.event.toUpperCase()}
+                            {ev.signal_id ? ` · signal ${ev.signal_id.slice(0, 8)}` : ""}
+                          </p>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
             </div>
           )}
         </div>

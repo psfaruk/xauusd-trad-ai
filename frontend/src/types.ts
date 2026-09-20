@@ -368,6 +368,25 @@ export interface WsTradingLogMsg {
   message: string;
 }
 
+/** D-036 — live AI auto-execution events (arm/order/skip/close). */
+export interface WsMt5AutoMsg {
+  type: "mt5_auto";
+  ts: string;
+  level: string;
+  message: string;
+  event: "armed" | "disarmed" | "order" | "skip" | "close";
+  ok?: boolean;
+  signal_id?: string;
+  symbol?: string;
+  side?: string;
+  volume?: number | null;
+  price?: number | null;
+  ticket?: number | null;
+  retcode?: number | null;
+  detail?: string;
+  reason?: string;
+}
+
 export interface WsHeartbeatMsg {
   type: "heartbeat" | "subscribed" | "unsubscribed" | "error";
   ts?: number;
@@ -386,6 +405,7 @@ export type WsMessage =
   | WsEngineLogMsg
   | WsTradingAccountMsg
   | WsTradingLogMsg
+  | WsMt5AutoMsg
   | WsHeartbeatMsg;
 
 /* ------------------------------------------------- D-034 real MT5 account */
@@ -458,4 +478,30 @@ export interface Mt5OrderResult {
   price: number | null;
   volume: number | null;
   symbol: string | null;
+}
+
+/* --------------------------------------------- D-036 AI signal -> MT5 order */
+
+export interface Mt5AutoTradeStatus {
+  armed: boolean;
+  armed_at: string | null;
+  armed_by: string | null;
+  terminal: {
+    available: boolean;
+    trade_allowed: boolean;
+    server: string | null;
+    login: string | null;
+    equity: number | null;
+    currency: string | null;
+  };
+  risk: {
+    risk_mode: string;
+    risk_percent: number;
+    fixed_lot: number;
+    max_positions: number;
+    daily_max_loss_pct: number;
+    max_spread_points: number;
+    timeframe: string;
+  };
+  last_skip_reason: string | null;
 }

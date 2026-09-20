@@ -2,7 +2,7 @@ import type {
   HealthInfo, MeInfo, CandlesResponse, Signal, Mt5Status, Position, StatsResponse,
   ConfigResponse, EngineConfig, TradingStatus, TradingPosition, TradeRecord,
   OrderResult, ExternalSnapshot, LogEntry, Mt5Account, Mt5OpenPosition,
-  Mt5HistoryPosition, Mt5Symbol, Mt5OrderResult,
+  Mt5HistoryPosition, Mt5Symbol, Mt5OrderResult, Mt5AutoTradeStatus,
 } from "../types";
 
 /**
@@ -129,6 +129,23 @@ export function postMt5Close(
   body: { symbol: string; ticket: number }
 ): Promise<Mt5OrderResult> {
   return request<Mt5OrderResult>("/api/mt5/close", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, token);
+}
+
+/* ------------------------------------------- D-036 AI signal -> MT5 order */
+
+export function getMt5AutoTrade(token: string): Promise<Mt5AutoTradeStatus> {
+  return request<Mt5AutoTradeStatus>("/api/mt5/auto-trade", {}, token);
+}
+
+export function postMt5AutoTrade(
+  token: string,
+  body: { enabled: boolean; confirm?: string }
+): Promise<{ armed: boolean; terminal: Mt5AutoTradeStatus["terminal"] }> {
+  return request("/api/mt5/auto-trade", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

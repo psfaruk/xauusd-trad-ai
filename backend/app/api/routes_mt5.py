@@ -11,6 +11,10 @@ GET  /api/mt5/history     (auth)  closed-position history (days=1..365)
 GET  /api/mt5/symbols     (auth)  Market Watch symbols (Exness set)
 POST /api/mt5/order       (auth)  market order on the REAL account (MCP)
 POST /api/mt5/close       (auth)  close a position by ticket (MCP)
+
+D-036 — AI signal -> auto-order on the REAL account:
+GET  /api/mt5/auto-trade  (auth)  arm state + terminal readiness + risk summary
+POST /api/mt5/auto-trade  (admin) {enabled, confirm:"ENABLE"} — typed confirm
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.auth import CurrentUser, require_admin
+from app.mt5.auto_trader import ArmError
 from app.mt5.mcp import MCPError, terminal_client
 
 router = APIRouter(prefix="/api/mt5", tags=["mt5"])
@@ -175,3 +180,46 @@ async def mt5_close(body: CloseBody, user: CurrentUser) -> dict:
         "price": res.get("price"),
         "profit": None,
     }
+
+
+# ------------------------------------------------------------------ D-036
+def _auto_trader(request: Request):
+    trader = getattr(request.app.state, "mt5_auto", None)
+    if trader is None:
+        raise HTTPException(
+            status_code=503,
+            detail="live auto-trade module not initialized on this server",
+        )
+    return trader
+
+
+@router.get("/auto-trade")
+async def mt5_auto_trade_status(request: Request, user: CurrentUser) -> dict:
+    """AI-signal -> auto-order state on the REAL MT5 terminal."""
+    return await _auto_trader(request).status()
+
+
+class AutoTradeLiveBody(BaseModel):
+    enabled: bool
+    confirm: str | None = Field(default=None, max_length=16)
+
+
+@router.post("/auto-trade", dependencies=[Depends(require_admin)])
+async def mt5_auto_trade_arm(
+    body: AutoTradeLiveBody, request: Request, user: CurrentUser
+) -> dict:
+    """Arm/disarm REAL auto-execution (typed confirmation "ENABLE")."""
+    if body.enabled and body.confirm != "ENABLE":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                'typed confirmation required: {"enabled": true, "confirm": "ENABLE"}'
+            ),
+        )
+    trader = _auto_trader(request)
+    try:
+        await trader.arm(body.enabled, owner=user["id"])
+    except ArmError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    st = await trader.status()
+    return {"armed": st["armed"], "terminal": st["terminal"]}

@@ -138,6 +138,15 @@ class EngineRuntime:
         logger.info(
             "signal %s -> %s (r=%s)", sig.id[:8], sig.status, sig.result_r
         )
+        # D-036 — the live MT5 plane keeps its REAL position in step
+        # (expiry -> terminal close; won/lost -> record reconciliation).
+        if self.trading_manager is not None:
+            notify = getattr(self.trading_manager, "notify_signal_status", None)
+            if notify is not None:
+                try:
+                    await notify(sig.id, sig.status)
+                except Exception:  # noqa: BLE001 — must never kill the callback
+                    logger.exception("live exit sync notification failed")
 
     # ----------------------------------------------------------------- loops
 

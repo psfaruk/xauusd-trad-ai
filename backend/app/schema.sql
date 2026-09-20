@@ -34,6 +34,11 @@ create table if not exists engine_config (
   updated_at timestamptz not null default now()
 );
 
+-- D-036: AI-signal -> auto-order on the REAL MT5 terminal (explicit live
+-- arm, separate from the paper auto_trade kill switch).
+alter table engine_config add column if not exists auto_trade_live boolean not null default false;
+alter table engine_config add column if not exists auto_trade_live_by uuid references profiles(id);
+
 create table if not exists signals (
   id uuid primary key default gen_random_uuid(),
   ts timestamptz not null,

@@ -116,6 +116,7 @@ class UserTradingManager:
         self._planes: dict[str, TradingPlane] = {}
         self._repo = TradeRepo(db_engine)
         self._platform_executor: OrderExecutor | None = None
+        self._live_auto: Any | None = None  # D-036 McpAutoTrader (real terminal)
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------ admin plane
@@ -127,6 +128,16 @@ class UserTradingManager:
     @property
     def platform_executor(self) -> OrderExecutor | None:
         return self._platform_executor
+
+    # ------------------------------------------------------- live MT5 plane
+
+    def attach_live_auto_trader(self, trader: Any) -> None:
+        """D-036 — the REAL-terminal auto-executor (AI signal -> MT5 order)."""
+        self._live_auto = trader
+
+    @property
+    def live_auto_trader(self) -> Any | None:
+        return self._live_auto
 
     # ------------------------------------------------------------- encryption
 
@@ -583,12 +594,18 @@ class UserTradingManager:
 
     async def relay_signal(self, signal: dict, symbol: str, point_size: float) -> None:
         """Fan a platform engine signal out to every ARMED plane + the admin
-        plane (copy-trading agent core, SPEC §9 executor per user)."""
+        plane (copy-trading agent core, SPEC §9 executor per user) + the
+        REAL MT5 terminal plane (D-036 AI signal -> auto-order)."""
         if self._platform_executor is not None and self._platform_executor.auto_trade:
             try:
                 await self._platform_executor.execute_signal(signal, symbol, point_size)
             except Exception:  # noqa: BLE001 — one plane must not break others
                 logger.exception("platform executor failed on signal relay")
+        if self._live_auto is not None:
+            try:
+                await self._live_auto.on_signal(signal, symbol, point_size)
+            except Exception:  # noqa: BLE001 — live plane must not break others
+                logger.exception("live auto-trader failed on signal relay")
         for owner, plane in list(self._planes.items()):
             if not plane.executor.auto_trade:
                 continue
@@ -597,10 +614,24 @@ class UserTradingManager:
             except Exception:  # noqa: BLE001
                 logger.exception("plane %s executor failed on signal relay", owner[:8])
 
+    async def notify_signal_status(self, signal_id: str, status: str) -> None:
+        """D-036 — tracker outcomes reach the live plane (expiry -> close)."""
+        if self._live_auto is None:
+            return
+        try:
+            await self._live_auto.notify_signal_status(signal_id, status)
+        except Exception:  # noqa: BLE001 — exit sync must never crash the runtime
+            logger.exception("live auto-trader exit sync failed")
+
     async def apply_config(self, cfg: EngineConfig) -> None:
         """Live config updates reach every executor (PUT /api/config)."""
         if self._platform_executor is not None:
             await self._platform_executor.apply_config(cfg)
+        if self._live_auto is not None:
+            try:
+                self._live_auto.apply_config(cfg)
+            except Exception:  # noqa: BLE001
+                logger.exception("live auto-trader config apply failed")
         for plane in self._planes.values():
             await plane.executor.apply_config(cfg)
 

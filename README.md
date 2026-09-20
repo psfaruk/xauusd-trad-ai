@@ -127,8 +127,24 @@ forex market through the terminal (1s tick poll + authoritative M1..D1 chart
 history). When forex closes (weekend) or the terminal is down, the platform
 transparently falls back to the 24/7 crypto composite and switches back to
 the broker feed automatically at the Monday open — the badge always shows
-which source is live (`LIVE · MT5 · broker feed` vs `LIVE · crypto composite`
-+ a weekend note). **BTCUSD is a full second pair** (own chart, ticks,
+which source is live (`LIVE · MT5 · broker feed` vs `LIVE · crypto composite`).
+
+**AI signal → auto-order on the REAL account (D-036).** The AI engines
+(XAUUSD + BTCUSD, M15 SFP pipeline) can now place REAL orders automatically
+through the MetaTrader 5 terminal: ⋮ → **MT5 Account (live)** → **AI AUTO**
+tab → type `ENABLE` → ARM. Every armed signal runs the unchanged §9 risk
+core against the real account (lot size from real equity + the signal's SL
+distance, idempotent per signal, max-positions/spread/daily-loss kill
+switches — daily loss closes everything and disarms), sends the order with
+broker-side SL/TP + an `xauai-<signal>` comment, and broadcasts a live
+`mt5_auto` event feed (orders, honest skips — e.g. forex weekends — and
+closes). Signal expiry closes the terminal position; won/lost reconcile
+automatically (broker-side SL/TP). The arm is a separate, explicit switch
+from the paper `auto_trade` toggle, persists in `engine_config`, is refused
+honestly (409) when the terminal is offline, and shows as a red pulsing
+`● AI AUTO ARMED` chip in the dashboard footer while active. Orders are
+NEVER queued: terminal down or market closed → the signal is kept and the
+skip is reported. **BTCUSD is a full second pair** (own chart, ticks,
 candles, signal engine, trading); XAUUSD ↔ BTCUSD switch with the instrument
 chips next to the timeframe switcher, and the real MT5 account balance /
 equity / open positions are always visible in the dashboard footer.
@@ -337,5 +353,10 @@ Health check: `https://<your-app>.up.railway.app/api/health`. Auth check:
 
 ## Safety
 
-`auto_trade` defaults to OFF everywhere (SPEC §0.6). v1 targets a **demo**
+`auto_trade` defaults to OFF everywhere (SPEC §0.6). The D-036 live
+auto-execution arm (`auto_trade_live`) is a SEPARATE switch, also defaults
+to OFF, requires the admin to type `ENABLE`, and is refused while the
+terminal is offline. Kill switches (daily loss −3%, max positions, max
+spread) guard every real order; the daily-loss emergency closes all
+terminal positions and disarms automatically. v1 targets a **demo**
 account only (SPEC C8).

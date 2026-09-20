@@ -184,6 +184,7 @@ async def lifespan(app: FastAPI):
 
     # --- Phase 4: arm the admin platform executor per persisted auto_trade;
     # restore user demo planes (multi-user agent).
+    # --- D-036: the REAL-terminal auto-executor (AI signal -> MT5 order).
     try:
         cfg0, auto0 = await app.state.config_repo.load(app.state.db_engine)
         platform_executor = OrderExecutor(
@@ -198,6 +199,39 @@ async def lifespan(app: FastAPI):
         app.state.trading.attach_platform_executor(platform_executor)
         if auto0:
             logger.warning("platform auto_trade=TRUE at boot — executor ARMED")
+
+        from app.mt5.auto_trader import McpAutoTrader
+        from app.mt5.mcp_source import McpTradingSource
+
+        def _market_state(plat: str) -> tuple[bool, str]:
+            """Broker-market-open check from the live feed's MT5 overlay
+            (weekend/holiday logic — gold closed Sat/Sun, BTC 24/7)."""
+            market = getattr(source, "market", None)
+            mcp = getattr(market, "mcp", None)
+            if mcp is None:
+                return True, "market state unknown (no MT5 overlay)"
+            try:
+                if mcp.fresh(plat):
+                    return True, "broker ticking"
+                return False, "weekend/holiday — no fresh broker ticks"
+            except Exception:  # noqa: BLE001 — never block trading on the check
+                return True, "market state unknown"
+
+        app.state.mt5_auto = McpAutoTrader(
+            source=McpTradingSource(),
+            cfg=cfg0,
+            repo=app.state.trades_repo,
+            hub=app.state.hub,
+            config_repo=app.state.config_repo,
+            db_engine=app.state.db_engine,
+            market_state=_market_state,
+        )
+        app.state.trading.attach_live_auto_trader(app.state.mt5_auto)
+        if await app.state.mt5_auto.restore():
+            logger.warning(
+                "LIVE MT5 AUTO-TRADE armed from persisted state — AI signals"
+                " will place REAL orders"
+            )
         restored = await app.state.trading.try_restore_planes()
         if restored:
             logger.info("restored %d user trading plane(s)", restored)

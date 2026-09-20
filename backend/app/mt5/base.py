@@ -57,6 +57,7 @@ class OrderResult:
     price: float | None = None
     retcode: int | None = None  # MT5 retcode (10009 = TRADE_RETCODE_DONE)
     comment: str = ""
+    volume: float | None = None  # filled volume (D-036 — terminal fills)
 
 
 @dataclass(frozen=True)
