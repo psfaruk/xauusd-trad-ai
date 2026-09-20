@@ -1,15 +1,21 @@
 import { useState } from "react";
+import MarketDataPanel from "./MarketDataPanel";
 import type { Signal, SignalStatus, StatsResponse } from "../types";
 
 /**
- * SignalPanel (SPEC §10 / Phase 3): active SignalCard with the decision
- * trace (✓/✗ per check), history with status chips, and a compact stats row.
+ * SignalPanel (SPEC §10 / Phase 3+4): tabs — Signals (active card + trace +
+ * history), Market Data (feed transparency + external references, user req #5)
+ * and Performance (PerfReport per SPEC §12 Phase 4).
  */
+
+export type SignalPanelTab = "signals" | "market" | "performance";
 
 interface SignalPanelProps {
   signals: Signal[];
   stats: StatsResponse | null;
-  onSelectSymbolless?: void;
+  token: string;
+  tab: SignalPanelTab;
+  onTabChange: (t: SignalPanelTab) => void;
 }
 
 const STATUS_STYLE: Record<SignalStatus, string> = {
@@ -149,64 +155,117 @@ function HistoryRow({ signal }: { signal: Signal }) {
   );
 }
 
-export default function SignalPanel({ signals, stats }: SignalPanelProps) {
+function PerformanceTab({ stats }: { stats: StatsResponse | null }) {
+  if (!stats || stats.closed_signals === 0) {
+    return (
+      <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 text-center text-xs text-zinc-500">
+        No closed signals yet — performance appears after the first wins/losses.
+      </div>
+    );
+  }
+  const rows: [string, string][] = [
+    ["Total signals", String(stats.total_signals)],
+    ["Closed", String(stats.closed_signals)],
+    ["Won / Lost / Expired", `${stats.won} / ${stats.lost} / ${stats.expired}`],
+    ["Win rate", stats.win_rate !== null ? `${(stats.win_rate * 100).toFixed(1)}%` : "—"],
+    ["Average R", stats.avg_r !== null ? stats.avg_r.toFixed(3) : "—"],
+    ["Expectancy (R)", stats.expectancy !== null ? stats.expectancy.toFixed(3) : "—"],
+    ["Profit factor", stats.profit_factor !== null ? stats.profit_factor.toFixed(2) : "—"],
+    ["Max drawdown (R)", stats.max_drawdown_r.toFixed(2)],
+    ["Total R", stats.total_r !== null ? `${stats.total_r > 0 ? "+" : ""}${stats.total_r.toFixed(2)}` : "—"],
+  ];
+  return (
+    <div className="space-y-3">
+      <div className="overflow-hidden rounded-xl border border-zinc-800">
+        <table className="w-full text-xs">
+          <tbody>
+            {rows.map(([k, v]) => (
+              <tr key={k} className="border-b border-zinc-800/70 last:border-0">
+                <td className="bg-zinc-950/60 px-3 py-2 text-zinc-500">{k}</td>
+                <td className="px-3 py-2 text-right font-mono font-semibold text-zinc-200">{v}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div>
+        <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-widest text-gold/70">by session</p>
+        <div className="space-y-1">
+          {Object.entries(stats.by_session).map(([name, s]) => (
+            <div key={name} className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-xs">
+              <span className="w-20 text-zinc-400">{name}</span>
+              <span className="text-zinc-500">{s.signals} sig</span>
+              <span className="ml-auto text-emerald-400">{s.won}W</span>
+              <span className="text-red-400">{s.lost}L</span>
+              <span className="text-zinc-500">{s.expired}E</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function SignalPanel({ signals, stats, token, tab, onTabChange }: SignalPanelProps) {
   const active = signals.find((s) => s.status === "active") ?? null;
   const history = signals.filter((s) => s.status !== "active");
 
+  const tabs: { id: SignalPanelTab; label: string }[] = [
+    { id: "signals", label: "signals" },
+    { id: "market", label: "market data" },
+    { id: "performance", label: "performance" },
+  ];
+
   return (
-    <div className="flex flex-col gap-3">
-      {active ? (
-        <SignalCard signal={active} />
-      ) : (
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 text-center">
-          <p className="text-sm font-medium text-zinc-300">No active signal</p>
-          <p className="mt-1 text-xs text-zinc-500">
-            engine evaluates every M15 close — 7-check SFP pipeline
-          </p>
-        </div>
-      )}
-
-      {stats && stats.closed_signals > 0 && (
-        <div className="grid grid-cols-4 gap-2 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3 text-center">
-          <div>
-            <p className="text-[10px] uppercase text-zinc-500">signals</p>
-            <p className="text-sm font-semibold text-zinc-200">{stats.total_signals}</p>
-          </div>
-          <div>
-            <p className="text-[10px] uppercase text-zinc-500">win rate</p>
-            <p className="text-sm font-semibold text-zinc-200">
-              {stats.win_rate !== null ? `${(stats.win_rate * 100).toFixed(0)}%` : "—"}
-            </p>
-          </div>
-          <div>
-            <p className="text-[10px] uppercase text-zinc-500">total R</p>
-            <p className={`text-sm font-semibold ${(stats.total_r ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"}`}>
-              {stats.total_r !== null ? `${stats.total_r > 0 ? "+" : ""}${stats.total_r.toFixed(1)}` : "—"}
-            </p>
-          </div>
-          <div>
-            <p className="text-[10px] uppercase text-zinc-500">PF</p>
-            <p className="text-sm font-semibold text-zinc-200">
-              {stats.profit_factor !== null ? stats.profit_factor.toFixed(2) : "—"}
-            </p>
-          </div>
-        </div>
-      )}
-
-      <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
-        <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-          history
-        </p>
-        {history.length === 0 ? (
-          <p className="px-1 py-2 text-xs text-zinc-600">no closed signals yet</p>
-        ) : (
-          <ul className="max-h-[420px] space-y-1.5 overflow-y-auto pr-1">
-            {history.map((s) => (
-              <HistoryRow key={s.id} signal={s} />
-            ))}
-          </ul>
-        )}
+    <div className="flex h-full flex-col gap-3">
+      <div className="flex rounded-lg border border-zinc-800 bg-zinc-900/60 p-0.5">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => onTabChange(t.id)}
+            className={`flex-1 rounded-md px-2 py-1.5 text-xs font-medium capitalize transition-colors ${
+              tab === t.id ? "bg-gold/15 text-gold" : "text-zinc-500 hover:text-zinc-300"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
       </div>
+
+      {tab === "signals" && (
+        <>
+          {active ? (
+            <SignalCard signal={active} />
+          ) : (
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 text-center">
+              <p className="text-sm font-medium text-zinc-300">No active signal</p>
+              <p className="mt-1 text-xs text-zinc-500">
+                engine evaluates every M15 close — 7-check SFP pipeline
+              </p>
+            </div>
+          )}
+
+          <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
+            <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
+              history
+            </p>
+            {history.length === 0 ? (
+              <p className="px-1 py-2 text-xs text-zinc-600">no closed signals yet</p>
+            ) : (
+              <ul className="max-h-[420px] space-y-1.5 overflow-y-auto pr-1">
+                {history.map((s) => (
+                  <HistoryRow key={s.id} signal={s} />
+                ))}
+              </ul>
+            )}
+          </div>
+        </>
+      )}
+
+      {tab === "market" && <MarketDataPanel token={token} />}
+
+      {tab === "performance" && <PerformanceTab stats={stats} />}
     </div>
   );
 }

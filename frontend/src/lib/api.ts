@@ -1,4 +1,8 @@
-import type { HealthInfo, MeInfo, CandlesResponse, Signal, Mt5Status, Position, StatsResponse, ConfigResponse, EngineConfig } from "../types";
+import type {
+  HealthInfo, MeInfo, CandlesResponse, Signal, Mt5Status, Position, StatsResponse,
+  ConfigResponse, EngineConfig, TradingStatus, TradingPosition, TradeRecord,
+  OrderResult, ExternalSnapshot, LogEntry,
+} from "../types";
 
 /**
  * REST helper. Empty base -> same-origin (dev proxy, D-005; Railway
@@ -115,4 +119,84 @@ export function postAutoTrade(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled, confirm }),
   }, token);
+}
+
+/* ------------------------------------------------------- trading plane */
+
+export function getTradingStatus(token: string): Promise<TradingStatus> {
+  return request<TradingStatus>("/api/trading/status", {}, token);
+}
+
+export function postTradingConnect(
+  token: string,
+  body: { server: string; login: string; password: string; mode: "demo" | "live" }
+): Promise<TradingStatus> {
+  return request<TradingStatus>("/api/trading/connect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, token);
+}
+
+export function postTradingDisconnect(token: string): Promise<{ connected: boolean }> {
+  return request<{ connected: boolean }>("/api/trading/disconnect", {
+    method: "POST",
+  }, token);
+}
+
+export function getTradingPositions(token: string): Promise<{ positions: TradingPosition[] }> {
+  return request<{ positions: TradingPosition[] }>("/api/trading/positions", {}, token);
+}
+
+export function postTradingOrder(
+  token: string,
+  body: { side: "BUY" | "SELL"; volume: number; sl?: number; tp?: number }
+): Promise<OrderResult> {
+  return request<OrderResult>("/api/trading/order", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, token);
+}
+
+export function postTradingClose(token: string, ticket: number): Promise<OrderResult> {
+  return request<OrderResult>(`/api/trading/positions/${ticket}/close`, {
+    method: "POST",
+  }, token);
+}
+
+export function getTradingTrades(token: string, limit = 100): Promise<{ trades: TradeRecord[] }> {
+  return request<{ trades: TradeRecord[] }>(`/api/trading/trades?limit=${limit}`, {}, token);
+}
+
+export function postTradingAutoTrade(
+  token: string,
+  enabled: boolean,
+  confirm?: string
+): Promise<{ auto_trade: boolean }> {
+  return request<{ auto_trade: boolean }>("/api/trading/auto-trade", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled, confirm }),
+  }, token);
+}
+
+/* ---------------------------------------------------- external + logs */
+
+export function getExternalSnapshot(token: string): Promise<ExternalSnapshot> {
+  return request<ExternalSnapshot>("/api/market/external", {}, token);
+}
+
+export function getLogs(
+  token: string,
+  limit = 200,
+  level?: string
+): Promise<{ count: number; logs: LogEntry[] }> {
+  const q = new URLSearchParams({ limit: String(limit) });
+  if (level) q.set("level", level);
+  return request<{ count: number; logs: LogEntry[] }>(`/api/logs?${q}`, {}, token);
+}
+
+export function logsExportUrl(): string {
+  return `${API_BASE}/api/logs/export.csv`;
 }

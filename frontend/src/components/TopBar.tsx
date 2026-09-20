@@ -1,23 +1,28 @@
 import { useEffect, useState } from "react";
 import { getHealth } from "../lib/api";
 import { useAuth } from "../lib/auth";
-import type { Mt5Status, Position } from "../types";
+import DotMenu, { type DotMenuActions } from "./DotMenu";
+import type { Mt5Status } from "../types";
 
 type BackendState = "checking" | "up" | "down";
 
 interface TopBarProps {
   mt5: Mt5Status | null;
   dataSource: "mock" | "mt5" | "";
-  onOpenConnect: () => void;
-  onOpenSettings: () => void;
+  tradingConnected: boolean;
+  menuActions: DotMenuActions;
+  isAdmin: boolean;
+  onOpenTrade: () => void;
 }
 
 /**
- * TopBar per SPEC §10: logo | symbol + MT5 status pill | health pill |
- * settings + connect buttons | user + sign-out. The dot-menu lands in Phase 4.
+ * TopBar per SPEC §10 + user req #3: logo | symbol + MT5 status pill |
+ * health pill | quick trade button | 3-dot menu with every grouped function.
  */
-export default function TopBar({ mt5, dataSource, onOpenConnect, onOpenSettings }: TopBarProps) {
-  const { session, signOut } = useAuth();
+export default function TopBar({
+  mt5, dataSource, tradingConnected, menuActions, isAdmin, onOpenTrade,
+}: TopBarProps) {
+  const { session } = useAuth();
   const email = session?.user?.email ?? null;
   const [backend, setBackend] = useState<BackendState>("checking");
   const [source, setSource] = useState<string>("");
@@ -39,6 +44,8 @@ export default function TopBar({ mt5, dataSource, onOpenConnect, onOpenSettings 
       window.clearInterval(timer);
     };
   }, []);
+
+  void email;
 
   const status = mt5?.status ?? "disconnected";
   const pill =
@@ -78,36 +85,17 @@ export default function TopBar({ mt5, dataSource, onOpenConnect, onOpenSettings 
       <div className="ml-auto flex items-center gap-2">
         <button
           type="button"
-          onClick={onOpenSettings}
-          className="rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 hover:border-zinc-500"
+          onClick={onOpenTrade}
+          className={`rounded-md border px-2.5 py-1 text-xs font-medium ${
+            tradingConnected
+              ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25"
+              : "border-gold/50 bg-gold/15 text-gold hover:bg-gold/25"
+          }`}
         >
-          ⚙ settings
+          {tradingConnected ? "my trades ●" : "start trading"}
         </button>
-        <button
-          type="button"
-          onClick={onOpenConnect}
-          className="rounded-md border border-gold/50 bg-gold/15 px-2.5 py-1 text-xs font-medium text-gold hover:bg-gold/25"
-        >
-          MT5 connect
-        </button>
-        <div className="hidden items-center gap-2 sm:flex">
-          <span className="text-xs text-zinc-400">{email}</span>
-          <button
-            type="button"
-            onClick={() => void signOut()}
-            className="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-400 hover:text-zinc-200"
-          >
-            sign out
-          </button>
-        </div>
+        <DotMenu actions={menuActions} isAdmin={isAdmin} />
       </div>
     </header>
   );
-}
-
-export interface AccountState {
-  balance: number | null;
-  equity: number | null;
-  currency: string;
-  positions: Position[] | { ticket: number; symbol: string; side: string; volume: number; profit: number }[];
 }

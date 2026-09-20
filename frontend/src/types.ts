@@ -153,6 +153,97 @@ export interface ConfigResponse {
   auto_trade: boolean;
 }
 
+/* --------------------------------------------------- trading plane (Phase 4) */
+
+export interface TradingStatus {
+  connected: boolean;
+  mode?: "demo" | "live" | null;
+  status?: string;
+  detail?: string;
+  server?: string | null;
+  login_masked?: string | null;
+  auto_trade?: boolean;
+  account?: {
+    balance: number;
+    equity: number;
+    currency: string;
+    login?: string;
+    server?: string;
+    leverage?: number;
+  } | null;
+  symbol?: string;
+  point_size?: number;
+  stored?: boolean;
+}
+
+export interface TradingPosition {
+  ticket: number;
+  symbol: string;
+  side: SignalDirection;
+  volume: number;
+  price_open: number;
+  sl: number | null;
+  tp: number | null;
+  profit: number;
+  time: string;
+}
+
+export interface TradeRecord {
+  signal_id: string | null;
+  owner: string | null;
+  ticket: number | null;
+  side: string;
+  volume: number;
+  price_open: number;
+  sl: number | null;
+  tp: number | null;
+  price_close: number | null;
+  opened_at: string | null;
+  closed_at: string | null;
+  signal_direction?: string | null;
+  signal_status?: string | null;
+}
+
+export interface OrderResult {
+  ok: boolean;
+  ticket: number | null;
+  price: number | null;
+  retcode: number | null;
+  comment: string;
+}
+
+export interface ExternalSnapshot {
+  ts: string;
+  gold_reference: {
+    ok: boolean;
+    provider: string;
+    symbol?: string;
+    price?: number;
+    change_24h_pct?: number;
+    high_24h?: number;
+    low_24h?: number;
+    error?: string;
+  };
+  eur_usd: { ok: boolean; provider: string; rate?: number; date?: string; error?: string };
+  usd_strength: {
+    ok: boolean;
+    provider: string;
+    name?: string;
+    value?: number;
+    legs?: Record<string, number>;
+    date?: string;
+    error?: string;
+  };
+}
+
+export interface LogEntry {
+  ts: string | null;
+  level: string;
+  source: string;
+  message: string;
+  meta: unknown;
+}
+
 /* ------------------------------------------------------------------ WS events */
 
 export interface WsTickMsg {
@@ -212,6 +303,22 @@ export interface WsEngineLogMsg {
   message: string;
 }
 
+export interface WsTradingAccountMsg {
+  type: "trading_account";
+  mode: string;
+  balance: number;
+  equity: number;
+  currency: string;
+  auto_trade: boolean;
+  positions: TradingPosition[];
+}
+
+export interface WsTradingLogMsg {
+  type: "trading_log";
+  level: string;
+  message: string;
+}
+
 export interface WsHeartbeatMsg {
   type: "heartbeat" | "subscribed" | "unsubscribed" | "error";
   ts?: number;
@@ -228,4 +335,6 @@ export type WsMessage =
   | WsAccountMsg
   | WsMt5StatusMsg
   | WsEngineLogMsg
+  | WsTradingAccountMsg
+  | WsTradingLogMsg
   | WsHeartbeatMsg;

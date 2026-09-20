@@ -3,21 +3,27 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import TopBar from "../components/TopBar";
 import Chart from "../components/Chart";
 import TimeframeSwitcher from "../components/TimeframeSwitcher";
-import SignalPanel from "../components/SignalPanel";
+import SignalPanel, { type SignalPanelTab } from "../components/SignalPanel";
 import Mt5ConnectDialog from "../components/Mt5ConnectDialog";
 import SettingsDialog from "../components/SettingsDialog";
+import TradingDialog from "../components/TradingDialog";
+import TradePanel from "../components/TradePanel";
+import LogViewer from "../components/LogViewer";
 import { useAuth } from "../lib/auth";
-import { getCandles, getMt5Status, getSignals, getStats, getHealth, getMe } from "../lib/api";
+import {
+  getCandles, getMt5Status, getSignals, getStats, getHealth, getMe,
+  getTradingStatus, getTradingPositions,
+} from "../lib/api";
 import { WSClient } from "../lib/ws";
 import type {
-  Candle, Mt5Status, Signal, StatsResponse, Timeframe, WsMessage,
+  Candle, Mt5Status, Signal, StatsResponse, Timeframe, TradingPosition,
+  TradingStatus, WsMessage,
 } from "../types";
 
 /**
- * Dashboard (SPEC §10): live chart + TF switcher + signal panel + account
- * strip. Data flow: REST backfill -> WS subscribe -> bar events stream into
- * the chart; on WS reconnect the candles query is invalidated to heal gaps
- * (Phase 2 AC).
+ * Dashboard (SPEC §10 + Phase 4): live chart + TF switcher + tabbed signal
+ * panel (signals / market data / performance) + account strip with the user's
+ * own trading plane. All dialogs open from the 3-dot menu (user req #3).
  */
 export default function Dashboard() {
   const { session } = useAuth();
@@ -35,12 +41,24 @@ export default function Dashboard() {
   } | null>(null);
   const [engineLogs, setEngineLogs] = useState<{ level: string; message: string }[]>([]);
   const [wsState, setWsState] = useState<"connecting" | "open" | "closed">("connecting");
+
+  /* Phase 4: own trading plane state */
+  const [trading, setTrading] = useState<TradingStatus | null>(null);
+  const [tradingPositions, setTradingPositions] = useState<TradingPosition[]>([]);
+
+  /* dialog + panel state */
   const [connectOpen, setConnectOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [tradingOpen, setTradingOpen] = useState(false);
+  const [tradePanelOpen, setTradePanelOpen] = useState(false);
+  const [tradePanelTab, setTradePanelTab] = useState<"trade" | "history">("trade");
+  const [logsOpen, setLogsOpen] = useState(false);
+  const [panelTab, setPanelTab] = useState<SignalPanelTab>("signals");
 
   const symbol = mt5?.symbol ?? null;
   const [roleState, setRoleState] = useState<string>("viewer");
   const isAdmin = useMemo(() => roleState === "admin", [roleState]);
+  const tradingConnected = trading?.connected === true;
 
   /* ---------------------------------------------------------------- queries */
 
@@ -67,6 +85,12 @@ export default function Dashboard() {
   });
 
   const wsRef = useRef<WSClient | null>(null);
+
+  const refreshTrading = useCallback(() => {
+    if (!token) return;
+    void getTradingStatus(token).then(setTrading).catch(() => undefined);
+    void getTradingPositions(token).then((r) => setTradingPositions(r.positions)).catch(() => undefined);
+  }, [token]);
 
   /* ------------------------------------------------------------ ws lifecycle */
 
@@ -107,6 +131,26 @@ export default function Dashboard() {
         case "engine_log":
           setEngineLogs((prev) => [...prev.slice(-7), { level: msg.level, message: msg.message }]);
           break;
+        case "trading_account":
+          setTrading((prev) => ({
+            ...prev,
+            connected: true,
+            mode: msg.mode === "live" ? "live" : "demo",
+            auto_trade: msg.auto_trade,
+            account: {
+              balance: msg.balance,
+              equity: msg.equity,
+              currency: msg.currency,
+            },
+          }));
+          setTradingPositions(msg.positions ?? []);
+          break;
+        case "trading_log":
+          setEngineLogs((prev) => [
+            ...prev.slice(-7),
+            { level: msg.level, message: `[my account] ${msg.message}` },
+          ]);
+          break;
         default:
           break;
       }
@@ -146,7 +190,7 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsState]);
 
-  // initial status + role + data source
+  // initial status + role + data source + trading plane
   useEffect(() => {
     if (!token) return;
     getMt5Status(token).then(setMt5).catch(() => undefined);
@@ -154,7 +198,8 @@ export default function Dashboard() {
       .then((h) => setDataSource(h.data_source))
       .catch(() => undefined);
     getMe(token).then((me) => setRoleState(me.role)).catch(() => undefined);
-  }, [token]);
+    refreshTrading();
+  }, [token, refreshTrading]);
 
   // poll status while WS is down (fallback path)
   useEffect(() => {
@@ -171,13 +216,32 @@ export default function Dashboard() {
   const stats: StatsResponse | null = statsQuery.data ?? null;
   const activeSignal = signals.find((s) => s.status === "active") ?? null;
 
+  const menuActions = {
+    onOpenTrading: () => setTradingOpen(true),
+    onOpenTradePanel: () => {
+      setTradePanelTab("trade");
+      setTradePanelOpen(true);
+    },
+    onOpenTradeHistory: () => {
+      setTradePanelTab("history");
+      setTradePanelOpen(true);
+    },
+    onOpenSignals: () => setPanelTab("signals"),
+    onOpenMarketData: () => setPanelTab("market"),
+    onOpenLogs: () => setLogsOpen(true),
+    onOpenSettings: () => setSettingsOpen(true),
+    onOpenPlatformMt5: () => setConnectOpen(true),
+  };
+
   return (
     <div className="flex min-h-screen flex-col bg-zinc-950">
       <TopBar
         mt5={mt5}
         dataSource={dataSource}
-        onOpenConnect={() => setConnectOpen(true)}
-        onOpenSettings={() => setSettingsOpen(true)}
+        tradingConnected={tradingConnected}
+        menuActions={menuActions}
+        isAdmin={isAdmin}
+        onOpenTrade={() => (tradingConnected ? setTradePanelOpen(true) : setTradingOpen(true))}
       />
 
       <main className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col gap-4 p-4 xl:flex-row">
@@ -222,7 +286,7 @@ export default function Dashboard() {
             <div className="max-h-24 overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-900/40 p-2.5">
               {engineLogs.slice(-4).map((log, i) => (
                 <p key={i} className="truncate font-mono text-[11px] text-zinc-500">
-                  <span className={log.level === "info" ? "text-gold/80" : "text-zinc-400"}>
+                  <span className={log.level === "info" ? "text-gold/80" : log.level === "critical" ? "text-red-400" : "text-zinc-400"}>
                     [{log.level}]
                   </span>{" "}
                   {log.message}
@@ -234,46 +298,95 @@ export default function Dashboard() {
 
         {/* SIGNAL PANEL */}
         <section className="w-full min-w-0 xl:w-96" aria-label="Signals">
-          <SignalPanel signals={signals} stats={stats} />
+          <SignalPanel
+            signals={signals}
+            stats={stats}
+            token={token ?? ""}
+            tab={panelTab}
+            onTabChange={setPanelTab}
+          />
         </section>
       </main>
 
-      {/* AccountStrip per SPEC §10 */}
+      {/* AccountStrip per SPEC §10 + Phase 4 own-plane linkage */}
       <footer className="border-t border-zinc-800 bg-zinc-900/60">
         <div className="mx-auto flex w-full max-w-[1600px] flex-wrap items-center gap-x-6 gap-y-1 px-4 py-2.5 text-xs text-zinc-400">
-          <span>
+          {/* platform feed account (admin plane) */}
+          <span className="flex items-center gap-1">
+            <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-500">platform</span>
             balance{" "}
             <span className="font-semibold text-zinc-200">
               {account ? `${account.balance.toFixed(2)} ${account.currency}` : "—"}
             </span>
-          </span>
-          <span>
+            <span className="mx-1 text-zinc-600">·</span>
             equity{" "}
             <span className="font-semibold text-zinc-200">
               {account ? account.equity.toFixed(2) : "—"}
             </span>
           </span>
-          <span>
-            open positions{" "}
-            <span className="font-semibold text-zinc-200">{account?.positions.length ?? 0}</span>
-            {account && account.positions.length > 0 && (
-              <span className="ml-1 text-zinc-500">
-                ({account.positions.map((p) => `${p.side} ${p.volume}`).join(", ")})
-              </span>
+
+          {/* own trading plane */}
+          <span className="flex items-center gap-1">
+            <span
+              className={`rounded px-1.5 py-0.5 text-[10px] ${
+                tradingConnected ? "bg-emerald-500/15 text-emerald-400" : "bg-zinc-800 text-zinc-500"
+              }`}
+            >
+              my account{trading?.mode ? ` · ${trading.mode}` : ""}
+            </span>
+            {tradingConnected && trading.account ? (
+              <>
+                <span className="font-semibold text-zinc-200">
+                  {trading.account.equity.toFixed(2)} {trading.account.currency}
+                </span>
+                <span className="text-zinc-600">·</span>
+                <span>
+                  {tradingPositions.length} open
+                  {tradingPositions.length > 0 && (
+                    <span className="ml-1 text-zinc-500">
+                      ({tradingPositions.map((p) => `${p.side} ${p.volume}`).join(", ")})
+                    </span>
+                  )}
+                </span>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setTradingOpen(true)}
+                className="underline decoration-dotted hover:text-gold"
+              >
+                connect your account
+              </button>
             )}
           </span>
-          <span className="ml-auto flex items-center gap-1.5">
-            <span
-              aria-hidden
-              className={`inline-block h-2 w-2 rounded-full ${
-                mt5?.engine_running ? "bg-emerald-500" : "bg-zinc-600"
-              }`}
-            />
-            engine <span className="font-semibold text-zinc-300">{mt5?.engine_running ? "ON" : "OFF"}</span>
-            <span className="text-zinc-600">· auto-trade OFF (default, Phase 4)</span>
+
+          <span className="ml-auto flex items-center gap-3">
+            <span className="flex items-center gap-1.5">
+              <span
+                aria-hidden
+                className={`inline-block h-2 w-2 rounded-full ${
+                  mt5?.engine_running ? "bg-emerald-500" : "bg-zinc-600"
+                }`}
+              />
+              engine <span className="font-semibold text-zinc-300">{mt5?.engine_running ? "ON" : "OFF"}</span>
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span
+                aria-hidden
+                className={`inline-block h-2 w-2 rounded-full ${
+                  trading?.auto_trade ? "bg-amber-400" : "bg-zinc-600"
+                }`}
+              />
+              my auto-trade{" "}
+              <span className={`font-semibold ${trading?.auto_trade ? "text-amber-400" : "text-zinc-500"}`}>
+                {trading?.auto_trade ? "ARMED" : "OFF"}
+              </span>
+            </span>
           </span>
         </div>
       </footer>
+
+      {/* ------------------------------------------------------------- dialogs */}
 
       <Mt5ConnectDialog
         open={connectOpen}
@@ -297,6 +410,34 @@ export default function Dashboard() {
         onClose={() => setSettingsOpen(false)}
         token={token ?? ""}
         isAdmin={isAdmin}
+      />
+
+      <TradingDialog
+        open={tradingOpen}
+        onClose={() => setTradingOpen(false)}
+        token={token ?? ""}
+        status={trading}
+        onStatusChange={(st) => {
+          setTrading(st);
+          refreshTrading();
+        }}
+      />
+
+      <TradePanel
+        open={tradePanelOpen}
+        onClose={() => setTradePanelOpen(false)}
+        token={token ?? ""}
+        connected={tradingConnected}
+        positions={tradingPositions}
+        lastPrice={lastPrice}
+        onPositionsChanged={refreshTrading}
+        initialTab={tradePanelTab}
+      />
+
+      <LogViewer
+        open={logsOpen}
+        onClose={() => setLogsOpen(false)}
+        token={token ?? ""}
       />
     </div>
   );
