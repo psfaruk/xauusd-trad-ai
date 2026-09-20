@@ -30,6 +30,7 @@ import pandas as pd
 
 from app.engine.config import EngineConfig
 from app.engine.engine import NewsState, closed_h1_asof, evaluate
+from app.engine.executor import size_lot
 from app.mt5.base import TIMEFRAME_MINUTES
 
 
@@ -288,6 +289,161 @@ def load_csv(path: str) -> pd.DataFrame:
     return df[RATES_COLUMNS]
 
 
+# ---------------------------------------------------------------------- risk
+
+
+@dataclass
+class RiskSimResult:
+    """Phase 4 §9 simulation: lot sizing + realized P/L + kill switches."""
+
+    start_equity: float
+    final_equity: float
+    net_pl: float
+    max_drawdown_usd: float
+    total_r: float
+    lots_min: float | None
+    lots_max: float | None
+    lots_avg: float | None
+    kill_switch_events: int
+    trades_taken: int
+    signals_skipped_after_kill: int
+    per_trade: list[dict] = field(default_factory=list)
+
+    def stats(self) -> dict:
+        return {
+            "start_equity": round(self.start_equity, 2),
+            "final_equity": round(self.final_equity, 2),
+            "net_pl": round(self.net_pl, 2),
+            "net_pl_pct": round(self.net_pl / self.start_equity * 100, 3)
+            if self.start_equity
+            else None,
+            "max_drawdown_usd": round(self.max_drawdown_usd, 2),
+            "total_r": round(self.total_r, 4),
+            "lots": {
+                "min": self.lots_min,
+                "max": self.lots_max,
+                "avg": round(self.lots_avg, 4) if self.lots_avg is not None else None,
+            },
+            "kill_switch_events": self.kill_switch_events,
+            "trades_taken": self.trades_taken,
+            "signals_skipped_after_kill": self.signals_skipped_after_kill,
+        }
+
+
+def simulate_risk(
+    res: BacktestResult,
+    start_equity: float = 10_000.0,
+    contract_size: float = 100.0,
+    volume_min: float = 0.01,
+    volume_max: float = 100.0,
+    volume_step: float = 0.01,
+) -> RiskSimResult:
+    """Replay closed signals through the SAME §9 sizing + kill-switch math.
+
+    Mirrors OrderExecutor semantics:
+    - lots per trade from `size_lot()` (risk_percent mode, compounding equity),
+    - P/L = result_r x sl_distance x contract x lots,
+    - daily loss >= daily_max_loss_pct -> auto_trade disarmed for the REST of
+      the run (kill switch), remaining signals counted as skipped.
+    """
+    from app.mt5.base import SymbolInfo
+
+    cfg = res.cfg
+    info = SymbolInfo(
+        name="XAUUSD", contract_size=contract_size,
+        volume_min=volume_min, volume_max=volume_max, volume_step=volume_step,
+    )
+    equity = start_equity
+    peak = start_equity
+    max_dd = 0.0
+    armed = True
+    kills = 0
+    skipped = 0
+    taken = 0
+    lots_seen: list[float] = []
+    total_r = 0.0
+    per_trade: list[dict] = []
+
+    for sig in res.signals:
+        if sig.status == "active" or sig.result_r is None:
+            continue  # never counted in a realized simulation
+        if not armed:
+            skipped += 1
+            continue
+        sl_distance = abs(sig.entry - sig.sl)
+        if sl_distance <= 0:
+            continue
+        # daily-loss check BEFORE every order (SPEC §9 order)
+        # (intraday drawdown vs the running peak is the conservative proxy
+        #  for the equity-based daily anchor in this replay)
+        if peak and (peak - equity) / peak * 100.0 >= cfg.daily_max_loss_pct:
+            armed = False
+            kills += 1
+            skipped += 1
+            per_trade.append(
+                {
+                    "ts": sig.ts.isoformat(),
+                    "event": "KILL_SWITCH",
+                    "equity": round(equity, 2),
+                    "loss_pct": round((peak - equity) / peak * 100.0, 3),
+                }
+            )
+            continue
+        lot = size_lot(cfg, equity, sl_distance, info)
+        pnl = sig.result_r * sl_distance * contract_size * lot.lots
+        equity += pnl
+        total_r += sig.result_r
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+        taken += 1
+        lots_seen.append(lot.lots)
+        per_trade.append(
+            {
+                "ts": sig.ts.isoformat(),
+                "direction": sig.direction,
+                "lots": lot.lots,
+                "result_r": sig.result_r,
+                "pnl_usd": round(pnl, 2),
+                "equity_after": round(equity, 2),
+            }
+        )
+
+    return RiskSimResult(
+        start_equity=start_equity,
+        final_equity=equity,
+        net_pl=equity - start_equity,
+        max_drawdown_usd=max_dd,
+        total_r=total_r,
+        lots_min=min(lots_seen) if lots_seen else None,
+        lots_max=max(lots_seen) if lots_seen else None,
+        lots_avg=sum(lots_seen) / len(lots_seen) if lots_seen else None,
+        kill_switch_events=kills,
+        trades_taken=taken,
+        signals_skipped_after_kill=skipped,
+        per_trade=per_trade,
+    )
+
+
+def format_risk_report(risk: RiskSimResult) -> str:
+    s = risk.stats()
+    lines = [
+        "-" * 64,
+        " RISK / EXECUTOR SIMULATION (SPEC §9)",
+        "-" * 64,
+        f" start equity : {s['start_equity']:.2f} USD",
+        f" final equity : {s['final_equity']:.2f} USD",
+        f" net P/L      : {s['net_pl']:+.2f} USD ({s['net_pl_pct']:+.3f}%)",
+        f" max DD (USD) : {s['max_drawdown_usd']:.2f}",
+        f" total R      : {s['total_r']}",
+        f" lots min/avg/max : {s['lots']['min']} / {s['lots']['avg']} / {s['lots']['max']}",
+        f" trades taken : {s['trades_taken']}",
+        f" kill switches : {s['kill_switch_events']}"
+        f" (skipped {s['signals_skipped_after_kill']} later signals)",
+        "-" * 64,
+    ]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------- report
 
 
@@ -319,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--inject-every", type=int, default=0,
                    help="overlay a crafted SFP sweep every N bars (engine sanity mode)")
+    p.add_argument("--start-equity", type=float, default=10_000.0,
+                   help="risk simulation starting equity (USD)")
     p.add_argument("--json", type=str, default=None, help="write stats+signals JSON here")
     p.add_argument("--csv-out", type=str, default=None, help="write signals CSV here")
     args = p.parse_args(argv)
@@ -335,12 +493,16 @@ def main(argv: list[str] | None = None) -> int:
 
     res = run_backtest(m15)
     print(format_report(res, label))
+    risk = simulate_risk(res, start_equity=args.start_equity)
+    print(format_risk_report(risk))
 
     if args.json:
         payload = {
             "label": label,
             "config": res.cfg.model_dump(),
             "stats": res.stats(),
+            "risk_sim": risk.stats(),
+            "risk_sim_per_trade": risk.per_trade,
             "signals": [
                 {
                     "ts": s.ts.isoformat(),

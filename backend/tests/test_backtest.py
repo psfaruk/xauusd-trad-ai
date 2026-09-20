@@ -15,6 +15,7 @@ from app.engine.backtest import (
     load_mock_history,
     resample_ohlc,
     run_backtest,
+    simulate_risk,
 )
 from app.engine.config import EngineConfig
 
@@ -183,3 +184,79 @@ class TestStats:
         s = self._result([])
         assert s["total_signals"] == 0
         assert s["win_rate"] is None and s["profit_factor"] is None
+
+
+# ------------------------------------------------------- Phase 4 risk sim
+
+
+class TestRiskSimulation:
+    """§9 executor simulation — the sizing/kill math verified end-to-end."""
+
+    @staticmethod
+    def _result(statuses_rs, risk_percent=0.5):
+        sigs = [
+            BacktestSignal(
+                ts=datetime(2025, 1, 6, 10 + i, tzinfo=UTC), direction="BUY",
+                entry=100.0, sl=98.0, tp=104.0, confidence=0.5, session="london",
+                status=s, result_r=r,
+            )
+            for i, (s, r) in enumerate(statuses_rs)
+        ]
+        return BacktestResult(
+            cfg=EngineConfig().model_copy(update={"risk_percent": risk_percent}),
+            bars_tested=100,
+            date_from=datetime(2025, 1, 6, tzinfo=UTC),
+            date_to=datetime(2025, 1, 10, tzinfo=UTC),
+            signals=sigs,
+        )
+
+    def test_risk_sim_pnl_matches_manual_calculation(self):
+        """SPEC §12 Phase 4 AC: stats numbers match manual calculation."""
+        res = self._result([("won", 2.0), ("lost", -1.0)])
+        risk = simulate_risk(res, start_equity=10_000.0)
+        # manual: equity 10_000, risk 0.5% -> $50; sl_dist 2 -> lots 0.25
+        # win: +2R -> +2*2*100*0.25 = +100  -> equity 10_100
+        # loss: -1R -> lots 10_100*0.005/(2*100)=0.2525 -> floor 0.25
+        #      -1*2*100*0.25 = -50 -> equity 10_050
+        assert risk.trades_taken == 2
+        first = risk.per_trade[0]
+        assert first["lots"] == pytest.approx(0.25)
+        assert first["pnl_usd"] == pytest.approx(100.0)
+        assert first["equity_after"] == pytest.approx(10_100.0)
+        assert risk.final_equity == pytest.approx(10_050.0)
+        assert risk.net_pl == pytest.approx(50.0)
+
+    def test_risk_sim_kill_switch_fires_and_skips_rest(self):
+        """Daily-loss kill switch verified in simulation (SPEC §12 Phase 4 AC)."""
+        # 3 losses of -1R each with wide SL distance so losses compound
+        sigs = [
+            BacktestSignal(
+                ts=datetime(2025, 1, 6, 10 + i, tzinfo=UTC), direction="BUY",
+                entry=100.0, sl=90.0, tp=120.0, confidence=0.5, session="london",
+                status="lost", result_r=-1.0,
+            )
+            for i in range(4)
+        ]
+        cfg = EngineConfig().model_copy(update={"risk_percent": 5.0, "daily_max_loss_pct": 3.0})
+        res = BacktestResult(
+            cfg=cfg, bars_tested=100,
+            date_from=datetime(2025, 1, 6, tzinfo=UTC),
+            date_to=datetime(2025, 1, 10, tzinfo=UTC),
+            signals=sigs,
+        )
+        risk = simulate_risk(res, start_equity=10_000.0)
+        # each loss: 5% of equity -> -5% -> after loss 1 the drawdown from the
+        # peak is already 5% >= 3% -> kill switch on the next signal
+        assert risk.kill_switch_events == 1
+        assert risk.trades_taken == 1
+        assert risk.signals_skipped_after_kill == 3
+        assert risk.final_equity == pytest.approx(9_500.0)  # only one -5% trade
+        kill = next(t for t in risk.per_trade if t.get("event") == "KILL_SWITCH")
+        assert kill["loss_pct"] >= 3.0
+
+    def test_risk_sim_no_trades_when_all_active(self):
+        res = self._result([("active", None)])
+        risk = simulate_risk(res)
+        assert risk.trades_taken == 0
+        assert risk.lots_min is None
+        assert risk.final_equity == 10_000.0
