@@ -63,6 +63,34 @@ recorded in [DECISIONS.md](./DECISIONS.md).
 | SettingsDialog edits engine_config (validated) | ✅ admin PUT `/api/config` (pydantic-validated, live engine reload) + auto-trade toggle with typed `ENABLE` confirmation |
 | Backtest verification | ✅ `python -m app.engine.backtest` — mock seed 42, 2825 M15 bars: pure random-walk 22 sigs (WR 31.8%, PF 0.93 — noise, as expected); injected-SFP 26 sigs (**WR 46.2%, PF 1.71, +10.0R**) — the engine finds real sweeps and the RR-2 math holds |
 
+### Phase 4 — Acceptance Criteria verification
+
+| AC (SPEC §12 Phase 4) | Result |
+|---|---|
+| Correct lot per formula (unit-test the math) | ✅ `test_lot_sizing_*` — `lots = risk/(sl_dist × 100)`, floor to volume_step, clamp to broker limits, fixed-lot mode, degenerate-SL guard; risk-sim test reproduces a hand-computed 0.25-lot / +$100 / −$50 sequence exactly |
+| SL/TP attached, magic set, zero duplicates per signal | ✅ executor attaches signal SL/TP + `magic=cfg.magic` + `comment=xauai-{signal_id}`; `test_executor_idempotent_per_signal` proves the second relay is skipped (trades-table pre-check) |
+| Daily-loss kill switch verified in simulation | ✅ `test_executor_daily_loss_emergency_stop` (close-all + disarm + CRITICAL log — incl. the fix that the emergency fires even when max_positions would skip) and `test_risk_sim_kill_switch_fires_and_skips_rest` (backtest replay: 5% loss ≥ 3% limit → 1 trade taken, 3 skipped) |
+| Kill switch disables auto-trade | ✅ per-user arm and the platform arm both flip to false; AccountStrip shows the live arm state |
+| Stats numbers match manual calculation | ✅ risk-sim P/L = result_r × sl_distance × contract × lots — unit-tested to the cent |
+| PerfReport UI | ✅ SignalPanel → performance tab (WR/expectancy/PF/maxDD-R/total-R/by-session from `/api/stats`) |
+| LogViewer + CSV export | ✅ `/api/logs` + `export.csv` (authorized blob download); level filter + 10s live tail |
+| Auto-trade toggle with typed confirmation | ✅ platform (admin, `/api/config/auto-trade`) AND per-user (`/api/trading/auto-trade`) — both require `confirm:"ENABLE"`; browser-verified ARM/disarm |
+| Multi-user trading planes (user req #1/#5 agent flow) | ✅ `UserTradingManager` — per-owner isolated planes, Fernet-encrypted per-owner credentials, masked logins (`10••••34`), WS events user-targeted (`test_user_plane_connect_and_isolation`, browser WS isolation e2e: owner receives `trading_account`, other user receives NOTHING) |
+| Trades table linkage | ✅ `trades.signal_id` ↔ signals; history shows AI-signal vs manual source chips |
+| Free external data APIs (user req #6) | ✅ `/api/market/external` — Binance PAXG (live-verified $4,361) + Frankfurter/ECB FX, all fail-soft (C6); Market Data tab renders references live |
+| 3-dot menu grouped functions (user req #3) | ✅ Trading / Analysis / Settings / Account groups, outside-click + Esc; browser-verified |
+
+### Phase 5 — Hardening (security checklist §13)
+
+| Item | Result |
+|---|---|
+| MT5 passwords Fernet-encrypted, never logged, masked on return | ✅ per-owner encryption; only `login_masked` ever leaves the backend (SPEC §13); tests assert the raw login never appears in responses |
+| All routes JWT-guarded except `/api/health`; admin-only routes enforced | ✅ mt5 connect/disconnect, PUT /config, platform auto-trade → admin; trading routes owner-scoped |
+| slowapi rate limits | ✅ 240/min global per client IP (X-Forwarded-For aware) + 30/min order/close + 10/min arm budgets; real-app 429 test |
+| Input validation on write endpoints | ✅ pydantic bodies everywhere (trading connect/order/auto-trade, config PUT rejects unknown keys + sane ranges) |
+| No secrets in git | ✅ `.env` gitignored; only `.env.example` committed |
+| 48h unattended run | ⚠️ needs a deployed environment (Railway/Windows VPS) — watchdogs, heartbeats, reconnect loops and degraded-mode fallbacks are in place and tested; the long-run soak is the only remaining operational check |
+
 ## How the frontend connects to MetaTrader 5 (architecture)
 
 The frontend **never talks to MT5 directly** — MT5 is a Windows terminal behind
@@ -77,8 +105,8 @@ React SPA ── REST /api/candles · /api/mt5/* ──► FastAPI backend
                                 DATA_SOURCE=mt5  │ MT5DataSource  → MetaTrader5 pkg → Exness terminal (Windows only, C1)
 ```
 
-1. Admin opens **MT5 connect** in the TopBar → `POST /api/mt5/connect`
-   `{server, login, password, terminal_path?}`.
+1. Admin opens **MT5 connect** in the 3-dot menu (Settings → Platform MT5) →
+   `POST /api/mt5/connect` `{server, login, password, terminal_path?}`.
 2. Backend `ConnectionManager.connect()` initializes the terminal, discovers the
    symbol (`*XAUUSD*` → e.g. `XAUUSDm`), stores the password Fernet-encrypted,
    and starts the **EngineRuntime**: tick loop → bar builder → engine + tracker.
@@ -88,6 +116,43 @@ React SPA ── REST /api/candles · /api/mt5/* ──► FastAPI backend
 4. On Railway (Linux) the app runs `DATA_SOURCE=mock` (C1: MetaTrader5 is
    Windows-only) — real MT5 streaming requires the backend on a Windows VPS
    with the Exness terminal installed (README → Deploy).
+
+## Multi-user trading: the agent architecture (Phase 4)
+
+Everyone watches the SAME public market feed (candles/ticks/signals). A user
+who wants to trade connects their OWN MT5/Exness account and gets an isolated
+**trading plane**:
+
+```
+                        ┌── EngineRuntime ── SFP signal ──┐
+public feed (admin MT5)─┤                                  ▼ relay
+                        └── WS broadcast (everyone)   UserTradingManager
+                                                          │
+                             ┌────────────────────────────┼────────────────────┐
+                             ▼                            ▼                    ▼
+                     user A's plane               user B's plane        admin platform plane
+                     (demo sibling mock)          (demo sibling mock)   (the admin's own account)
+                     OrderExecutor §9             OrderExecutor §9      OrderExecutor §9
+                     kill switches + lots         …                     auto_trade flag
+                     trades(owner=A)              trades(owner=B)       trades(owner=admin)
+                             │                            │
+                             └── WS trading_account / trading_log → ONLY that user
+```
+
+- **Demo mode (works everywhere incl. Railway):** the plane is a paper account
+  ($10,000) priced off the SAME deterministic market as the public chart
+  (`MockDataSource.sibling` — identical seed/origin/clock, so positions mark
+  against exactly the candles everyone sees).
+- **Live mode:** credentials are stored encrypted with status
+  `bridge_required` on Linux — per-user LIVE execution needs the Windows MT5
+  bridge (one worker process per user, v2 scope — DECISIONS D-024). The
+  platform NEVER silently simulates live trading.
+- **Copy-trading agent:** when a user arms auto-trade (typed `ENABLE`), every
+  engine signal is executed on their plane with THEIR equity via the same
+  §9 sizing + kill switches — idempotent per signal_id.
+- **Isolation:** credentials, positions, trades and WS events are strictly
+  owner-scoped; logins are masked (`10••••34`) and passwords are never
+  returned, logged, or shared between planes.
 
 ## Repository layout
 
