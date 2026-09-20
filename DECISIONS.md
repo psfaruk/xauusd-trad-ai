@@ -35,3 +35,29 @@ here, newest at the bottom. Phase numbering follows SPEC §12.
 | D-028 | 4 | `mt5_connections` rows are now one-per-owner (upsert scoped by `owner`); the admin/platform plane persists only when an admin user initiated the connect (owner = their profile id); the D-018 mock auto-connect stays in memory. Schema gains `mode` + per-user `auto_trade` columns via idempotent `ALTER ... ADD COLUMN IF NOT EXISTS`. | The previous `DELETE FROM mt5_connections` (single-connection assumption) would have wiped every other user's stored credentials on each connect. |
 | D-029 | 4 | `scripts/mock_supabase.py` upgraded: each email maps to a deterministic DISTINCT user (uuid5) + distinct token, enabling true multi-user isolation e2e in the dev stack. | The original mock returned the same user for every login, making per-user isolation impossible to verify (and hiding the D-028 bug class). |
 | D-030 | 4 | **`DATA_SOURCE=live` is the new default**: real-time gold market data from free key-less public APIs (Binance PAXG/USDT quotes + klines primary; gold-api.com XAU quote fallback; Yahoo GC=F history fallback; tick-built candles last resort). Boot probes the chain once and honestly degrades to mock only when every provider is unreachable (reported via `/api/health`). Paper/demo planes price off the SAME live feed. TopBar shows a LIVE badge (provider + tick age), status/WS `mt5_status` carries a `feed` block, and the heartbeat rebroadcasts status every ~15s so badges stay fresh. Frankfurter ECB endpoint updated to `api.frankfurter.dev/v1` (old `.app` host now 301s). | User report "live real data is not updating": on Linux/Railway the MetaTrader5 package cannot run (C1), so the previous default showed synthetic mock prices. PAXG is a regulated physical-gold-backed token (1 PAXG = 1 fine troy oz) that tracks spot XAUUSD within a fraction of a percent and trades 24/7 — free, no API key. The basis vs broker XAUUSD is disclosed everywhere (feed detail, Market Data tab). |
+
+## D-031 — Sandbox preview always-on stack (orphan watchdog + same-origin auth)
+
+**Context:** The sandbox reaper kills every descendant of a tool-command when it
+ends; only boot-chain (`.zscripts/dev.sh`) processes survive. The dev stack
+(:8090 auth mock, :8000 API, :3000 vite) therefore died between sessions and the
+preview showed no data; additionally the boot vite had no Supabase env, so login
+through the preview origin was impossible.
+
+**Decision:**
+1. `scripts/watchdog.sh` — keep-alive loop restarting any dead component
+   (mock-supabase :8090, API :8000 `DATA_SOURCE=live`, vite :3000). Every spawn
+   is wrapped `( setsid nohup … & )` so it is orphan-reparented to PID 1
+   immediately and escapes the reaper's descendant-tree walk (a direct
+   `setsid nohup … &` is killed; verified empirically). Started from
+   `.zscripts/dev.sh` (container boot) via a guarded hook.
+2. `vite.config.ts` proxies `/auth/v1` → :8090; `supabase.ts` in DEV falls back
+   to `window.location.origin` + placeholder key when `VITE_*` env is absent —
+   the preview logs in through its own origin with zero baked credentials.
+   Production builds are unaffected (fallback is `import.meta.env.DEV`-gated).
+
+**Verification:** watchdog survived call boundaries (PPID=1); same-origin login →
+/api/me (admin) → live Binance PAXG feed (tick age <2s) → real M1 candles at the
+current minute; browser e2e: dashboard ticker === backend price, "LIVE · Binance
+PAXG +0s" badge, ws open, zero console errors. Flat price over 40s was the quiet
+Saturday market, not staleness (backend showed the same price).
