@@ -20,8 +20,9 @@ class Settings(BaseSettings):
     fernet_key: str | None = None
     admin_emails: str = ""
 
-    # Engine / data
-    data_source: Literal["mock", "mt5"] = "mock"  # SPEC C7
+    # Engine / data (SPEC C7; live = free real-time APIs, DECISIONS.md D-030)
+    data_source: Literal["mock", "mt5", "live"] = "live"
+    live_poll_seconds: float = 2.0
     fmp_api_key: str | None = None
     mt5_terminal_path: str | None = None
 

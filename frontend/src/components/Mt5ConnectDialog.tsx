@@ -5,7 +5,8 @@ import type { Mt5Status } from "../types";
 /**
  * MT5 connection dialog (SPEC §10): server / login / password (+ optional
  * terminal path for a custom MT5 install). Admin-only action; with
- * DATA_SOURCE=mock any credentials work and the demo market connects.
+ * DATA_SOURCE=mock/live any values connect — the public market (synthetic
+ * demo or free real-time APIs, D-030) keeps streaming.
  */
 
 interface Mt5ConnectDialogProps {
@@ -14,7 +15,7 @@ interface Mt5ConnectDialogProps {
   token: string;
   isAdmin: boolean;
   status: Mt5Status | null;
-  dataSource: "mock" | "mt5" | "";
+  dataSource: "mock" | "mt5" | "live" | "";
   onConnected: (status: Mt5Status) => void;
   onDisconnected: (status: Mt5Status) => void;
 }
@@ -108,6 +109,13 @@ export default function Mt5ConnectDialog({
           </button>
         </div>
 
+        {dataSource === "live" && (
+          <p className="mb-3 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300/90">
+            Live mode (DATA_SOURCE=live, D-030): real-time gold prices stream
+            from free public APIs (Binance PAXG → gold-api fallback) — connection
+            credentials are not required for market data.
+          </p>
+        )}
         {dataSource === "mock" && (
           <p className="mb-3 rounded-md border border-gold/30 bg-gold/10 px-3 py-2 text-xs text-gold/90">
             Demo mode (DATA_SOURCE=mock): any values connect — the chart streams

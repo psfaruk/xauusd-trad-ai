@@ -9,8 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from app.mt5.base import TIMEFRAME_MINUTES
-from app.mt5.mock_source import MockDataSource
+# Hermetic tests (D-030): DATA_SOURCE defaults to "live" (free real-time
+# APIs) since the real-data switch — force mock for the whole suite so unit
+# tests NEVER touch the network. Must run before any app import that loads
+# Settings (test modules import app.main at collection time).
+os.environ.setdefault("DATA_SOURCE", "mock")
+
+from app.mt5.base import TIMEFRAME_MINUTES  # noqa: E402
+from app.mt5.mock_source import MockDataSource  # noqa: E402
 
 # Fixed anchor so every test is fully deterministic (Monday 2025-01-06 00:00 UTC).
 START = datetime(2025, 1, 6, tzinfo=UTC)

@@ -333,8 +333,13 @@ class ConnectionManager:
             self._heartbeat_task = None
 
     async def _heartbeat_loop(self) -> None:
-        """Monitor + auto-reconnect (SPEC Phase 2: reconnect within 10s)."""
+        """Monitor + auto-reconnect (SPEC Phase 2: reconnect within 10s).
+
+        While connected it also rebroadcasts the status every ~15s so every
+        client's live-feed badge (provider, price age) stays fresh (D-030).
+        """
         offset_checked = time_mod.monotonic()
+        status_broadcast = 0.0
         try:
             while not self._stop.is_set():
                 await asyncio.sleep(HEARTBEAT_S)
@@ -343,6 +348,10 @@ class ConnectionManager:
                 ok = await self._source.is_connected()
                 if ok:
                     self.state.status = "connected"
+                    now = time_mod.monotonic()
+                    if now - status_broadcast >= 15.0:
+                        status_broadcast = now
+                        await self._broadcast_status()
                     await self._update_stored_status("connected")
                     # C4 — refresh broker offset twice a day
                     if (
@@ -388,7 +397,7 @@ class ConnectionManager:
                 account = info
                 self.state.account = info
         offset = getattr(self._source, "broker_utc_offset_minutes", 0)
-        return {
+        st = {
             "status": self.state.status,
             "symbol": self.state.symbol,
             "account": {
@@ -402,14 +411,23 @@ class ConnectionManager:
             "broker_time_utc_offset": offset,
             "engine_running": self.runtime is not None and self.runtime.running,
         }
+        # Live-feed transparency (D-030): provider + price + data age
+        feed_status = getattr(self._source, "feed_status", None)
+        if callable(feed_status):
+            try:
+                st["feed"] = feed_status()
+            except Exception:  # noqa: BLE001
+                pass
+        return st
 
     async def _broadcast_status(self) -> None:
         if self._hub is None:
             return
         st = await self.status()
-        await self._hub.broadcast_all(
-            "mt5_status", {"status": st["status"], "symbol": st["symbol"]}
-        )
+        payload = {"status": st["status"], "symbol": st["symbol"]}
+        if "feed" in st:
+            payload["feed"] = st["feed"]
+        await self._hub.broadcast_all("mt5_status", payload)
 
     # ------------------------------------------------------------- delegation
 
@@ -442,6 +460,38 @@ def create_data_source(settings: Settings) -> DataSource:
         from app.mt5.mt5_source import MT5DataSource  # lazy (C7)
 
         return MT5DataSource(terminal_path=settings.mt5_terminal_path)
+    if settings.data_source == "live":
+        from app.mt5.live_source import LiveDataSource  # free real-time APIs
+
+        return LiveDataSource(poll_seconds=settings.live_poll_seconds)
     from app.mt5.mock_source import MockDataSource
 
     return MockDataSource()
+
+
+async def resolve_data_source(
+    settings: Settings, http_factory: Any
+) -> tuple[DataSource, str]:
+    """Boot-time source resolution (D-030).
+
+    DATA_SOURCE=live probes the free provider chain ONCE (Binance PAXG ->
+    gold-api, ~4s timeouts). When every provider is unreachable the platform
+    degrades to the mock source so the dashboard still streams — the effective
+    source name is returned and reported via /api/health.
+    """
+    if settings.data_source != "live":
+        return create_data_source(settings), settings.data_source
+    from app.mt5.live_source import LiveDataSource
+
+    candidate = LiveDataSource(
+        http_factory=http_factory, poll_seconds=settings.live_poll_seconds
+    )
+    if await candidate.quick_check():
+        logger.info("live providers reachable — real-time market data ON")
+        return candidate, "live"
+    logger.warning(
+        "live providers unreachable — degrading DATA_SOURCE to mock (D-030)"
+    )
+    from app.mt5.mock_source import MockDataSource
+
+    return MockDataSource(), "mock"

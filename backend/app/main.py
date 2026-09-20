@@ -45,7 +45,7 @@ from app.config import Settings, get_settings
 from app.db import apply_schema, is_postgres_url, make_engine, promote_admins
 from app.engine.config import ConfigRepo
 from app.engine.repo import SignalRepo
-from app.mt5.connection import ConnectionManager, create_data_source
+from app.mt5.connection import ConnectionManager, resolve_data_source
 from app.services.external import ExternalMarketService
 from app.services.news import NewsService, NullNewsService
 from app.services.ws_hub import WSHub
@@ -96,7 +96,9 @@ async def lifespan(app: FastAPI):
         http_factory=lambda: _get_http(app)
     )
 
-    # --- Services: WS hub, news, repos, connection manager + engine runtime
+    # --- Services: WS hub, news, repos, connection manager + engine runtime.
+    # D-030: DATA_SOURCE=live probes the free real-time provider chain once;
+    # on total failure it degrades to mock so the dashboard always streams.
     app.state.hub = WSHub()
     if settings.fmp_api_key:
         app.state.news = NewsService(
@@ -107,8 +109,12 @@ async def lifespan(app: FastAPI):
         app.state.news = NullNewsService()
     app.state.config_repo = ConfigRepo()
     app.state.signals = SignalRepo(app.state.db_engine)
+    source, effective_data_source = await resolve_data_source(
+        settings, http_factory=lambda: _get_http(app)
+    )
+    app.state.data_source = effective_data_source
     app.state.mt5 = ConnectionManager(
-        source=create_data_source(settings),
+        source=source,
         settings=settings,
         hub=app.state.hub,
         db_engine=app.state.db_engine,
@@ -140,15 +146,25 @@ async def lifespan(app: FastAPI):
     if not any(isinstance(h, DBLogHandler) for h in root.handlers):
         root.addHandler(DBLogHandler(lambda: app.state.db_engine))
 
-    # --- D-018: mock auto-connect / mt5 stored-credential restore
-    if settings.data_source == "mock":
+    # --- D-018/D-030: mock + live auto-connect / mt5 stored-credential restore
+    if effective_data_source in ("mock", "live"):
         try:
-            await app.state.mt5.connect(
-                {"server": "MockServer", "login": "10000000", "password": "mock"}
-            )
-            logger.info("mock source auto-connected (D-018) — dashboard streams now")
+            if effective_data_source == "live":
+                st = await app.state.mt5.connect(
+                    {"server": "LiveMarket", "login": "REALTIME", "password": "none"}
+                )
+                feed = st.get("feed") or {}
+                logger.info(
+                    "live source auto-connected (D-030) — provider=%s price=%s",
+                    feed.get("provider", "?"), feed.get("last_price", "?"),
+                )
+            else:
+                await app.state.mt5.connect(
+                    {"server": "MockServer", "login": "10000000", "password": "mock"}
+                )
+                logger.info("mock source auto-connected (D-018) — dashboard streams now")
         except Exception:  # noqa: BLE001 — never block boot
-            logger.exception("mock auto-connect failed")
+            logger.exception("%s auto-connect failed", effective_data_source)
     else:
         asyncio.create_task(app.state.mt5.try_restore())
 
@@ -175,7 +191,7 @@ async def lifespan(app: FastAPI):
         logger.exception("trading plane init failed")
 
     logger.info(
-        "startup complete: data_source=%s db=%s", settings.data_source, app.state.db_ok
+        "startup complete: data_source=%s db=%s", effective_data_source, app.state.db_ok
     )
     yield
     await app.state.http.aclose()
@@ -217,7 +233,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "version": app.version,
-        "data_source": settings.data_source,
+        "data_source": getattr(app.state, "data_source", None) or settings.data_source,
         "db": app.state.db_ok,
     }
 

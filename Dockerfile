@@ -5,8 +5,10 @@
 # and the built SPA (STATIC_DIR) — same-origin, no CORS needed.
 #
 # SPEC C1/C7: the MetaTrader5 package is Windows-only; this Linux image runs
-# DATA_SOURCE=mock. Real MT5 trading targets the Windows VPS deployment
-# (SPEC §14) — this image is the demo/preview environment.
+# DATA_SOURCE=live (D-030): REAL-TIME gold prices from free key-less public
+# APIs (Binance PAXG -> gold-api -> Yahoo fallbacks), auto-degrading to mock
+# when no provider is reachable. Real MT5 *execution* targets the Windows VPS
+# deployment (SPEC §14).
 
 # ---------- Stage 1: build the Vite SPA ----------
 FROM node:20-alpine AS frontend
@@ -36,8 +38,9 @@ COPY backend/app ./app
 COPY --from=frontend /build/dist ./static
 
 # FastAPI serves the SPA from STATIC_DIR (app/main.py, D-016).
+# DATA_SOURCE=live (D-030): free real-time gold APIs, auto-degrade to mock.
 ENV STATIC_DIR=/app/static \
-    DATA_SOURCE=mock
+    DATA_SOURCE=live
 
 # Railway injects PORT; 8000 fallback for local docker runs.
 EXPOSE 8000

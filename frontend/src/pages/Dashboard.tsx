@@ -17,7 +17,7 @@ import {
 import { WSClient } from "../lib/ws";
 import type {
   Candle, Mt5Status, Signal, StatsResponse, Timeframe, TradingPosition,
-  TradingStatus, WsMessage,
+  TradingStatus, WsMessage, WsMt5StatusMsg,
 } from "../types";
 
 /**
@@ -32,9 +32,10 @@ export default function Dashboard() {
 
   const [tf, setTf] = useState<Timeframe>("M15");
   const [mt5, setMt5] = useState<Mt5Status | null>(null);
-  const [dataSource, setDataSource] = useState<"mock" | "mt5" | "">("");
+  const [dataSource, setDataSource] = useState<"mock" | "mt5" | "live" | "">("");
   const [liveBar, setLiveBar] = useState<Candle | null>(null);
   const [lastPrice, setLastPrice] = useState<{ bid: number; ask: number } | null>(null);
+  const [lastTickAt, setLastTickAt] = useState<number | null>(null);
   const [account, setAccount] = useState<{
     balance: number; equity: number; currency: string;
     positions: { ticket: number; symbol: string; side: string; volume: number; profit: number }[];
@@ -99,6 +100,7 @@ export default function Dashboard() {
       switch (msg.type) {
         case "tick":
           setLastPrice({ bid: msg.bid, ask: msg.ask });
+          setLastTickAt(Date.now());
           break;
         case "bar_open":
         case "bar_update":
@@ -121,7 +123,12 @@ export default function Dashboard() {
         case "mt5_status":
           setMt5((prev) =>
             prev
-              ? { ...prev, status: msg.status, symbol: msg.symbol ?? prev.symbol }
+              ? {
+                  ...prev,
+                  status: msg.status,
+                  symbol: msg.symbol ?? prev.symbol,
+                  feed: (msg as WsMt5StatusMsg).feed ?? prev.feed,
+                }
               : prev
           );
           if (msg.symbol) {
@@ -242,6 +249,8 @@ export default function Dashboard() {
         menuActions={menuActions}
         isAdmin={isAdmin}
         onOpenTrade={() => (tradingConnected ? setTradePanelOpen(true) : setTradingOpen(true))}
+        lastPrice={lastPrice}
+        lastTickAt={lastTickAt}
       />
 
       <main className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col gap-4 p-4 xl:flex-row">

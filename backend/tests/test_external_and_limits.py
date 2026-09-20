@@ -75,8 +75,8 @@ async def test_snapshot_aggregates_all_providers() -> None:
     client = _FakeClient(
         {
             "https://api.binance.com": BINANCE,
-            "https://api.frankfurter.app/latest?from=EUR": ECB_EUR,
-            "https://api.frankfurter.app/latest?from=USD": ECB_USD,
+            "https://api.frankfurter.dev/v1/latest?base=EUR": ECB_EUR,
+            "https://api.frankfurter.dev/v1/latest?base=USD": ECB_USD,
         }
     )
     snap = await _service(client).snapshot()
@@ -94,7 +94,7 @@ async def test_snapshot_aggregates_all_providers() -> None:
 async def test_snapshot_fails_soft_when_provider_down() -> None:
     """C6: one dead API -> null field with ok:false, snapshot still valid."""
     client = _FakeClient(
-        {"https://api.frankfurter.app": ECB_EUR}
+        {"https://api.frankfurter.dev": ECB_EUR}
     )
     service = _service(client)  # ONE instance -> cache applies
     snap = await service.snapshot()

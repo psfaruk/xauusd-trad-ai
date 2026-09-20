@@ -13,7 +13,7 @@ export type SignalStatus = "active" | "won" | "lost" | "expired" | "cancelled";
 export interface HealthInfo {
   status: string;
   version: string;
-  data_source: "mock" | "mt5";
+  data_source: "mock" | "mt5" | "live";
   db: boolean;
 }
 
@@ -70,6 +70,15 @@ export interface Signal {
   closed_at: string | null;
 }
 
+/** Live-feed transparency (D-030): active provider + price freshness. */
+export interface FeedStatus {
+  provider: string;
+  detail: string;
+  last_price: number | null;
+  spread: number | null;
+  last_tick_age_s: number | null;
+}
+
 export interface Mt5Status {
   status: "connected" | "disconnected" | "reconnecting";
   symbol: string | null;
@@ -83,6 +92,7 @@ export interface Mt5Status {
   } | null;
   broker_time_utc_offset: number;
   engine_running: boolean;
+  feed?: FeedStatus;
 }
 
 export interface Position {
@@ -295,6 +305,7 @@ export interface WsMt5StatusMsg {
   type: "mt5_status";
   status: Mt5Status["status"];
   symbol: string | null;
+  feed?: FeedStatus;
 }
 
 export interface WsEngineLogMsg {

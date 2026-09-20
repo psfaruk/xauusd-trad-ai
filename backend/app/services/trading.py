@@ -232,9 +232,18 @@ class UserTradingManager:
             return st
 
     def _make_user_source(self, creds: dict) -> Any:
-        """Demo planes share the public market clock (identical prices)."""
+        """Demo planes share the public market (identical prices).
+
+        With the live feed (D-030) siblings are paper accounts priced off the
+        REAL market — every user sees the same real-time gold prices.
+        """
+        from app.mt5.live_source import LiveDataSource
         from app.mt5.mock_source import MockDataSource
 
+        if isinstance(self._public, LiveDataSource):
+            src = LiveDataSource.sibling(self._public)
+            src.set_starting_balance(DEMO_START_BALANCE)
+            return src
         if isinstance(self._public, MockDataSource):
             src = MockDataSource.sibling(self._public)
             src.set_starting_balance(DEMO_START_BALANCE)

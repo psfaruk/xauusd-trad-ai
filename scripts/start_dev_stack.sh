@@ -1,7 +1,8 @@
 #!/bin/bash
 # Full dev stack for local browser e2e (dev only):
 #   mock-supabase :8090  <-  auth for BOTH frontend (supabase-js) and backend
-#   api+mock      :8000  <-  SUPABASE_URL pointed at the mock
+#   api+LIVE      :8000  <-  DATA_SOURCE=live: free real-time gold APIs (D-030);
+#                           auto-degrades to mock if providers are unreachable
 #   vite dev      :3001  <-  VITE_SUPABASE_URL pointed at the mock
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -12,9 +13,9 @@ nohup "$ROOT/backend/.venv/bin/python" "$ROOT/scripts/mock_supabase.py" \
   > "$ROOT/run/mock-supabase.log" 2>&1 &
 echo $! > "$ROOT/run/mock-supabase.pid"
 
-# 2) backend api (mock source, mock supabase)
+# 2) backend api (LIVE source: real-time free APIs, mock fallback; mock supabase)
 cd "$ROOT/backend"
-DATA_SOURCE=mock SUPABASE_URL=http://127.0.0.1:8090 \
+DATA_SOURCE=${DATA_SOURCE:-live} SUPABASE_URL=http://127.0.0.1:8090 \
 SUPABASE_ANON_KEY=test ADMIN_EMAILS=trader@example.com \
 nohup .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 \
   > "$ROOT/run/uvicorn.log" 2>&1 &

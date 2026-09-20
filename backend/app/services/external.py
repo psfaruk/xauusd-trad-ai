@@ -67,8 +67,8 @@ class ExternalMarketService:
     async def _fetch_eurusd(self) -> dict:
         client = await self._http_factory()
         resp = await client.get(
-            "https://api.frankfurter.app/latest",
-            params={"from": "EUR", "to": "USD"},
+            "https://api.frankfurter.dev/v1/latest",  # new home (app->301 dev, D-030)
+            params={"base": "EUR", "symbols": "USD"},
             timeout=5.0,
         )
         resp.raise_for_status()
@@ -85,12 +85,13 @@ class ExternalMarketService:
         """USD index proxy from ECB majors (free Frankfurter series)."""
         client = await self._http_factory()
         resp = await client.get(
-            "https://api.frankfurter.app/latest",
-            params={"from": "USD", "to": "EUR,GBP,JPY,CAD,SEK,CHF"},
+            "https://api.frankfurter.dev/v1/latest",  # new home (app->301 dev, D-030)
+            params={"base": "USD", "symbols": "EUR,GBP,JPY,CAD,SEK,CHF"},
             timeout=5.0,
         )
         resp.raise_for_status()
-        rates = resp.json()["rates"]
+        payload = resp.json()
+        rates = payload["rates"]
         # Inverse of the DXY basket legs (approximate: DXY uses FX quoting
         # conventions; we expose the geometric-ish mean of USD strength)
         legs = {
@@ -108,7 +109,7 @@ class ExternalMarketService:
             "name": "USD strength (DXY proxy, 6-currency mean)",
             "value": round(strength, 5),
             "legs": {k: round(v, 5) for k, v in legs.items()},
-            "date": resp.json().get("date"),
+            "date": payload.get("date"),
         }
 
     # ---------------------------------------------------------------- public

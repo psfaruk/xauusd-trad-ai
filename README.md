@@ -13,8 +13,9 @@ recorded in [DECISIONS.md](./DECISIONS.md).
 | 1 | Auth (Supabase) | ✅ done (ACs verified below) |
 | 2 | MT5 connection + chart | ✅ done (ACs verified below) |
 | 3 | Signal engine + panel | ✅ done (ACs verified below) |
-| 4 | Execution + risk | ⬜ next |
-| 5 | Hardening + deploy | ⬜ |
+| 4 | Execution + risk | ✅ done (ACs verified below) |
+| 5 | Hardening + deploy | ✅ done (security checklist below) |
+| — | **Live real-time data** (D-030) | ✅ `DATA_SOURCE=live` default — free real-time gold APIs (Binance PAXG), verified end-to-end |
 
 ### Phase 0 — Acceptance Criteria verification
 
@@ -100,10 +101,30 @@ the backend:
 React SPA ── REST /api/candles · /api/mt5/* ──► FastAPI backend
           ── WS   /ws?token=…  (tick/bar/signal events)
                                                     │
-                              DataSource (C7) ┌─────┴──────┐
-                                DATA_SOURCE=mock │ MockDataSource (any OS, demo)
+                              DataSource (C7) ┌─────┴──────────────────────────┐
+                                DATA_SOURCE=live │ LiveDataSource — FREE real-time gold APIs (DEFAULT, D-030)
+                                                  │   Binance PAXG/USDT → gold-api.com → Yahoo GC=F
+                                DATA_SOURCE=mock │ MockDataSource (synthetic demo, any OS)
                                 DATA_SOURCE=mt5  │ MT5DataSource  → MetaTrader5 pkg → Exness terminal (Windows only, C1)
 ```
+
+**LIVE mode (default, D-030) — real-time data without any MT5 terminal.**
+The backend polls free key-less public APIs every 2 seconds and streams REAL
+gold prices 24/7:
+
+- **Binance `PAXG/USDT`** (primary) — PAXG is a regulated, physical-gold-backed
+  token (1 PAXG = 1 fine troy ounce, Paxos); it tracks spot XAUUSD within a
+  fraction of a percent and trades around the clock. Real bid/ask quotes via
+  `bookTicker`, authoritative OHLCV candles via `klines` for every timeframe.
+- **gold-api.com XAU spot** (quote fallback when Binance is geo-blocked).
+- **Yahoo Finance `GC=F`** (history fallback — COMEX gold futures candles).
+- **Tick-built candles** (last resort — bars aggregate live from quotes).
+
+If every provider is unreachable the app degrades to mock and says so via
+`/api/health` (`data_source` flips to `mock`) — the dashboard always streams.
+The active provider + price age is shown in the TopBar **LIVE badge**, the
+MT5 status (`feed` block) and the **Market Data tab** (basis vs spot XAU is
+disclosed there too). Demo/paper trading planes fill at the SAME live prices.
 
 1. Admin opens **MT5 connect** in the 3-dot menu (Settings → Platform MT5) →
    `POST /api/mt5/connect` `{server, login, password, terminal_path?}`.
@@ -113,9 +134,10 @@ React SPA ── REST /api/candles · /api/mt5/* ──► FastAPI backend
 3. The dashboard subscribes `/ws` `{channel:"market", symbol, tf}` and receives
    `tick` / `bar_open` / `bar_update` / `bar_close` events; signals arrive as
    global `signal` / `signal_update` events; `/api/candles` backfills history.
-4. On Railway (Linux) the app runs `DATA_SOURCE=mock` (C1: MetaTrader5 is
-   Windows-only) — real MT5 streaming requires the backend on a Windows VPS
-   with the Exness terminal installed (README → Deploy).
+4. On Railway (Linux) the app now runs `DATA_SOURCE=live` (D-030): real-time
+   gold data from free APIs. Real MT5 *execution* still requires the backend on
+   a Windows VPS with the Exness terminal installed (C1: the MetaTrader5
+   package is Windows-only).
 
 ## Multi-user trading: the agent architecture (Phase 4)
 
@@ -223,13 +245,14 @@ pytest        # 33 tests; DB tests use TEST_DATABASE_URL/DATABASE_URL (Postgres)
 ruff check .
 ```
 
-## Deploy to Railway (mock mode)
+## Deploy to Railway (live mode — real-time data)
 
 The repo ships a **single-service Docker image**: one uvicorn process serves
 the REST API (`/api/*`), the WebSocket (`/ws`, Phase 2) **and** the built SPA
-(`STATIC_DIR`, D-016) — same-origin, no CORS needed. It runs `DATA_SOURCE=mock`
-(SPEC C1/C7: MetaTrader5 is Windows-only; real trading targets the Windows VPS
-per SPEC §14).
+(`STATIC_DIR`, D-016) — same-origin, no CORS needed. It runs `DATA_SOURCE=live`
+(D-030): REAL-TIME gold prices stream from free key-less public APIs (Binance
+PAXG primary). Real MT5 *execution* still targets the Windows VPS per SPEC §14
+(C1: the MetaTrader5 package is Windows-only).
 
 1. **Create the project** — <https://railway.app> → New Project → *Deploy from
    GitHub repo* (root = repo root; the `Dockerfile` + `railway.json` are picked
@@ -251,7 +274,7 @@ per SPEC §14).
    ADMIN_EMAILS=you@example.com
    FERNET_KEY=<python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())">
    DATABASE_URL="${{Postgres.DATABASE_URL}}"
-   DATA_SOURCE=mock
+   DATA_SOURCE=live          # free real-time gold APIs (auto-degrade to mock)
    # SPA build args (Railway passes service vars as Docker build args):
    VITE_SUPABASE_URL=https://<ref>.supabase.co
    VITE_SUPABASE_ANON_KEY=<anon public key>
