@@ -1,7 +1,8 @@
 import type {
   HealthInfo, MeInfo, CandlesResponse, Signal, Mt5Status, Position, StatsResponse,
   ConfigResponse, EngineConfig, TradingStatus, TradingPosition, TradeRecord,
-  OrderResult, ExternalSnapshot, LogEntry,
+  OrderResult, ExternalSnapshot, LogEntry, Mt5Account, Mt5OpenPosition,
+  Mt5HistoryPosition, Mt5Symbol, Mt5OrderResult,
 } from "../types";
 
 /**
@@ -77,6 +78,55 @@ export function postMt5Connect(
 
 export function postMt5Disconnect(token: string): Promise<Mt5Status> {
   return request<Mt5Status>("/api/mt5/disconnect", { method: "POST" }, token);
+}
+
+/* --------------------------------------------- D-034 real MT5 account (MCP) */
+
+export function getMt5Account(token: string): Promise<Mt5Account> {
+  return request<Mt5Account>("/api/mt5/account", {}, token);
+}
+
+export function getMt5Positions(
+  token: string
+): Promise<{ positions: Mt5OpenPosition[]; orders: unknown[] }> {
+  return request<{ positions: Mt5OpenPosition[]; orders: unknown[] }>(
+    "/api/mt5/positions", {}, token
+  );
+}
+
+export function getMt5History(
+  token: string,
+  days = 30
+): Promise<{ positions: Mt5HistoryPosition[] }> {
+  return request<{ positions: Mt5HistoryPosition[] }>(
+    `/api/mt5/history?days=${days}`, {}, token
+  );
+}
+
+export function getMt5Symbols(token: string): Promise<{ symbols: Mt5Symbol[] }> {
+  return request<{ symbols: Mt5Symbol[] }>("/api/mt5/symbols", {}, token);
+}
+
+export function postMt5Order(
+  token: string,
+  body: { symbol: string; side: "buy" | "sell"; volume: number; sl?: number; tp?: number }
+): Promise<Mt5OrderResult> {
+  return request<Mt5OrderResult>("/api/mt5/order", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, token);
+}
+
+export function postMt5Close(
+  token: string,
+  body: { symbol: string; ticket: number }
+): Promise<Mt5OrderResult> {
+  return request<Mt5OrderResult>("/api/mt5/close", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, token);
 }
 
 /* --------------------------------------------------------------- signals */

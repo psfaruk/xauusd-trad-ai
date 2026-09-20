@@ -358,3 +358,75 @@ export type WsMessage =
   | WsTradingAccountMsg
   | WsTradingLogMsg
   | WsHeartbeatMsg;
+
+/* ------------------------------------------------- D-034 real MT5 account */
+
+export interface Mt5Account {
+  connected: boolean;
+  bridge: string;
+  login: number | null;
+  name: string | null;
+  server: string | null;
+  broker: string | null;
+  type: string | null;
+  currency: string | null;
+  leverage: number | null;
+  margin_mode: string | null;
+  balance: number | null;
+  equity: number | null;
+  margin: number | null;
+  margin_free: number | null;
+  profit: number | null;
+  mcp_trade_allowed: boolean | null;
+  build: number | null;
+}
+
+export interface Mt5OpenPosition {
+  position_id: number;
+  action: string;
+  reason: string;
+  symbol: string;
+  create_time: string;
+  update_time: string;
+  volume: number;
+  price_open: number;
+  price_last?: number;
+  profit?: number;
+  comment?: string;
+}
+
+export interface Mt5HistoryPosition {
+  position_id: number;
+  type: string;
+  symbol: string;
+  open_reason: string;
+  open_time: string;
+  open_volume: number;
+  open_price: number;
+  close_reason: string;
+  close_time: string;
+  close_volume: number;
+  close_price: number;
+  profit: number;
+  comment?: string;
+}
+
+export interface Mt5Symbol {
+  symbol: string;
+  description: string;
+  bid?: number;
+  ask?: number;
+  digits?: number;
+  trade_mode?: number;
+}
+
+export interface Mt5OrderResult {
+  ok: boolean;
+  retcode: number;
+  detail: string | null;
+  deal: number | null;
+  order: number | null;
+  price: number | null;
+  volume: number | null;
+  symbol: string | null;
+}

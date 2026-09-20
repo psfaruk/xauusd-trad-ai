@@ -72,11 +72,26 @@ class MT5DataSource(DataSource):
     # ------------------------------------------------------------ internals
 
     def _import_mt5(self) -> Any:
-        """Lazily import the Windows-only MetaTrader5 package (SPEC C7)."""
-        if self._mt5 is None:
-            import MetaTrader5  # noqa: PLC0415 — deliberate lazy import (C7)
+        """Lazily import the Windows-only MetaTrader5 package (SPEC C7).
 
-            self._mt5 = MetaTrader5
+        On Linux, fall back to the wine bridge shim (real terminal driven by
+        Windows Python inside wine — D-034). Fail-closed when neither exists.
+        """
+        if self._mt5 is None:
+            try:
+                import MetaTrader5  # noqa: PLC0415 — deliberate lazy import (C7)
+
+                self._mt5 = MetaTrader5
+            except ImportError:
+                from app.mt5.bridge import import_mt5_module
+
+                shim = import_mt5_module()
+                if shim is None:
+                    raise DataSourceError(
+                        "MetaTrader5 package unavailable and the MT5 wine "
+                        "bridge (MT5_BRIDGE_URL) is not reachable"
+                    ) from None
+                self._mt5 = shim
         return self._mt5
 
     async def _run(self, fn, *args):
@@ -378,6 +393,37 @@ class MT5DataSource(DataSource):
                         self._to_utc_epoch(p.time), tz=UTC
                     ),
                 )
+            )
+        return out
+
+    # ------------------------------------------------- account history (D-034)
+    DEAL_TYPE = {0: "BUY", 1: "SELL"}
+    DEAL_ENTRY = {0: "IN", 1: "OUT", 2: "INOUT", 3: "OUT_BY"}
+
+    async def history_deals(self, days: int = 90) -> list[dict]:
+        """Real account deal history (D-034) — /api/trading/mt5-history."""
+        mt5 = self._import_mt5()
+        now = int(time_mod.time())
+        deals = await self._run(mt5.history_deals_get, now - days * 86400, now + 86400)
+        out: list[dict] = []
+        for d in deals or []:
+            out.append(
+                {
+                    "ticket": int(d.ticket),
+                    "order": int(d.order),
+                    "position_id": int(d.position_id),
+                    "time": int(d.time),
+                    "symbol": str(d.symbol),
+                    "type": self.DEAL_TYPE.get(int(d.type), str(d.type)),
+                    "entry": self.DEAL_ENTRY.get(int(d.entry), str(d.entry)),
+                    "volume": float(d.volume),
+                    "price": float(d.price),
+                    "profit": float(d.profit),
+                    "commission": float(d.commission),
+                    "swap": float(d.swap),
+                    "fee": float(getattr(d, "fee", 0.0)),
+                    "comment": str(getattr(d, "comment", "") or ""),
+                }
             )
         return out
 

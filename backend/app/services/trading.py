@@ -55,6 +55,7 @@ class TradingPlane:
     login: str  # masked on output
     source: Any  # DataSource (demo sibling / live)
     executor: OrderExecutor
+    symbol: str = "XAUUSDm"  # plane's own trading symbol (D-034)
     connected_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     poll_task: asyncio.Task | None = None
 
@@ -167,32 +168,37 @@ class UserTradingManager:
         """Connect a user's own trading account (agent flow).
 
         mode "demo": instant paper-trading plane priced off the public market.
-        mode "live": stored for the Windows bridge; on Linux returns
-        bridge_required (honest state — never silently simulate live).
+        mode "live": REAL MT5 execution through the wine bridge when it is
+        reachable (D-034 — the sandbox/VPS runs the MT5 terminal + gateway);
+        otherwise credentials are stored with status "bridge_required"
+        (honest state — never silently simulate live).
         """
         async with self._lock:
             if owner in self._planes:
                 await self._teardown_plane(owner)
 
             mode = creds.get("mode", "demo")
-            if mode == "live" and self._settings.data_source != "mt5":
-                stored = await self._store_creds(
-                    owner, creds, status="bridge_required", mode="live"
-                )
-                return {
-                    "connected": False,
-                    "mode": "live",
-                    "status": "bridge_required",
-                    "detail": (
-                        "Live MT5 execution needs the Windows bridge "
-                        "(DECISIONS D-024). Credentials stored encrypted; "
-                        "connect again on the Windows deployment."
-                    ),
-                    "login_masked": _mask_login(str(creds.get("login", ""))),
-                    "stored": stored,
-                }
-
-            source = self._make_user_source(creds)
+            if mode == "live":
+                source = await self._make_live_source()
+                if source is None:
+                    stored = await self._store_creds(
+                        owner, creds, status="bridge_required", mode="live"
+                    )
+                    return {
+                        "connected": False,
+                        "mode": "live",
+                        "status": "bridge_required",
+                        "detail": (
+                            "Live MT5 execution needs the MT5 bridge "
+                            "(terminal + gateway, DECISIONS D-024/D-034). "
+                            "Credentials stored encrypted; retry when the "
+                            "bridge host is running."
+                        ),
+                        "login_masked": _mask_login(str(creds.get("login", ""))),
+                        "stored": stored,
+                    }
+            else:
+                source = self._make_user_source(creds)
             await source.connect(creds)
             symbol = self._discover(source)
             point = 0.01
@@ -215,6 +221,7 @@ class UserTradingManager:
                 login=str(creds.get("login", "")),
                 source=source,
                 executor=executor,
+                symbol=symbol,
             )
             self._planes[owner] = plane
             await self._store_creds(owner, creds, status="connected", mode=mode)
@@ -230,6 +237,24 @@ class UserTradingManager:
             st["symbol"] = symbol
             st["point_size"] = point
             return st
+
+    async def _make_live_source(self) -> Any | None:
+        """Real MT5 source for live planes when the bridge is reachable (D-034).
+
+        DATA_SOURCE=mt5 (Windows native) always qualifies; on Linux the wine
+        bridge (gateway.py over the real terminal) must answer /health.
+        """
+        if self._settings.data_source == "mt5":
+            from app.mt5.mt5_source import MT5DataSource
+
+            return MT5DataSource()
+        from app.mt5.bridge import bridge_available
+
+        if bridge_available():
+            from app.mt5.mt5_source import MT5DataSource
+
+            return MT5DataSource()
+        return None
 
     def _make_user_source(self, creds: dict) -> Any:
         """Demo planes share the public market (identical prices).
@@ -456,7 +481,7 @@ class UserTradingManager:
             raise ValueError("trading plane not connected")
         from app.mt5.base import validate_tf  # noqa: F401 — keep imports local
 
-        symbol = self._symbol_hint()
+        symbol = getattr(plane, "symbol", None) or self._symbol_hint()
         order = Order(
             symbol=symbol, side=side, volume=volume, sl=sl, tp=tp,
             deviation=30, magic=0, comment="xauai-manual",

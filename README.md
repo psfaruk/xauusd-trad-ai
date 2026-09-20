@@ -108,6 +108,19 @@ React SPA ── REST /api/candles · /api/mt5/* ──► FastAPI backend
                                 DATA_SOURCE=mt5  │ MT5DataSource  → MetaTrader5 pkg → Exness terminal (Windows only, C1)
 ```
 
+**Real-account trading via the terminal's built-in MCP server (D-034).** The
+backend also speaks to a LIVE MetaTrader 5 terminal directly — on the sandbox
+host the genuine terminal (build 6000+) runs under user-space Wine
+(`/home/z/mt5stack`, no root needed) logged into the Exness account, and its
+built-in MCP server (`127.0.0.1:22346`, bearer-key auth) serves account info,
+positions, history, symbols and ORDER EXECUTION (`app/mt5/mcp.py`). The 3-dot
+menu → **MT5 Account (live)** panel shows real balance / equity / floating
+P/L, open positions (with one-click close), the 90-day trade history and a
+market-order tab — every order is executed by the real MetaTrader 5 terminal,
+never simulated. The watchdog supervises Xvfb + openbox + the terminal and
+skips the whole stack automatically where it is not installed (e.g. Railway,
+which keeps serving real-time market DATA only).
+
 **LIVE mode (default, D-030/D-033) — real-time data without any MT5 terminal.**
 The backend aggregates five key-less public venues over WebSocket and pushes
 EVERY real market event the instant it happens — tens of ticks per second in
@@ -143,10 +156,12 @@ Demo/paper trading planes fill at the SAME live prices.
 3. The dashboard subscribes `/ws` `{channel:"market", symbol, tf}` and receives
    `tick` / `bar_open` / `bar_update` / `bar_close` events; signals arrive as
    global `signal` / `signal_update` events; `/api/candles` backfills history.
-4. On Railway (Linux) the app now runs `DATA_SOURCE=live` (D-030): real-time
-   gold data from free APIs. Real MT5 *execution* still requires the backend on
-   a Windows VPS with the Exness terminal installed (C1: the MetaTrader5
-   package is Windows-only).
+4. On Railway (Linux) the app runs `DATA_SOURCE=live` (D-030): real-time gold
+   data from free APIs. Real MT5 *execution* works wherever the MT5 terminal
+   runs — natively on Windows, or rootless under Wine on Linux (D-034,
+   `/home/z/mt5stack`) — with the terminal's MCP server bridging the platform
+   to the broker. Where no terminal exists (Railway), trading endpoints
+   honestly report the bridge as offline instead of simulating.
 
 ## Multi-user trading: the agent architecture (Phase 4)
 

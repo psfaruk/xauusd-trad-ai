@@ -6,6 +6,7 @@ export interface DotMenuActions {
   onOpenTrading: () => void;      // Trading: my account connect/arming
   onOpenTradePanel: () => void;   // Trading: manual orders + positions
   onOpenTradeHistory: () => void; // Trading: my trade history
+  onOpenMt5Account: () => void;   // Trading: REAL MT5 account panel (D-034)
   onOpenSignals: () => void;      // Analysis: signals + performance tab
   onOpenMarketData: () => void;   // Analysis: external reference data tab
   onOpenLogs: () => void;         // Analysis: platform log viewer
@@ -51,6 +52,7 @@ export default function DotMenu({ actions, isAdmin }: DotMenuProps) {
     {
       title: "Trading",
       items: [
+        { label: "MT5 Account (live)", hint: "real Exness balance · positions · orders", onClick: actions.onOpenMt5Account },
         { label: "My Trading Account", hint: "connect your MT5 / Exness account", onClick: actions.onOpenTrading },
         { label: "Trade Panel", hint: "manual orders & open positions", onClick: actions.onOpenTradePanel },
         { label: "Trade History", hint: "my executed trades", onClick: actions.onOpenTradeHistory },

@@ -8,6 +8,7 @@ import Mt5ConnectDialog from "../components/Mt5ConnectDialog";
 import SettingsDialog from "../components/SettingsDialog";
 import TradingDialog from "../components/TradingDialog";
 import TradePanel from "../components/TradePanel";
+import Mt5AccountPanel from "../components/Mt5AccountPanel";
 import LogViewer from "../components/LogViewer";
 import { useAuth } from "../lib/auth";
 import {
@@ -54,6 +55,7 @@ export default function Dashboard() {
   const [tradingOpen, setTradingOpen] = useState(false);
   const [tradePanelOpen, setTradePanelOpen] = useState(false);
   const [tradePanelTab, setTradePanelTab] = useState<"trade" | "history">("trade");
+  const [mt5AccountOpen, setMt5AccountOpen] = useState(false); // D-034 real account
   const [logsOpen, setLogsOpen] = useState(false);
   const [panelTab, setPanelTab] = useState<SignalPanelTab>("signals");
 
@@ -239,6 +241,7 @@ export default function Dashboard() {
       setTradePanelTab("history");
       setTradePanelOpen(true);
     },
+    onOpenMt5Account: () => setMt5AccountOpen(true),
     onOpenSignals: () => setPanelTab("signals"),
     onOpenMarketData: () => setPanelTab("market"),
     onOpenLogs: () => setLogsOpen(true),
@@ -448,6 +451,12 @@ export default function Dashboard() {
         lastPrice={lastPrice}
         onPositionsChanged={refreshTrading}
         initialTab={tradePanelTab}
+      />
+
+      <Mt5AccountPanel
+        open={mt5AccountOpen}
+        onClose={() => setMt5AccountOpen(false)}
+        token={token ?? ""}
       />
 
       <LogViewer

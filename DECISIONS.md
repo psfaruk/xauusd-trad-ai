@@ -145,3 +145,50 @@ the "real data only" directive; the t/s meter shows the true market rate
 offline unit tests for every venue parser + consolidation + the emit path;
 resolve tests updated for the no-degrade contract (incl. ALLOW_DEMO gating);
 193 tests green; ruff/tsc/vite clean.
+
+---
+
+## D-034 — Real MT5 account through the terminal's built-in MCP server
+
+**Context:** The user supplied a live Exness demo account (Exness-MT5Trial6,
+login 414350770) and required the platform to connect THROUGH MetaTrader 5
+("তোমি সরাসরি এটি কানেক্ট করতে পারবে না — meta 5 দিয়ে করতে হবে") and to
+show balance + detailed trade history + prove auto-trading, from the site.
+
+**Decision:**
+1. **Real terminal, user-space Wine (no root):** Debian wine debs extracted
+   under `/home/z/mt5stack/root` (rootless), Xvfb :99 + openbox provide the
+   GUI, and the genuine MetaTrader 5 terminal (build 6204) runs as
+   `terminal64.exe /portable`, logged into the Exness account. The watchdog
+   (D-031) now supervises the whole stack (xvfb/openbox/terminal) with a 90s
+   boot grace; the stack is skipped automatically where the dir is absent
+   (Railway/Windows hosts).
+2. **Terminal MCP bridge instead of MetaTrader5 pip:** MT5 build 6000+ ships
+   a built-in MCP server (127.0.0.1:22346, bearer-key auth). `app/mt5/mcp.py`
+   is a JSON-RPC client for it (initialize/tools-call, session retry). This
+   replaces the Windows-Python gateway idea (bridge.py stays as an optional
+   shim for DATA_SOURCE=mt5 hosts) — no Windows Python needed, the platform
+   only ever talks to the terminal, satisfying the "through MetaTrader 5"
+   constraint.
+3. **Admin panel endpoints (routes_mt5.py):** GET /api/mt5/account
+   (balance/equity/margin/connected/mcp_trade_allowed), /positions,
+   /history?days=1..365, /symbols, POST /order + /close — all executed by
+   the real terminal. Per-user live planes keep the honest
+   `bridge_required` state (D-024) until a per-account terminal exists.
+4. **UI:** DotMenu → "MT5 Account (live)" opens Mt5AccountPanel — live
+   balance/equity/free-margin/floating-P/L cards (5s refresh), open
+   positions with per-row close, 90-day trade history table, and a market
+   order tab (symbol/volume/SL/TP, BUY/SELL) routed to the real account.
+
+**Verification:** MCP round-trip in-sandbox — account (Exness-MT5Trial6,
+$499.94, mcp_trade_allowed=true); REST e2e through the vite proxy (same
+path the UI uses): order BUY 0.01 BTCUSDm filled @81224.37 (deal
+4424979755), position shape verified, closed @81232.39 (+$0.08), history
+shows all 3 trades. XAUUSDm weekend order correctly rejected with
+"Market closed" (retcode 10018) — real broker behaviour. Browser e2e:
+panel shows ● LIVE, BALANCE 500.02 USD, server/login line, history table;
+zero console errors. 194 tests green, ruff/tsc/vite clean.
+
+**Secrets:** the MCP bearer key lives only in /home/z/mt5stack/mcp_key.txt
+(gitignored, outside the repo); the API reads it via MT5_MCP_KEY_FILE.
+Account credentials live in the terminal's encrypted profile only.

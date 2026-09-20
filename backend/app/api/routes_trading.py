@@ -124,6 +124,25 @@ async def trading_history(
     return {"trades": await _manager(request).trade_history(user["id"], limit)}
 
 
+@router.get("/mt5-history")
+async def trading_mt5_history(
+    request: Request,
+    user: CurrentUser,
+    days: int = Query(default=90, ge=1, le=365),
+) -> dict:
+    """Real MT5 account deal history (D-034) — live planes only."""
+    plane = _manager(request).plane(user["id"])
+    if plane is None or plane.mode != "live":
+        return {"deals": []}
+    history_deals = getattr(plane.source, "history_deals", None)
+    if not callable(history_deals):
+        return {"deals": []}
+    try:
+        return {"deals": await history_deals(days)}
+    except Exception as exc:  # noqa: BLE001 — history must never 500 the panel
+        raise HTTPException(status_code=502, detail=f"mt5 history failed: {exc}") from exc
+
+
 @router.post("/auto-trade")
 async def trading_auto_trade(body: AutoTradeBody, request: Request, user: CurrentUser) -> dict:
     if not await _budget(request, "arm", 10):
