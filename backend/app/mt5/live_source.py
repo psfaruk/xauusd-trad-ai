@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time as time_mod
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dataclasses_replace
 from datetime import UTC, datetime
@@ -158,6 +158,17 @@ class _Account:
     leverage: int = 100
 
 
+# Binance public market-data mirrors (D-032). data-api.binance.vision is
+# Binance's official key-less data endpoint — it serves the identical REST
+# shape and is NOT subject to the 451 "Unsupported Security Policy" geo
+# blocks that api.binance.com applies to many datacenter/AWS egress IPs
+# (Railway, Fly, AWS Lambda...). The classic domain stays as mirror #2.
+BINANCE_BASES_DEFAULT = (
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+)
+
+
 class MarketFeed:
     """Owns provider polling + candle caches.
 
@@ -169,11 +180,21 @@ class MarketFeed:
         self,
         http_factory: HttpFactory | None = None,
         poll_seconds: float = 2.0,
-        binance_base: str = "https://api.binance.com",
+        binance_base: str = "",
+        binance_bases: Sequence[str] | None = None,
     ) -> None:
         self._http_factory = http_factory or _default_http_client
         self.poll_seconds = float(poll_seconds)
-        self._binance_base = binance_base.rstrip("/")
+        # Mirror chain with a sticky "currently working" index (D-032):
+        # try mirrors in rotation, remember the first one that answers.
+        if binance_bases:
+            bases = [b.rstrip("/") for b in binance_bases]
+        else:
+            bases = list(BINANCE_BASES_DEFAULT)
+        if binance_base and binance_base.rstrip("/") not in bases:
+            bases.insert(0, binance_base.rstrip("/"))
+        self._binance_bases = bases or list(BINANCE_BASES_DEFAULT)
+        self._binance_idx = 0
 
         self.tick: Tick | None = None
         self.provider = "init"  # init | binance | goldapi | degraded
@@ -259,6 +280,33 @@ class MarketFeed:
             c = await c
         return c  # type: ignore[return-value]
 
+    async def _binance_get(
+        self, client: httpx.AsyncClient, path: str, params: dict, timeout: float
+    ) -> httpx.Response:
+        """GET a Binance endpoint with mirror failover (D-032).
+
+        Tries the sticky mirror first, then rotates through the rest (e.g.
+        data-api.binance.vision when api.binance.com answers 451 from a
+        datacenter IP). The first mirror that responds becomes sticky so
+        healthy polls never pay the failover latency.
+        """
+        last_exc: Exception | None = None
+        bases = self._binance_bases
+        for offset in range(len(bases)):
+            idx = (self._binance_idx + offset) % len(bases)
+            try:
+                r = await client.get(f"{bases[idx]}{path}", params=params, timeout=timeout)
+                r.raise_for_status()
+                if idx != self._binance_idx:
+                    logger.info("binance mirror switched to %s", bases[idx])
+                    self._binance_idx = idx
+                return r
+            except Exception as exc:  # noqa: BLE001 — try the next mirror
+                last_exc = exc
+                logger.debug("binance mirror %s failed: %s", bases[idx], exc)
+        assert last_exc is not None
+        raise last_exc
+
     async def poll_once(self) -> bool:
         """One provider cycle (binance -> gold-api). True when data arrived."""
         try:
@@ -277,24 +325,21 @@ class MarketFeed:
 
     async def _poll_binance(self) -> None:
         client = await self._client()
-        r = await client.get(
-            f"{self._binance_base}/api/v3/ticker/bookTicker",
-            params={"symbol": "PAXGUSDT"},
-            timeout=4.0,
+        r = await self._binance_get(
+            client, "/api/v3/ticker/bookTicker", {"symbol": "PAXGUSDT"}, 4.0
         )
-        r.raise_for_status()
         d = r.json()
         bid, ask = float(d["bidPrice"]), float(d["askPrice"])
         if bid <= 0 or ask < bid:
             raise DataSourceError(f"binance bookTicker invalid: {d!r}")
         # Authoritative forming M1 (klines weight 2 — cheap alongside quotes)
         try:
-            rk = await client.get(
-                f"{self._binance_base}/api/v3/klines",
-                params={"symbol": "PAXGUSDT", "interval": "1m", "limit": 2},
-                timeout=4.0,
+            rk = await self._binance_get(
+                client,
+                "/api/v3/klines",
+                {"symbol": "PAXGUSDT", "interval": "1m", "limit": 2},
+                4.0,
             )
-            rk.raise_for_status()
             closed, forming = _parse_binance_klines(rk.json())
             if closed:
                 self._m1_recent_closed = closed[-2:]
@@ -400,16 +445,16 @@ class MarketFeed:
     async def _fetch_binance_tf(self, tf: str, min_count: int) -> list[dict]:
         client = await self._client()
         limit = min(1000, max(min_count + 1, 120))
-        r = await client.get(
-            f"{self._binance_base}/api/v3/klines",
-            params={
+        r = await self._binance_get(
+            client,
+            "/api/v3/klines",
+            {
                 "symbol": "PAXGUSDT",
                 "interval": BINANCE_INTERVALS[tf],
                 "limit": limit,
             },
-            timeout=6.0,
+            6.0,
         )
-        r.raise_for_status()
         closed, _ = _parse_binance_klines(r.json())
         return closed
 
@@ -520,7 +565,8 @@ class LiveDataSource(DataSource):
         self,
         http_factory: HttpFactory | None = None,
         poll_seconds: float = 2.0,
-        binance_base: str = "https://api.binance.com",
+        binance_base: str = "",
+        binance_bases: Sequence[str] | None = None,
         market: MarketFeed | None = None,
         starting_balance: float = DEMO_START_BALANCE,
         connect_timeout_s: float = 10.0,
@@ -529,6 +575,7 @@ class LiveDataSource(DataSource):
             http_factory=http_factory,
             poll_seconds=poll_seconds,
             binance_base=binance_base,
+            binance_bases=binance_bases,
         )
         self._owns_market = market is None
         self._connect_timeout_s = float(connect_timeout_s)

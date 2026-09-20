@@ -423,19 +423,68 @@ async def test_resolve_data_source_live_and_fallback(monkeypatch):
     client = FakeClient()
     binance_quotes(client)
     settings = Settings(data_source="live")
-    source, name = await resolve_data_source(settings, lambda: client)
-    assert name == "live" and isinstance(source, LiveDataSource)
-    await source.market.stop()
+    res = await resolve_data_source(settings, lambda: client)
+    assert res.effective == "live" and isinstance(res.source, LiveDataSource)
+    assert res.requested == "live" and res.degraded is False
+    await res.source.market.stop()
 
     # providers dead -> honest mock fallback (dashboard still streams)
     dead = FakeClient()
     dead.fail.add("binance")
     dead.fail.add("gold-api")
     settings2 = Settings(data_source="live")
-    source2, name2 = await resolve_data_source(settings2, lambda: dead)
-    assert name2 == "mock" and isinstance(source2, MockDataSource)
+    res2 = await resolve_data_source(settings2, lambda: dead)
+    assert res2.effective == "mock" and isinstance(res2.source, MockDataSource)
+    assert res2.requested == "live" and res2.degraded is True
+    assert res2.reason  # diagnosable via /api/health
 
-    # explicit non-live mode untouched
+    # explicit non-live mode untouched (not degraded — user asked for it)
     settings3 = Settings(data_source="mt5")
-    source3, name3 = await resolve_data_source(settings3, lambda: dead)
-    assert name3 == "mt5"
+    res3 = await resolve_data_source(settings3, lambda: dead)
+    assert res3.effective == "mt5" and res3.requested == "mt5"
+    assert res3.degraded is False
+
+    # explicit mock: requested mock (health surfaces it; UI shows DEMO banner)
+    settings4 = Settings(data_source="mock")
+    res4 = await resolve_data_source(settings4, lambda: dead)
+    assert res4.effective == "mock" and res4.requested == "mock"
+    assert res4.degraded is False
+
+
+async def test_binance_mirror_failover_451():
+    """D-032: api.binance.com 451-blocked (datacenter) -> data-api.binance.vision.
+
+    Mirror #1 (vision) is default-primary; here we force the classic domain
+    first via binance_bases order and script a 451 for it — the feed must
+    rotate to the vision mirror, remember it (sticky), and keep streaming.
+    """
+    client = FakeClient()
+    state = {"bid": 4000.0, "ask": 4000.2}
+
+    def classic_451(p):
+        return httpx.HTTPStatusError(
+            "HTTP 451", request=None,
+            response=httpx.Response(451, request=httpx.Request("GET", "https://api.binance.com")),
+        )
+
+    client.on("api.binance.com", classic_451)
+    client.on("bookTicker", lambda p: {
+        "symbol": "PAXGUSDT", "bidPrice": str(state["bid"]),
+        "askPrice": str(state["ask"]),
+    })
+    client.on("/api/v3/klines", lambda p: binance_klines(60, 3))
+    feed = MarketFeed(
+        http_factory=lambda: client,
+        poll_seconds=0.05,
+        binance_bases=["https://api.binance.com", "https://data-api.binance.vision"],
+    )
+    assert await feed.poll_once() is True
+    assert feed.provider == "binance"
+    # the classic domain was tried and failed; the vision mirror answered
+    assert client.count("api.binance.com") >= 1
+    assert client.count("data-api.binance.vision") >= 1
+    # sticky: the next poll goes straight to the working mirror
+    calls_before = len(client.calls)
+    await feed.poll_once()
+    new_calls = client.calls[calls_before:]
+    assert all("data-api.binance.vision" in u for u in new_calls)

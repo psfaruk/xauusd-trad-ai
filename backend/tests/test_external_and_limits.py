@@ -74,7 +74,8 @@ ECB_USD = {
 async def test_snapshot_aggregates_all_providers() -> None:
     client = _FakeClient(
         {
-            "https://api.binance.com": BINANCE,
+            # D-032: the PAXG fetch tries data-api.binance.vision FIRST
+            "https://data-api.binance.vision/api/v3/ticker/24hr": BINANCE,
             "https://api.frankfurter.dev/v1/latest?base=EUR": ECB_EUR,
             "https://api.frankfurter.dev/v1/latest?base=USD": ECB_USD,
         }

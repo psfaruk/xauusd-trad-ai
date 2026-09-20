@@ -14,6 +14,9 @@ export interface HealthInfo {
   status: string;
   version: string;
   data_source: "mock" | "mt5" | "live";
+  /** D-032: what the env requested (differs from data_source only on degrade). */
+  requested_data_source?: "mock" | "mt5" | "live";
+  degraded?: boolean;
   db: boolean;
 }
 

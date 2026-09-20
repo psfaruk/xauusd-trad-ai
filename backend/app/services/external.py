@@ -46,13 +46,25 @@ class ExternalMarketService:
 
     async def _fetch_paxg(self) -> dict:
         client = await self._http_factory()
-        resp = await client.get(
-            "https://api.binance.com/api/v3/ticker/24hr",
-            params={"symbol": "PAXGUSDT"},
-            timeout=5.0,
-        )
-        resp.raise_for_status()
-        d = resp.json()
+        # data-api.binance.vision first (D-032): same REST shape, immune to
+        # the 451 datacenter blocks api.binance.com applies on many hosts.
+        last_exc: Exception | None = None
+        d = None
+        for base in ("https://data-api.binance.vision", "https://api.binance.com"):
+            try:
+                resp = await client.get(
+                    f"{base}/api/v3/ticker/24hr",
+                    params={"symbol": "PAXGUSDT"},
+                    timeout=5.0,
+                )
+                resp.raise_for_status()
+                d = resp.json()
+                break
+            except Exception as exc:  # noqa: BLE001 — try the mirror
+                last_exc = exc
+                logger.debug("paxg 24hr via %s failed: %s", base, exc)
+        if d is None:
+            raise last_exc if last_exc else RuntimeError("paxg fetch failed")
         return {
             "ok": True,
             "provider": "binance",

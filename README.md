@@ -274,7 +274,7 @@ PAXG primary). Real MT5 *execution* still targets the Windows VPS per SPEC §14
    ADMIN_EMAILS=you@example.com
    FERNET_KEY=<python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())">
    DATABASE_URL="${{Postgres.DATABASE_URL}}"
-   DATA_SOURCE=live          # free real-time gold APIs (auto-degrade to mock)
+   # DATA_SOURCE defaults to "live" in the image (D-030) — you can omit it.
    # SPA build args (Railway passes service vars as Docker build args):
    VITE_SUPABASE_URL=https://<ref>.supabase.co
    VITE_SUPABASE_ANON_KEY=<anon public key>
@@ -282,6 +282,13 @@ PAXG primary). Real MT5 *execution* still targets the Windows VPS per SPEC §14
    ```
    Changing a `VITE_*` variable triggers a rebuild (the values are baked into
    the SPA at build time).
+
+   ⚠️ **Deployed BEFORE D-030 (Sept 2026)? REMOVE the stale `DATA_SOURCE=mock`
+   variable** — Railway variables persist across deploys and OVERRIDE the
+   image default, which silently keeps the platform on synthetic demo prices
+   (~2715) while the code is fully live-capable. Same for a missing
+   `DATABASE_URL`: `/api/health` then reports `"db": false` (in-memory data
+   only — trades/signals/config do not survive restarts).
 4. **Deploy** — `railway up` (or push to the connected branch).
 5. **Generate a domain** — Settings → Networking → Generate Domain. Railway
    handles WebSockets on the same domain (needed from Phase 2).

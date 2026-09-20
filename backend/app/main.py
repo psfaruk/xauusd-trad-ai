@@ -45,7 +45,7 @@ from app.config import Settings, get_settings
 from app.db import apply_schema, is_postgres_url, make_engine, promote_admins
 from app.engine.config import ConfigRepo
 from app.engine.repo import SignalRepo
-from app.mt5.connection import ConnectionManager, resolve_data_source
+from app.mt5.connection import ConnectionManager, SourceResolution, resolve_data_source
 from app.services.external import ExternalMarketService
 from app.services.news import NewsService, NullNewsService
 from app.services.ws_hub import WSHub
@@ -109,10 +109,12 @@ async def lifespan(app: FastAPI):
         app.state.news = NullNewsService()
     app.state.config_repo = ConfigRepo()
     app.state.signals = SignalRepo(app.state.db_engine)
-    source, effective_data_source = await resolve_data_source(
+    resolution = await resolve_data_source(
         settings, http_factory=lambda: _get_http(app)
     )
+    source, effective_data_source = resolution.source, resolution.effective
     app.state.data_source = effective_data_source
+    app.state.source_resolution = resolution  # D-032
     app.state.mt5 = ConnectionManager(
         source=source,
         settings=settings,
@@ -168,6 +170,50 @@ async def lifespan(app: FastAPI):
     else:
         asyncio.create_task(app.state.mt5.try_restore())
 
+    # --- D-032: live-recovery loop. When the boot probe degraded live->mock
+    # (transient provider outage), re-probe every 60s and hot-swap the moment
+    # a provider answers — a bad boot minute must not pin the platform to
+    # synthetic prices forever. Explicit DATA_SOURCE=mock never enters here.
+    async def _live_recovery_loop() -> None:
+        from app.mt5.live_source import LiveDataSource
+
+        while True:
+            await asyncio.sleep(60)
+            try:
+                if app.state.data_source != "mock":
+                    return  # recovered / reconfigured — stop
+                candidate = LiveDataSource(
+                    http_factory=lambda: _get_http(app),
+                    poll_seconds=settings.live_poll_seconds,
+                )
+                if not await candidate.quick_check():
+                    continue
+                logger.warning("live providers RECOVERED — swapping mock -> live")
+                was_connected = app.state.mt5.state.status == "connected"
+                if was_connected:
+                    try:
+                        await app.state.mt5.disconnect()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("disconnect during recovery failed", exc_info=True)
+                app.state.mt5.set_source(candidate)
+                app.state.trading._public = candidate  # new demo planes price live
+                app.state.data_source = "live"
+                if getattr(app.state, "source_resolution", None):
+                    app.state.source_resolution = None  # no longer degraded
+                if was_connected:
+                    await app.state.mt5.connect(
+                        {"server": "LiveMarket", "login": "REALTIME", "password": "none"}
+                    )
+                logger.warning("mock -> live hot-swap complete — REAL prices now")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — the loop must survive anything
+                logger.debug("live recovery probe failed", exc_info=True)
+
+    if resolution.degraded:
+        recovery_task = asyncio.create_task(_live_recovery_loop(), name="live-recovery")
+        app.state._live_recovery_task = recovery_task
+
     # --- Phase 4: arm the admin platform executor per persisted auto_trade;
     # restore user demo planes (multi-user agent).
     try:
@@ -194,6 +240,9 @@ async def lifespan(app: FastAPI):
         "startup complete: data_source=%s db=%s", effective_data_source, app.state.db_ok
     )
     yield
+    recovery = getattr(app.state, "_live_recovery_task", None)
+    if recovery is not None:
+        recovery.cancel()
     await app.state.http.aclose()
     await app.state.trading.shutdown()
     await app.state.mt5.shutdown()
@@ -228,12 +277,26 @@ app.add_middleware(
 
 @app.get("/api/health")
 async def health() -> dict:
-    """Liveness probe (SPEC §7.1) — no auth required."""
+    """Liveness probe (SPEC §7.1) — no auth required.
+
+    D-032: `data_source` is what RUNS; `requested_data_source` is what the
+    environment asked for. "mock" + requested "live" + degraded=true means a
+    boot-time provider outage (recovery loop retries every 60s); "mock" +
+    requested "mock" means the DATA_SOURCE env var forces demo prices.
+    """
     settings: Settings = app.state.settings
+    resolution: SourceResolution | None = getattr(
+        app.state, "source_resolution", None
+    )
+    effective = getattr(app.state, "data_source", None) or settings.data_source
     return {
         "status": "ok",
         "version": app.version,
-        "data_source": getattr(app.state, "data_source", None) or settings.data_source,
+        "data_source": effective,
+        "requested_data_source": (
+            resolution.requested if resolution else settings.data_source
+        ),
+        "degraded": bool(resolution and resolution.degraded),
         "db": app.state.db_ok,
     }
 

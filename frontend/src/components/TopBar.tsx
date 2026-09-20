@@ -30,6 +30,7 @@ export default function TopBar({
   const email = session?.user?.email ?? null;
   const [backend, setBackend] = useState<BackendState>("checking");
   const [source, setSource] = useState<string>("");
+  const [requested, setRequested] = useState<string>("");
 
   useEffect(() => {
     let alive = true;
@@ -39,6 +40,7 @@ export default function TopBar({
           if (!alive) return;
           setBackend(info.status === "ok" ? "up" : "down");
           setSource(info.data_source);
+          setRequested(info.requested_data_source ?? info.data_source);
         })
         .catch(() => alive && setBackend("down"));
     check();
@@ -129,6 +131,29 @@ export default function TopBar({
         {mt5?.symbol ?? "MT5"} · {status}
         {dataSource === "mock" && <span className="ml-1 text-gold/80">(demo)</span>}
       </span>
+
+      {/* D-032: unmistakable demo-data warning — mock prices are synthetic.
+       * Distinguish WHY: env-forced (DATA_SOURCE=mock) vs boot-degrade
+       * (recovery loop retries live every 60s). */}
+      {source === "mock" && (
+        <span
+          className={`rounded-full border px-2.5 py-0.5 text-xs font-semibold ${
+            requested === "live"
+              ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
+              : "border-red-500/40 bg-red-500/10 text-red-300"
+          }`}
+          title={
+            requested === "live"
+              ? "Live providers were unreachable at boot — auto-retrying every 60s (D-032)"
+              : "DATA_SOURCE=mock — synthetic demo prices. Set DATA_SOURCE=live (or remove the variable) and redeploy for REAL gold prices."
+          }
+        >
+          ⚠ DEMO DATA · synthetic prices
+          {requested === "live" && (
+            <span className="ml-1 font-normal text-amber-400/80">recovering…</span>
+          )}
+        </span>
+      )}
 
       {liveActive && (
         <span

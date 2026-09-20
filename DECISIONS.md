@@ -61,3 +61,43 @@ through the preview origin was impossible.
 current minute; browser e2e: dashboard ticker === backend price, "LIVE · Binance
 PAXG +0s" badge, ws open, zero console errors. Flat price over 40s was the quiet
 Saturday market, not staleness (backend showed the same price).
+
+## D-032 — Deployment-proof live data (mirror failover, health introspection, auto-recovery)
+
+**Context:** The user's Railway deploy (verified live) ran the LATEST code but
+served synthetic mock prices (~2715 vs real ~4362). Two causes were plausible:
+(1) the Phase-1 README had instructed `DATA_SOURCE=mock` as a Railway variable —
+Railway vars persist across deploys and override the image default (`live`),
+silently pinning the platform to demo prices; (2) boot-time provider outage
+(api.binance.com returns 451 to many datacenter/AWS egress IPs) degrades to mock
+FOREVER because the probe runs only once at boot.
+
+**Decision:**
+1. **Binance mirror chain** — all market-data calls now try
+   `data-api.binance.vision` (Binance's official public data domain, identical
+   REST shape, not subject to the 451 datacenter blocks) and fall back to
+   `api.binance.com`; the working mirror becomes sticky so healthy polls pay no
+   failover latency. Applied to MarketFeed (quotes + klines + TF fetch) and
+   ExternalMarketService (24h ticker).
+2. **Health introspection** — `/api/health` now reports
+   `requested_data_source` + `degraded` alongside `data_source`, so a remote
+   deployment is diagnosable without shell access ("mock"+requested "mock" =
+   env var forces demo; "mock"+requested "live"+degraded = boot outage).
+3. **Live-recovery loop** — when the boot probe degrades live->mock, a
+   background task re-probes every 60s and hot-swaps the platform to live the
+   moment any provider answers (disconnect -> `ConnectionManager.set_source`
+   -> reconnect rebuilds the engine runtime). A bad boot minute never pins the
+   platform to synthetic prices again.
+4. **Unmistakable UI warning** — TopBar shows a red "⚠ DEMO DATA · synthetic
+   prices" badge whenever mock runs (amber + "recovering…" when degraded),
+   with the exact fix in the tooltip.
+5. **README corrected** — Railway guide no longer sets `DATA_SOURCE=mock`;
+   pre-D-030 deployments are told to DELETE the stale variable (and to attach
+   Postgres — `"db": false` means data does not survive restarts).
+
+**Verification:** 186 backend tests green (new: mirror-failover 451 rotation +
+sticky, SourceResolution contract incl. explicit-mock vs degraded distinction;
+external test re-based on the vision domain), ruff/tsc/vite clean; live stack
+restarted — health `{data_source: live, requested: live, degraded: false}`,
+uvicorn log shows data-api.binance.vision 200s, real feed 4362.59 @ 0.2s tick
+age, browser LIVE badge + ticker 4362.58/4362.59, zero console errors.

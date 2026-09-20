@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time as time_mod
+from dataclasses import dataclass
 from typing import Any
 
 from app.config import Settings
@@ -435,6 +436,14 @@ class ConnectionManager:
     def source(self) -> DataSource:
         return self._source
 
+    def set_source(self, source: DataSource) -> None:
+        """Swap the platform data source (D-032 live-recovery hot-swap).
+
+        Call while DISCONNECTED — the next connect() rebuilds the engine
+        runtime on top of the new source (the same path MT5 reconnects use).
+        """
+        self._source = source
+
     @property
     def symbol(self) -> str | None:
         return self.state.symbol
@@ -469,18 +478,46 @@ def create_data_source(settings: Settings) -> DataSource:
     return MockDataSource()
 
 
+@dataclass(frozen=True)
+class SourceResolution:
+    """Boot-time data-source decision (D-032), fully introspectable.
+
+    `requested` is what the environment asked for (DATA_SOURCE), `effective`
+    is what actually runs. They differ ONLY when live was requested but every
+    free provider was unreachable at boot (honest degrade, D-030) — surfaced
+    via /api/health so a remote deployment is diagnosable without shell access.
+    """
+
+    source: Any
+    effective: str  # "live" | "mock" | "mt5"
+    requested: str
+    degraded: bool = False
+    reason: str = ""
+
+
 async def resolve_data_source(
     settings: Settings, http_factory: Any
-) -> tuple[DataSource, str]:
-    """Boot-time source resolution (D-030).
+) -> SourceResolution:
+    """Boot-time source resolution (D-030/D-032).
 
-    DATA_SOURCE=live probes the free provider chain ONCE (Binance PAXG ->
-    gold-api, ~4s timeouts). When every provider is unreachable the platform
-    degrades to the mock source so the dashboard still streams — the effective
-    source name is returned and reported via /api/health.
+    DATA_SOURCE=live probes the free provider chain ONCE (Binance PAXG
+    mirrors -> gold-api, ~4s timeouts). When every provider is unreachable
+    the platform degrades to the mock source so the dashboard still streams;
+    the resolution carries requested/effective/degraded for /api/health and
+    the recovery loop in main.py.
     """
     if settings.data_source != "live":
-        return create_data_source(settings), settings.data_source
+        if settings.data_source == "mock":
+            logger.warning(
+                "DATA_SOURCE=mock requested — running SYNTHETIC demo prices "
+                "(~2715 range). Set DATA_SOURCE=live (or remove the variable "
+                "to use the image default) for REAL gold prices."
+            )
+        return SourceResolution(
+            source=create_data_source(settings),
+            effective=settings.data_source,
+            requested=settings.data_source,
+        )
     from app.mt5.live_source import LiveDataSource
 
     candidate = LiveDataSource(
@@ -488,10 +525,20 @@ async def resolve_data_source(
     )
     if await candidate.quick_check():
         logger.info("live providers reachable — real-time market data ON")
-        return candidate, "live"
+        return SourceResolution(candidate, "live", "live")
     logger.warning(
-        "live providers unreachable — degrading DATA_SOURCE to mock (D-030)"
+        "live providers unreachable — degrading DATA_SOURCE to mock (D-030); "
+        "a recovery probe retries every 60s (D-032)"
     )
     from app.mt5.mock_source import MockDataSource
 
-    return MockDataSource(), "mock"
+    return SourceResolution(
+        source=MockDataSource(),
+        effective="mock",
+        requested="live",
+        degraded=True,
+        reason=(
+            "no free provider reachable at boot "
+            "(binance data-api/api mirrors + gold-api)"
+        ),
+    )
