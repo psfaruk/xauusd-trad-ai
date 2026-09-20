@@ -41,6 +41,29 @@ def _manager(request: Request):
     return request.app.state.trading
 
 
+async def _budget(request: Request, bucket: str, per_minute: int) -> bool:
+    """Tiny in-process token bucket on top of the global slowapi limit —
+    money-moving endpoints get a tight per-client budget (SPEC §13 spirit)."""
+    import time
+
+    key = getattr(request.app.state, "_trading_budgets", None)
+    if key is None:
+        key = request.app.state._trading_budgets = {}
+    now = time.monotonic()
+    window_start, count = key.get((bucket, _client_key(request)), (0.0, 0))
+    if now - window_start >= 60.0:
+        window_start, count = now, 0
+    key[(bucket, _client_key(request))] = (window_start, count + 1)
+    return count < per_minute
+
+
+def _client_key(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 @router.post("/connect")
 async def trading_connect(body: TradingConnectBody, request: Request, user: CurrentUser) -> dict:
     try:
@@ -68,6 +91,8 @@ async def trading_positions(request: Request, user: CurrentUser) -> dict:
 
 @router.post("/order")
 async def trading_order(body: ManualOrderBody, request: Request, user: CurrentUser) -> dict:
+    if not await _budget(request, "order", 30):
+        raise HTTPException(status_code=429, detail="too many order requests — slow down")
     try:
         return await _manager(request).place_manual_order(
             user["id"], body.side, body.volume, body.sl, body.tp
@@ -80,6 +105,8 @@ async def trading_order(body: ManualOrderBody, request: Request, user: CurrentUs
 
 @router.post("/positions/{ticket}/close")
 async def trading_close(ticket: int, request: Request, user: CurrentUser) -> dict:
+    if not await _budget(request, "close", 30):
+        raise HTTPException(status_code=429, detail="too many close requests — slow down")
     try:
         return await _manager(request).close_position(user["id"], ticket)
     except ValueError as exc:
@@ -99,6 +126,8 @@ async def trading_history(
 
 @router.post("/auto-trade")
 async def trading_auto_trade(body: AutoTradeBody, request: Request, user: CurrentUser) -> dict:
+    if not await _budget(request, "arm", 10):
+        raise HTTPException(status_code=429, detail="too many arm/disarm requests")
     if body.enabled and body.confirm != AUTO_TRADE_CONFIRM:
         raise HTTPException(
             status_code=400,

@@ -1,7 +1,9 @@
-"""routes_market — SPEC §7.1 market endpoints (Phase 2).
+"""routes_market — SPEC §7.1 market endpoints (Phase 2 + Phase 4 external).
 
 GET /api/candles?tf=M15&limit=500  (auth) closed-bars OHLCV backfill
 GET /api/positions                 (auth) open MT5 positions
+GET /api/market/external           (auth) free external reference data
+                                            (Binance PAXG gold, ECB FX)
 """
 
 from __future__ import annotations
@@ -76,3 +78,12 @@ async def positions(request: Request, user: CurrentUser) -> dict:
             for p in rows
         ]
     }
+
+
+@router.get("/market/external")
+async def market_external(request: Request, user: CurrentUser) -> dict:
+    """Free external reference data (user req #6) — every field fails soft."""
+    service = getattr(request.app.state, "external", None)
+    if service is None:
+        return {"ok": False, "detail": "external data not configured"}
+    return await service.snapshot()

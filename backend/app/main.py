@@ -21,10 +21,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import JSONResponse
 
 from app.api import (
     routes_config,
@@ -42,11 +46,24 @@ from app.db import apply_schema, is_postgres_url, make_engine, promote_admins
 from app.engine.config import ConfigRepo
 from app.engine.repo import SignalRepo
 from app.mt5.connection import ConnectionManager, create_data_source
+from app.services.external import ExternalMarketService
 from app.services.news import NewsService, NullNewsService
 from app.services.ws_hub import WSHub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("xauusd")
+
+
+def _client_key(request: Request) -> str:
+    """Rate-limit key: real client IP behind the Railway/proxy layer."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+# SPEC §13: slowapi rate limits on auth-bearing REST routes.
+limiter = Limiter(key_func=_client_key, default_limits=["240/minute"])
 
 
 @asynccontextmanager
@@ -73,6 +90,11 @@ async def lifespan(app: FastAPI):
 
     # --- Shared httpx client (Supabase auth checks; external APIs)
     app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+
+    # --- Free external reference data (user req #6): Binance PAXG + ECB FX
+    app.state.external = ExternalMarketService(
+        http_factory=lambda: _get_http(app)
+    )
 
     # --- Services: WS hub, news, repos, connection manager + engine runtime
     app.state.hub = WSHub()
@@ -169,6 +191,14 @@ app = FastAPI(
     version=get_settings().app_version,
     lifespan=lifespan,
 )
+
+# SPEC §13 — rate limiting (default 240/min per client IP on REST routes)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, lambda req, exc: JSONResponse(
+    status_code=429,
+    content={"detail": f"rate limit exceeded: {exc.detail}"},
+))
+app.add_middleware(SlowAPIMiddleware)
 
 _settings = get_settings()
 app.add_middleware(
