@@ -37,7 +37,7 @@ def _m15(n=300, start="2025-01-06 07:00"):
 class TestResample:
     def test_m15_to_h1(self):
         df = _m15(8)  # exactly 2 hours
-        h1 = resample_ohlc(df, 60)
+        h1 = resample_ohlc(df, 60, src_min=15)
         assert len(h1) == 2
         first = h1.iloc[0]
         assert first["o"] == df.iloc[0]["o"]
@@ -48,7 +48,7 @@ class TestResample:
 
     def test_drops_incomplete_bucket(self):
         df = _m15(6)  # 1.5 hours -> only 1 full H1 bucket
-        h1 = resample_ohlc(df, 60)
+        h1 = resample_ohlc(df, 60, src_min=15)
         assert len(h1) == 1
 
 
@@ -116,7 +116,7 @@ class TestSimTracker:
 
 class TestRunBacktest:
     def test_deterministic(self):
-        df = load_mock_history(1500, seed=42)
+        df = load_mock_history(5000, seed=42)
         r1 = run_backtest(df)
         r2 = run_backtest(df.copy())
         s1, s2 = r1.stats(), r2.stats()
@@ -124,8 +124,8 @@ class TestRunBacktest:
         assert [s.ts for s in r1.signals] == [s.ts for s in r2.signals]
 
     def test_injected_series_produces_signals(self):
-        df = load_mock_history(2000, seed=42)
-        df = inject_sweep_series(df, every_bars=120)
+        df = load_mock_history(7000, seed=42)
+        df = inject_sweep_series(df, every_bars=200)
         res = run_backtest(df)
         assert res.stats()["total_signals"] > 0
         # every signal carries sane levels
@@ -139,17 +139,17 @@ class TestRunBacktest:
 
     def test_no_lookahead_h1_context(self):
         """A signal's H1 trend must only use bars closed BEFORE the sweep."""
-        df = inject_sweep_series(load_mock_history(2000, seed=42), every_bars=150)
+        df = inject_sweep_series(load_mock_history(7000, seed=42), every_bars=150)
         res = run_backtest(df)
         from app.engine.engine import closed_h1_asof
 
-        h1 = resample_ohlc(df, 60)
+        h1 = resample_ohlc(df, 60, src_min=15)
         for s in res.signals[:5]:
-            asof = closed_h1_asof(h1, s.ts + pd.Timedelta(minutes=15))
+            asof = closed_h1_asof(h1, s.ts + pd.Timedelta(minutes=1))
             assert len(asof) > 0
             # the last H1 bar closed at/before the sweep bar's close
             last_h1_close = (asof["time_utc"] + pd.Timedelta(hours=1)).iloc[-1]
-            assert last_h1_close <= s.ts + pd.Timedelta(minutes=15)
+            assert last_h1_close <= s.ts + pd.Timedelta(minutes=1)
 
 
 class TestStats:

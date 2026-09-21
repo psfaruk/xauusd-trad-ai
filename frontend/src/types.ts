@@ -55,6 +55,8 @@ export interface SignalTrace {
   direction: SignalDirection | null;
   checks: TraceCheck[];
   params: Record<string, unknown>;
+  /** D-041 — which pattern fired: "sfp" (liquidity sweep) | "pullback". */
+  trigger?: "sfp" | "pullback" | string;
 }
 
 export interface Signal {
@@ -188,6 +190,10 @@ export interface SessionRule {
 export interface EngineConfig {
   timeframe: string;
   trend_tf: string;
+  /** D-041 MTF confirmation timeframes (e.g. ["M5", "M15"]). */
+  confirm_tfs?: string[];
+  /** D-041 how many confirm TFs must agree with the trend. */
+  min_tf_agree?: number;
   ema_fast: number;
   ema_slow: number;
   trend_ema: number;
@@ -201,9 +207,17 @@ export interface EngineConfig {
   sfp_lookback: number;
   sfp_wick_atr_ratio: number;
   sl_buffer_atr: number;
+  /** D-041 — SL at least this many ATRs from entry (spread/noise floor). */
+  min_sl_atr?: number;
+  /** D-041 — skip when spread exceeds this fraction of the SL distance. */
+  max_spread_to_risk?: number;
   rr: number;
   expiry_bars: number;
   cooldown_bars: number;
+  /** D-041 pullback trigger. */
+  pullback_enabled?: boolean;
+  pullback_min_range_atr?: number;
+  pullback_wick_ratio?: number;
   sessions: SessionRule[];
   news_blackout_min: number;
   max_spread_points: number;

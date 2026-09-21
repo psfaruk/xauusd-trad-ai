@@ -120,9 +120,15 @@ class TestLevels:
         trace.direction = "BUY"
         sig = detect_sfp(buy_sweep_frame(), CFG, trace)
         entry, sl, tp = build_levels(sig, CFG)
-        assert sl == pytest.approx(sig.sweep_extreme - CFG.sl_buffer_atr * sig.atr, abs=1e-6)
+        # D-041: SL is the FARTHER of (sweep - buffer, entry - min_sl_atr)
+        expected = min(
+            sig.sweep_extreme - CFG.sl_buffer_atr * sig.atr,
+            entry - CFG.min_sl_atr * sig.atr,
+        )
+        assert sl == pytest.approx(expected, abs=1e-6)
         risk = entry - sl
         assert risk > 0
+        assert risk >= CFG.min_sl_atr * sig.atr - 1e-6
         assert tp == pytest.approx(entry + CFG.rr * risk, abs=1e-6)
 
     def test_sell_sl_tp_math(self):
@@ -136,10 +142,24 @@ class TestLevels:
         sig = detect_sfp(df, CFG, trace)
         assert sig is not None
         entry, sl, tp = build_levels(sig, CFG)
-        assert sl == pytest.approx(sig.sweep_extreme + CFG.sl_buffer_atr * sig.atr, abs=1e-6)
+        expected = max(
+            sig.sweep_extreme + CFG.sl_buffer_atr * sig.atr,
+            entry + CFG.min_sl_atr * sig.atr,
+        )
+        assert sl == pytest.approx(expected, abs=1e-6)
         risk = sl - entry
         assert risk > 0
+        assert risk >= CFG.min_sl_atr * sig.atr - 1e-6
         assert tp == pytest.approx(entry - CFG.rr * risk, abs=1e-6)
+
+    def test_min_sl_floor_widens_tight_stops(self):
+        """A shallow sweep must still stop at least min_sl_atr*ATR away —
+        the spread/noise floor that keeps M1 stops tradeable (D-041)."""
+        from app.engine.sfp import SfpSignal
+
+        sig = SfpSignal("BUY", 100.0, 99.9, 99.95, 0.1, 0.05, 2.0)
+        entry, sl, tp = build_levels(sig, CFG)
+        assert entry - sl >= CFG.min_sl_atr * 2.0 - 1e-9
 
 
 class TestQuality:
@@ -152,7 +172,7 @@ class TestQuality:
     def test_at_double_threshold_full(self):
         from app.engine.sfp import SfpSignal
 
-        sig = SfpSignal("BUY", 100, 98, 99, 0.6, 0.6, 1.0)
+        sig = SfpSignal("BUY", 100, 98, 99, 0.9, 0.9, 1.0)
         assert sfp_quality(sig, CFG) == pytest.approx(1.0)
 
     def test_clamped_above(self):

@@ -60,12 +60,13 @@ async def _trend_direction(src, symbol):
 
 class TestEngineE2E:
     async def test_injected_sweep_emits_signal_with_full_trace(self):
-        """The Phase 3 headline AC — happy path through the REAL engine.
+        """The Phase 3 headline AC (D-041: on the M1 engine) — happy path
+        through the REAL engine.
 
-        Injects a trend-aligned sweep at successive buckets until one clears
-        every filter (random-walk RSI/session can legitimately block crafted
-        sweeps — the retry keeps the test deterministic without weakening the
-        default config).
+        Injects a trend-aligned M1 sweep at successive buckets until one clears
+        every filter (random-walk RSI/session/MTF can legitimately block
+        crafted sweeps — the retry keeps the test deterministic without
+        weakening the default config).
         """
         src = make_mock(seed=7)
         await src.connect({"server": "s", "login": "1", "password": "x"})
@@ -74,11 +75,8 @@ class TestEngineE2E:
         # so injected buckets close inside the london window.
         src.advance_minutes(10 * 60)
 
-        from app.mt5.mock_source import SweepScenario
-
-        m15 = await src.get_rates(symbol, "M15", 200)
-        h1_full = await src.get_rates(symbol, "H1", 100)
         from app.engine.indicators import ema
+        from app.mt5.mock_source import SweepScenario
 
         hub = EventHub()
         repo = SignalRepo(None)
@@ -86,53 +84,66 @@ class TestEngineE2E:
         tracker = SignalTracker()
 
         fired = None
-        last_trace = None
-        for _attempt in range(12):
+        direction = None
+        for _attempt in range(10):
+            h1_full = await src.get_rates(symbol, "H1", 100)
             direction = (
                 "BUY"
                 if float(h1_full["c"].iloc[-1]) > float(ema(h1_full["c"], 50).iloc[-1])
                 else "SELL"
             )
             scenario = src.inject_sweep(
-                SweepScenario(direction=direction, tf="M15")
+                SweepScenario(direction=direction, tf="M1")
             )
-            bucket_end = scenario.bucket_time + timedelta(minutes=15)
+            bucket_end = scenario.bucket_time + timedelta(minutes=1)
             now = src._vnow()
+            # advance EXACTLY to the bucket close: on M1 an extra minute would
+            # close the NEXT bar too and the sweep would no longer be last
             src.advance_minutes(
-                max(0.0, (bucket_end - now).total_seconds() / 60 + 1)
+                max(0.0, (bucket_end - now).total_seconds() / 60)
             )
-            m15 = await src.get_rates(symbol, "M15", 200)
-            assert m15["time_utc"].iloc[-1] == scenario.bucket_time
+            m1 = await src.get_rates(symbol, "M1", 200)
+            assert m1["time_utc"].iloc[-1] == scenario.bucket_time
             await engine.on_bar_close(
-                "M15", closed_bar_of(m15), src, tracker, symbol
+                "M1", closed_bar_of(m1), src, tracker, symbol
             )
             signals = await repo.list()
             if signals:
                 fired = signals[0]
                 break
-            h1_full = await src.get_rates(symbol, "H1", 100)
+            # let the random walk RECOVER (the crafted sweep drags M1 RSI deep
+            # below the buy window; without recovery every later sweep inherits
+            # the depressed RSI and can never pass)
+            src.advance_minutes(25)
+            # the frame cache is wall-clock TTL'd; the mock's virtual clock
+            # runs faster than real time, so drop it explicitly between attempts
+            engine.invalidate_frames()
 
         assert fired is not None, (
-            f"no injected sweep cleared all filters in 12 attempts; last trace: {last_trace}"
+            "no injected M1 sweep cleared all filters in 30 attempts"
         )
         sig = fired
         assert sig["direction"] == direction
         assert sig["status"] == "active"
-        # complete 7-check trace
+        assert sig["tf"] == "M1"
+        # complete D-041 trace: trend + MTF + trigger + filters + risk gates
         names = [c["name"] for c in sig["trace"]["checks"]]
         for expected in (
-            "trend_h1", "sfp_sweep", "rsi", "atr", "session", "news", "spread",
+            "trend_h1", "mtf_m5", "mtf_m15", "sfp_sweep", "rsi", "atr",
+            "session", "news", "spread", "spread_risk",
         ):
             assert expected in names, f"missing check {expected}: {names}"
         assert all(c["pass"] for c in sig["trace"]["checks"])
-        # levels math per §8.2
+        # levels math per §8.2 + D-041 floor
         if sig["direction"] == "BUY":
             assert sig["sl"] < sig["entry"] < sig["tp"]
         else:
             assert sig["sl"] > sig["entry"] > sig["tp"]
         risk = abs(sig["entry"] - sig["sl"])
-        assert abs(abs(sig["tp"] - sig["entry"]) - 2.0 * risk) < 0.02
+        cfg = EngineConfig()
+        assert abs(abs(sig["tp"] - sig["entry"]) - cfg.rr * risk) < 0.02
         assert 0.0 < sig["confidence"] <= 1.0
+        assert sig["trace"]["trigger"] in ("sfp", "pullback")
         # WS signal event broadcast
         assert any(t == "signal" for t, _ in hub.events)
         # tracker holds it active
@@ -148,16 +159,16 @@ class TestEngineE2E:
 
         from app.mt5.mock_source import SweepScenario
 
-        scenario = src.inject_sweep(SweepScenario(direction=direction, tf="M15"))
+        scenario = src.inject_sweep(SweepScenario(direction=direction, tf="M1"))
         # DO NOT advance the clock: bucket still forming (last closed bar < it)
-        m15 = await src.get_rates(symbol, "M15", 200)
-        assert m15["time_utc"].iloc[-1] < scenario.bucket_time
+        m1 = await src.get_rates(symbol, "M1", 200)
+        assert m1["time_utc"].iloc[-1] < scenario.bucket_time
 
         hub = EventHub()
         repo = SignalRepo(None)
         engine = SignalEngine(EngineConfig(), hub, repo)
         tracker = SignalTracker()
-        await engine.on_bar_close("M15", closed_bar_of(m15), src, tracker, symbol)
+        await engine.on_bar_close("M1", closed_bar_of(m1), src, tracker, symbol)
 
         assert await repo.list() == []
         assert not tracker.has_active()
@@ -170,11 +181,11 @@ class TestEngineE2E:
 
         from app.mt5.mock_source import SweepScenario
 
-        src.inject_sweep(SweepScenario(direction=direction, tf="M15", offset_bars=1))
-        src.inject_sweep(SweepScenario(direction=direction, tf="M15", offset_bars=4))
-        src.advance_minutes(4 * 15 + 1)
+        src.inject_sweep(SweepScenario(direction=direction, tf="M1", offset_bars=1))
+        src.inject_sweep(SweepScenario(direction=direction, tf="M1", offset_bars=4))
+        src.advance_minutes(4 * 1 + 1)
 
-        m15 = await src.get_rates(symbol, "M15", 200)
+        m1 = await src.get_rates(symbol, "M1", 200)
         hub = EventHub()
         repo = SignalRepo(None)
         engine = SignalEngine(EngineConfig(), hub, repo)
@@ -182,13 +193,13 @@ class TestEngineE2E:
 
         # replay both closed bars
         for i in (-2, -1):
-            r = m15.iloc[i]
+            r = m1.iloc[i]
             bar = {
                 "t": int(r["time_utc"].timestamp()),
                 "o": float(r["o"]), "h": float(r["h"]),
                 "l": float(r["l"]), "c": float(r["c"]), "v": int(r["v"]),
             }
-            await engine.on_bar_close("M15", bar, src, tracker, symbol)
+            await engine.on_bar_close("M1", bar, src, tracker, symbol)
 
         # first sweep may have fired OR been filtered (session etc.), but a
         # second one within cooldown_bars must NEVER fire while one is active
@@ -286,48 +297,109 @@ class TestEvaluatePure:
     """The shared pipeline used by BOTH the live engine and the backtest."""
 
     def _frames(self, hour_shift=0):
-        """60 oscillating bars + a clean BUY sweep; H1 uptrend.
+        """60 oscillating M1 bars + a clean BUY sweep; H1/M5/M15 uptrend.
 
         Closes alternate 100.2/99.8 so RSI(14) lands mid-window (~50), and
-        the sweep bar closes at 17:15 UTC (newyork session).
+        the sweep bar closes at 16:01 UTC (newyork session).
         """
-        base = pd.Timestamp("2025-01-06 02:00", tz="UTC") + pd.Timedelta(hours=hour_shift)
+        base = pd.Timestamp("2025-01-06 15:00", tz="UTC") + pd.Timedelta(hours=hour_shift)
         rows = []
         prev_c = 100.0
         for i in range(60):
-            t = base + pd.Timedelta(minutes=15 * i)
+            t = base + pd.Timedelta(minutes=i)
             c = 100.2 if i % 2 == 0 else 99.8
             o = prev_c
             rows.append([t, o, max(o, c) + 0.4, min(o, c) - 0.4, c, 10])
             prev_c = c
-        t = base + pd.Timedelta(minutes=15 * 60)
+        t = base + pd.Timedelta(minutes=60)
         rows.append([t, 99.8, 100.8, 98.6, 100.4, 30])  # sweep: low 98.6 < prior min 99.4
-        m15 = pd.DataFrame(rows, columns=["time_utc", "o", "h", "l", "c", "v"])
-        h1_rows = [
-            [pd.Timestamp("2025-01-06 02:00", tz="UTC") + pd.Timedelta(hours=i),
-             90.0 + i, 91.0 + i, 89.0 + i, 90.5 + i, 50]
-            for i in range(60)
-        ]
-        h1 = pd.DataFrame(h1_rows, columns=["time_utc", "o", "h", "l", "c", "v"])
-        return m15, h1
+        m1 = pd.DataFrame(rows, columns=["time_utc", "o", "h", "l", "c", "v"])
+
+        def trend_frame(tf_min: int):
+            t_rows = [
+                [
+                    pd.Timestamp("2025-01-06 15:00", tz="UTC")
+                    - pd.Timedelta(minutes=tf_min * 60)
+                    + pd.Timedelta(minutes=tf_min * i),
+                    90.0 + i, 91.0 + i, 89.0 + i, 90.5 + i, 50,
+                ]
+                for i in range(60)
+            ]
+            return pd.DataFrame(t_rows, columns=["time_utc", "o", "h", "l", "c", "v"])
+
+        return m1, {tf: trend_frame(m) for tf, m in (("H1", 60), ("M15", 15), ("M5", 5))}
 
     def test_full_pass_emits_signal(self):
-        m15, h1 = self._frames()
-        close_time = m15["time_utc"].iloc[-1] + pd.Timedelta(minutes=15)
-        ev = evaluate(m15, h1, close_time, EngineConfig(), spread_points=20)
+        m1, htf = self._frames()
+        close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
+        ev = evaluate(m1, htf, close_time, EngineConfig(), spread_points=20)
         assert ev.signal is not None, ev.trace
         assert ev.signal["direction"] == "BUY"
+        assert ev.signal["trigger"] == "sfp"
+        assert ev.signal["trace"]["trigger"] == "sfp"
 
     def test_spread_blocks(self):
-        m15, h1 = self._frames()
-        close_time = m15["time_utc"].iloc[-1] + pd.Timedelta(minutes=15)
-        ev = evaluate(m15, h1, close_time, EngineConfig(), spread_points=99)
+        m1, htf = self._frames()
+        close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
+        ev = evaluate(m1, htf, close_time, EngineConfig(), spread_points=99)
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "spread"
 
+    def test_spread_vs_risk_blocks_tight_stops(self):
+        """D-041: a tight stop (huge spread/risk ratio) is structurally
+        unprofitable — the engine must refuse it (near-miss)."""
+        # small-ATR tape (range ~0.3 -> ATR ~0.3) with a shallow sweep: the
+        # min-SL floor keeps risk at ~1.8*ATR = 0.54, so a 0.30 spread is
+        # > 50% of the risk -> structurally unprofitable, must be refused
+        base = pd.Timestamp("2025-01-06 15:00", tz="UTC")
+        rows = []
+        prev_c = 100.0
+        for i in range(60):
+            t = base + pd.Timedelta(minutes=i)
+            c = 100.05 if i % 2 == 0 else 99.95
+            o = prev_c
+            rows.append([t, o, max(o, c) + 0.10, min(o, c) - 0.10, c, 10])
+            prev_c = c
+        # sweep bar: dips under the prior min low (~99.85), closes back above
+        rows.append([base + pd.Timedelta(minutes=60), 100.0, 100.15, 99.78, 100.05, 30])
+        m1 = pd.DataFrame(rows, columns=["time_utc", "o", "h", "l", "c", "v"])
+
+        def trend_frame(tf_min: int):
+            t_rows = [
+                [
+                    base - pd.Timedelta(minutes=tf_min * 60) + pd.Timedelta(minutes=tf_min * i),
+                    90.0 + i, 91.0 + i, 89.0 + i, 90.5 + i, 50,
+                ]
+                for i in range(60)
+            ]
+            return pd.DataFrame(t_rows, columns=["time_utc", "o", "h", "l", "c", "v"])
+
+        htf = {tf: trend_frame(m) for tf, m in (("H1", 60), ("M15", 15), ("M5", 5))}
+        close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
+        # 30 points passes the absolute cap (35) but the risk is only ~0.54
+        ev = evaluate(m1, htf, close_time, EngineConfig(), spread_points=30, point_size=0.01)
+        assert ev.signal is None
+        assert ev.trace["checks"][-1]["name"] == "spread_risk"
+        # and the SAME tape trades fine when the spread is small
+        ev_ok = evaluate(m1, htf, close_time, EngineConfig(), spread_points=10, point_size=0.01)
+        assert ev_ok.signal is not None, ev_ok.trace
+
+    def test_mtf_conflict_blocks(self):
+        m1, htf = self._frames()
+        close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
+        # both confirms fight the H1 trend -> min_tf_agree=1 fails
+        down = htf["H1"].copy()
+        for col in ("o", "h", "l", "c"):
+            down[col] = 300.0 - down[col]
+        htf_bad = {"H1": htf["H1"], "M5": down, "M15": down}
+        ev = evaluate(m1, htf_bad, close_time, EngineConfig(), spread_points=20)
+        assert ev.signal is None
+        assert ev.trace["checks"][-1]["name"] == "mtf_m15"
+
     def test_off_session_blocks(self):
-        m15, h1 = self._frames(hour_shift=12)  # sweep closes 05:15 UTC — off-session
-        close_time = m15["time_utc"].iloc[-1] + pd.Timedelta(minutes=15)
-        ev = evaluate(m15, h1, close_time, EngineConfig(), spread_points=20)
+        # base 01:00 UTC -> the sweep closes 02:01 UTC — off-session
+        m1, htf = self._frames(hour_shift=-14)
+        close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
+        ev = evaluate(m1, htf, close_time, EngineConfig(), spread_points=20)
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "session"

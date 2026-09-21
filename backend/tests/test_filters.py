@@ -10,12 +10,14 @@ import pytest
 from app.engine.config import EngineConfig, SessionRule
 from app.engine.filters import (
     W_ATR,
+    W_MTF,
     W_RSI,
     W_SESSION,
-    W_SFP,
     W_TREND,
+    W_TRIGGER,
     atr_strength,
     check_atr,
+    check_mtf,
     check_rsi,
     check_session,
     check_spread,
@@ -148,7 +150,10 @@ class TestSpread:
 
 class TestConfidenceParts:
     def test_weights_sum_to_one(self):
-        assert W_TREND + W_SFP + W_RSI + W_SESSION + W_ATR == pytest.approx(1.0)
+        assert (
+            W_TREND + W_MTF + W_TRIGGER + W_RSI + W_SESSION + W_ATR
+            == pytest.approx(1.0)
+        )
 
     def test_rsi_position_centered_full(self):
         assert rsi_position(52.5, CFG, "BUY") == pytest.approx(1.0)  # mid of 40-65
@@ -157,7 +162,27 @@ class TestConfidenceParts:
         assert rsi_position(40.0, CFG, "BUY") == pytest.approx(0.0)
 
     def test_atr_strength_double_full(self):
-        assert atr_strength(1.6, CFG) == pytest.approx(1.0)  # 2x min_atr
+        assert atr_strength(0.3, CFG) == pytest.approx(1.0)  # 2x min_atr (0.15)
 
     def test_atr_strength_below_min_zero(self):
-        assert atr_strength(0.4, CFG) == pytest.approx(0.25)
+        assert atr_strength(0.075, CFG) == pytest.approx(0.25)
+
+
+class TestMtfConfirm:
+    def test_both_agree(self):
+        up = frame([100 + i for i in range(60)])
+        trace = Trace()
+        trace.direction = "BUY"
+        assert check_mtf({"M5": up, "M15": up}, "BUY", CFG, trace) == 2
+
+    def test_conflict_reduces_agreement(self):
+        up = frame([100 + i for i in range(60)])
+        down = frame([160 - i for i in range(60)])
+        trace = Trace()
+        agreed = check_mtf({"M5": up, "M15": down}, "BUY", CFG, trace)
+        assert agreed == 1
+
+    def test_insufficient_history_counts_against(self):
+        short = frame([100.0] * 10)
+        trace = Trace()
+        assert check_mtf({"M5": short, "M15": short}, "SELL", CFG, trace) == 0

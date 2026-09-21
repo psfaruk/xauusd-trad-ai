@@ -11,7 +11,7 @@ import json
 import logging
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.mt5.base import validate_tf
 
@@ -45,12 +45,27 @@ class SessionRule(BaseModel):
 
 
 class EngineConfig(BaseModel):
-    """Strategy parameters (SPEC §8.6 defaults)."""
+    """Strategy parameters (SPEC §8.6 defaults, D-041 M1 rework).
+
+    D-041: the engine now trades the M1 timeframe with multi-timeframe
+    confirmation — H1 sets the trend, M5+M15 must agree (mtf_align), and the
+    trigger is a REAL M1 pattern (liquidity-sweep SFP or an EMA pullback
+    rejection candle). Old M15-only defaults are upgraded automatically by
+    ConfigRepo.load (see _LEGACY_UPGRADE).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    timeframe: str = "M15"
-    trend_tf: str = "H1"
+    timeframe: str = "M1"     # trigger timeframe (D-041)
+    trend_tf: str = "H1"      # major trend timeframe
+    confirm_tfs: list[str] = Field(
+        default_factory=lambda: ["M5", "M15"],
+        description="MTF confirmation timeframes — each must be > timeframe",
+    )
+    min_tf_agree: int = Field(
+        2, ge=0,
+        description="how many confirm TFs must agree with the H1 trend (hard gate)",
+    )
     ema_fast: int = Field(20, ge=1)
     ema_slow: int = Field(50, ge=1)
     trend_ema: int = Field(50, ge=1)
@@ -60,13 +75,24 @@ class EngineConfig(BaseModel):
     rsi_sell_min: float = Field(35.0, ge=0, le=100)
     rsi_sell_max: float = Field(60.0, ge=0, le=100)
     atr_period: int = Field(14, ge=1)
-    min_atr: float = Field(0.8, ge=0)
+    min_atr: float = Field(0.15, ge=0)   # M1 ATR floor (D-041 — was 0.8 on M15)
     sfp_lookback: int = Field(20, ge=2)
-    sfp_wick_atr_ratio: float = Field(0.3, gt=0)
+    sfp_wick_atr_ratio: float = Field(0.45, gt=0)
     sl_buffer_atr: float = Field(0.2, ge=0)
-    rr: float = Field(2.0, gt=0)
-    expiry_bars: int = Field(20, ge=1)
-    cooldown_bars: int = Field(3, ge=0)
+    rr: float = Field(0.9, gt=0)         # D-041 backtest-tuned (real 22pt spread)
+    expiry_bars: int = Field(14, ge=1)  # 14 M1 bars = 14 minutes
+    cooldown_bars: int = Field(8, ge=0)
+    # -------------------------------------------------- D-041 pullback trigger
+    pullback_enabled: bool = True
+    pullback_min_range_atr: float = Field(0.35, gt=0,
+        description="min trigger-bar range as a fraction of ATR (doji filter)")
+    pullback_wick_ratio: float = Field(0.55, gt=0,
+        description="min rejection wick as a fraction of the bar range")
+    # -------------------------------------------------- D-041 risk geometry
+    min_sl_atr: float = Field(1.8, ge=0,
+        description="SL at least this many ATRs from entry (spread/noise floor)")
+    max_spread_to_risk: float = Field(0.5, gt=0,
+        description="skip when spread > this fraction of the SL distance")
     sessions: list[SessionRule] = Field(
         default_factory=lambda: [
             SessionRule(name="london", utc=(7, 16)),
@@ -88,6 +114,35 @@ class EngineConfig(BaseModel):
         validate_tf(v)
         return v
 
+    @field_validator("confirm_tfs")
+    @classmethod
+    def _confirm_tfs(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("confirm_tfs may not be empty (set min_tf_agree=0 to disable)")
+        seen: list[str] = []
+        for tf in v:
+            validate_tf(tf)
+            if tf in seen:
+                raise ValueError(f"duplicate confirm tf: {tf}")
+            seen.append(tf)
+        return seen
+
+    @model_validator(mode="after")
+    def _tf_order(self) -> EngineConfig:
+        from app.mt5.base import TIMEFRAME_MINUTES
+
+        base = TIMEFRAME_MINUTES[self.timeframe]
+        if TIMEFRAME_MINUTES[self.trend_tf] <= base:
+            raise ValueError("trend_tf must be greater than timeframe")
+        for tf in self.confirm_tfs:
+            if TIMEFRAME_MINUTES[tf] <= base:
+                raise ValueError(f"confirm tf {tf} must be greater than timeframe")
+            if TIMEFRAME_MINUTES[tf] >= TIMEFRAME_MINUTES[self.trend_tf]:
+                raise ValueError(f"confirm tf {tf} must be below trend_tf {self.trend_tf}")
+        if self.min_tf_agree > len(self.confirm_tfs):
+            raise ValueError("min_tf_agree can never be satisfied")
+        return self
+
     @field_validator("sessions")
     @classmethod
     def _sessions(cls, v: list[SessionRule]) -> list[SessionRule]:
@@ -101,6 +156,40 @@ class EngineConfig(BaseModel):
             if s.contains(hour_utc):
                 return s.name
         return None
+
+
+# D-041 — fields the auto-upgrade overrides when it meets a legacy M15 row
+# stored before the M1 rework (no `confirm_tfs` key). Risk/session fields the
+# user may have customized are PRESERVED; only the strategy block is moved to
+# the new defaults.
+_LEGACY_STRATEGY_DEFAULTS = {
+    "timeframe": "M1",
+    "confirm_tfs": ["M5", "M15"],
+    "min_tf_agree": 2,
+    "min_atr": 0.15,
+    "sfp_wick_atr_ratio": 0.45,
+    "rr": 0.9,
+    "expiry_bars": 14,
+    "cooldown_bars": 8,
+    "pullback_enabled": True,
+    "pullback_min_range_atr": 0.35,
+    "pullback_wick_ratio": 0.55,
+    "min_sl_atr": 1.8,
+    "max_spread_to_risk": 0.5,
+}
+
+
+def upgrade_legacy_payload(raw: dict) -> tuple[dict, bool]:
+    """Upgrade a pre-D-041 stored config to the M1 engine (one-time).
+
+    Returns (upgraded_payload, changed). Unchanged when `confirm_tfs` is
+    already present (current schema) — nothing to do.
+    """
+    if not isinstance(raw, dict) or "confirm_tfs" in raw:
+        return raw, False
+    out = dict(raw)
+    out.update(_LEGACY_STRATEGY_DEFAULTS)
+    return out, True
 
 
 DEFAULT_CONFIG = EngineConfig()
@@ -132,7 +221,12 @@ class ConfigRepo:
                 # schema.sql seeds it; if missing (fresh DB without seed) insert defaults
                 await self.save(db_engine, self._mem_config, self._mem_auto_trade)
                 return self._mem_config, self._mem_auto_trade
-            cfg = EngineConfig.model_validate(json.loads(row[0]))
+            raw = json.loads(row[0])
+            raw, upgraded = upgrade_legacy_payload(raw)
+            cfg = EngineConfig.model_validate(raw)
+            if upgraded:
+                logger.info("engine config upgraded to the D-041 M1 strategy — persisting")
+                await self.save(db_engine, cfg, bool(row[1]))
             self._mem_config, self._mem_auto_trade = cfg, bool(row[1])
             return cfg, bool(row[1])
         except Exception as exc:  # noqa: BLE001 — degrade, never crash (C6)

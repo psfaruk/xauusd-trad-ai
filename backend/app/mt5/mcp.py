@@ -16,8 +16,10 @@ Config:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import UTC
@@ -26,6 +28,22 @@ from typing import Any
 DEFAULT_URL = "http://127.0.0.1:22346/mcp"
 DEFAULT_KEY_FILE = "/home/z/mt5stack/mcp_key.txt"
 _TIMEOUT = 60  # order ops can take a few seconds; info ops are fast
+
+log = logging.getLogger("xauusd.mcp")
+
+#: D-041 — read-only tools that are safe to retry once on a transport error
+#: (a gateway blip must not flip the platform to "disconnected"). Order
+#: tools are deliberately absent: a duplicate order is worse than a miss.
+_IDEMPOTENT_TOOLS = frozenset(
+    {
+        "get_trading_account_info",
+        "get_trading_open_positions",
+        "get_trading_history_positions",
+        "get_marketwatch_symbols",
+        "get_chart_ticks_history",
+        "get_chart_history",
+    }
+)
 
 #: D-040 — honest hint when the terminal refuses trading tools. The native
 #: MT5 MCP gates trade tools on BOTH the terminal AutoTrading button AND
@@ -110,6 +128,24 @@ class MT5TerminalClient:
 
     def _call(self, name: str, arguments: dict[str, Any] | None = None,
               timeout: int = _TIMEOUT) -> Any:
+        # D-041 — idempotent read tools get ONE transport-level retry (fresh
+        # session + short pause). The public bridge sits behind a gateway that
+        # can blip for a second; a single retry absorbs that without flipping
+        # the whole platform to "disconnected". Order tools never retry.
+        idempotent = name in _IDEMPOTENT_TOOLS
+        try:
+            return self._call_once(name, arguments, timeout)
+        except MCPError as first:
+            if not idempotent:
+                raise
+            log.warning("MCP %s failed (%s) — one retry", name, first)
+            time.sleep(1.0)
+            with self._lock:
+                self._session = None
+            return self._call_once(name, arguments, timeout)
+
+    def _call_once(self, name: str, arguments: dict[str, Any] | None,
+                   timeout: int) -> Any:
         with self._lock:
             if self._session is None:
                 self._connect_locked()

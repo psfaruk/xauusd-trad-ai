@@ -1,15 +1,20 @@
-"""SignalEngine (SPEC §8.5) — bar-close driven SFP evaluation.
+"""SignalEngine (SPEC §8.5, D-041 M1 rework) — bar-close driven evaluation.
 
 The pure pipeline `evaluate()` is shared by the live engine AND the backtest
 runner so both paths apply exactly the same rules (single source of truth).
 The live engine additionally runs the async news check, handles cooldown /
 active-state, persistence and WS broadcasts.
+
+D-041 pipeline (base TF = M1 by default):
+    H1 trend -> MTF align (M5, M15) -> trigger (SFP sweep | pullback
+    rejection candle) -> RSI -> ATR -> session -> news -> spread -> levels.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time as time_mod
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -19,22 +24,38 @@ import pandas as pd
 from app.engine.config import EngineConfig
 from app.engine.filters import (
     W_ATR,
+    W_MTF,
     W_RSI,
     W_SESSION,
-    W_SFP,
     W_TREND,
+    W_TRIGGER,
     atr_strength,
     check_atr,
+    check_mtf,
     check_rsi,
     check_session,
     check_trend,
     rsi_position,
 )
-from app.engine.sfp import build_levels, detect_sfp, sfp_quality
+from app.engine.sfp import (
+    PullbackSignal,
+    SfpSignal,
+    build_levels,
+    build_levels_pullback,
+    detect_pullback,
+    detect_sfp,
+    pullback_quality,
+    sfp_quality,
+)
 from app.engine.trace import Trace
 from app.mt5.base import TIMEFRAME_MINUTES
 
 logger = logging.getLogger("xauusd.engine")
+
+# D-041 — confirm/trend frames change at most once per their own bar close;
+# a 30s engine-side TTL cache cuts bridge traffic ~20x at 60 M1 closes/hour
+# while staying strictly fresher than the shortest confirm TF (M5 = 300s).
+HTF_CACHE_TTL_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -53,24 +74,41 @@ class NewsState:
 class Evaluation:
     signal: dict | None  # full signal payload (None when no signal)
     trace: dict
-    near_miss: bool  # trend+sfp passed but a later filter failed
+    near_miss: bool  # trend+mtf+trigger passed but a later filter failed
+
+
+def closed_asof(df: pd.DataFrame, tf: str, close_time: datetime) -> pd.DataFrame:
+    """Bars of `tf` fully closed at/before `close_time` (no lookahead)."""
+    tf_min = TIMEFRAME_MINUTES[tf]
+    cutoff = pd.Timestamp(close_time)
+    close_col = df["time_utc"] + pd.Timedelta(minutes=tf_min)
+    return df[close_col <= cutoff].reset_index(drop=True)
+
+
+def closed_h1_asof(h1: pd.DataFrame, close_time: datetime) -> pd.DataFrame:
+    """Pre-D-041 signature kept as a thin wrapper (H1 hardcoded)."""
+    return closed_asof(h1, "H1", close_time)
 
 
 def evaluate(
-    m15: pd.DataFrame,
-    h1: pd.DataFrame,
-    bar_close_time: datetime,  # UTC close time of the newest closed M15 bar
+    base: pd.DataFrame,  # closed bars of cfg.timeframe (trigger TF)
+    htf: dict[str, pd.DataFrame],  # {"H1": ..., "M5": ..., "M15": ...} closed-only
+    bar_close_time: datetime,  # UTC close time of the newest closed base bar
     cfg: EngineConfig,
     spread_points: float,  # rule 7b — current spread in points
     news: NewsState | None = None,  # None -> treated as skipped
+    point_size: float = 0.01,  # D-041 — for the spread-vs-risk gate
 ) -> Evaluation:
-    """Run the full §8.2 check pipeline on closed bars only.
+    """Run the full §8.2/D-041 check pipeline on closed bars only.
 
-    `h1` must contain only H1 bars closed at/before `bar_close_time`
-    (see closed_h1_asof — prevents lookahead in backtests).
+    `htf` frames must contain only bars closed at/before `bar_close_time`
+    (see closed_asof — prevents lookahead in backtests).
     """
     trace = Trace(
         params={
+            "timeframe": cfg.timeframe,
+            "trend_tf": cfg.trend_tf,
+            "confirm_tfs": list(cfg.confirm_tfs),
             "ema_trend": cfg.trend_ema,
             "sfp_lookback": cfg.sfp_lookback,
             "wick_atr": cfg.sfp_wick_atr_ratio,
@@ -78,15 +116,35 @@ def evaluate(
         }
     )
 
-    if not check_trend(h1, cfg, trace):
+    trend_frame = htf.get(cfg.trend_tf)
+    if trend_frame is None or not check_trend(trend_frame, cfg, trace):
         return Evaluation(None, trace.to_dict(), near_miss=False)
-    sig = detect_sfp(m15, cfg, trace)
-    if sig is None:
+
+    # D-041 rule 1b — MTF confirmation (hard gate on min_tf_agree)
+    agreed = check_mtf(htf, trace.direction, cfg, trace)
+    if agreed < cfg.min_tf_agree:
         return Evaluation(None, trace.to_dict(), near_miss=False)
-    rsi_ok, rsi_value = check_rsi(m15, cfg, trace)
+
+    # D-041 dual trigger — SFP sweep first (higher-quality pattern), then the
+    # trend-pullback rejection candle.
+    trigger: str
+    sig_sfp = detect_sfp(base, cfg, trace)
+    sig_pb: PullbackSignal | None = None
+    if sig_sfp is not None:
+        trigger = "sfp"
+    elif cfg.pullback_enabled:
+        sig_pb = detect_pullback(base, cfg, trace)
+        if sig_pb is None:
+            return Evaluation(None, trace.to_dict(), near_miss=False)
+        trigger = "pullback"
+    else:
+        return Evaluation(None, trace.to_dict(), near_miss=False)
+
+    # After a trigger fired, every later failure is a NEAR MISS (worth a log).
+    rsi_ok, rsi_value = check_rsi(base, cfg, trace)
     if not rsi_ok:
         return Evaluation(None, trace.to_dict(), near_miss=True)
-    atr_ok, atr_value = check_atr(m15, cfg, trace)
+    atr_ok, atr_value = check_atr(base, cfg, trace)
     if not atr_ok:
         return Evaluation(None, trace.to_dict(), near_miss=True)
     session_ok, session_name = check_session(bar_close_time, cfg, trace)
@@ -99,40 +157,65 @@ def evaluate(
     if news.blocked:
         return Evaluation(None, trace.to_dict(), near_miss=True)
 
-    # Rule 7b — spread
+    # Rule 7b — spread (absolute cap)
     spread_ok = spread_points <= cfg.max_spread_points
-    trace.add("spread", spread_ok, f"{spread_points:.0f} points (max {cfg.max_spread_points})")
+    trace.add(
+        "spread", spread_ok,
+        f"spread {spread_points:.0f} points (max {cfg.max_spread_points})",
+    )
     if not spread_ok:
         return Evaluation(None, trace.to_dict(), near_miss=True)
 
-    entry, sl, tp = build_levels(sig, cfg)
+    if sig_sfp is not None:
+        entry, sl, tp = build_levels(sig_sfp, cfg)
+        trigger_quality = sfp_quality(sig_sfp, cfg)
+        trigger_tag: SfpSignal | PullbackSignal = sig_sfp
+    else:
+        assert sig_pb is not None  # for the type checker
+        entry, sl, tp = build_levels_pullback(sig_pb, cfg)
+        trigger_quality = pullback_quality(sig_pb)
+        trigger_tag = sig_pb
+
+    # D-041 — spread vs risk: entering at ask/exiting at bid costs one spread;
+    # when that cost exceeds `max_spread_to_risk` of the stop distance the
+    # trade is structurally unprofitable (noise-level stop).
+    risk = abs(entry - sl)
+    point = point_size if point_size > 0 else 0.01
+    spread_price = spread_points * point
+    spread_risk_ok = risk > 0 and spread_price <= cfg.max_spread_to_risk * risk
+    trace.add(
+        "spread_risk",
+        spread_risk_ok,
+        f"spread ${spread_price:.2f} vs risk ${risk:.2f}"
+        f" (max {cfg.max_spread_to_risk:.0%} of risk)",
+    )
+    if not spread_risk_ok:
+        return Evaluation(None, trace.to_dict(), near_miss=True)
+
+    mtf_score = agreed / max(len(cfg.confirm_tfs), 1)
     confidence = (
         1.0 * W_TREND
-        + sfp_quality(sig, cfg) * W_SFP
-        + rsi_position(rsi_value, cfg, sig.direction) * W_RSI
+        + mtf_score * W_MTF
+        + trigger_quality * W_TRIGGER
+        + rsi_position(rsi_value, cfg, trigger_tag.direction) * W_RSI
         + (1.0 if session_ok else 0.0) * W_SESSION
         + atr_strength(atr_value, cfg) * W_ATR
     )
+    trace_dict = trace.to_dict()
+    trace_dict["trigger"] = trigger  # survives inside signals.trace JSON (D-041)
     payload = {
-        "direction": sig.direction,
+        "direction": trigger_tag.direction,
         "entry": round(entry, 2),
         "sl": round(sl, 2),
         "tp": round(tp, 2),
         "confidence": round(min(max(confidence, 0.0), 1.0), 3),
-        "trace": trace.to_dict(),
-        "bar_time": m15["time_utc"].iloc[-1],
+        "trigger": trigger,
+        "trace": trace_dict,
+        "bar_time": base["time_utc"].iloc[-1],
         "session": session_name,
         "spread_points": spread_points,
     }
-    return Evaluation(payload, trace.to_dict(), near_miss=False)
-
-
-def closed_h1_asof(h1: pd.DataFrame, close_time: datetime) -> pd.DataFrame:
-    """H1 bars fully closed at/before `close_time` (no lookahead in backtests)."""
-    tf_min = TIMEFRAME_MINUTES["H1"]
-    cutoff = pd.Timestamp(close_time)
-    close_col = h1["time_utc"] + pd.Timedelta(minutes=tf_min)
-    return h1[close_col <= cutoff].reset_index(drop=True)
+    return Evaluation(payload, trace_dict, near_miss=False)
 
 
 class SignalEngine:
@@ -154,6 +237,8 @@ class SignalEngine:
         self._lock = asyncio.Lock()
         self._last_signal_bar: datetime | None = None  # cooldown anchor
         self._last_spread_points: float = 0.0
+        # D-041 — confirm/trend frame cache: {(symbol, tf): (mono_ts, df)}
+        self._htf_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
         # Phase 4: async callback fired with (payload, signal_id) right after a
         # signal is persisted+ broadcast — the runtime routes it into the
         # per-user trading planes (copy-trading agent relay).
@@ -166,11 +251,36 @@ class SignalEngine:
     async def apply_config(self, cfg: EngineConfig) -> None:
         async with self._lock:
             self._cfg = cfg
+            self._htf_cache.clear()  # TF set may have changed
+
+    def invalidate_frames(self) -> None:
+        """Drop the confirm/trend frame cache (tests with accelerated
+        clocks; also correct after any external data reset)."""
+        self._htf_cache.clear()
 
     def note_spread(self, bid: float, ask: float) -> None:
         """Track the latest spread so bar-close evaluation uses a fresh value."""
         point = self._point_size if self._point_size > 0 else 0.01
         self._last_spread_points = (ask - bid) / point
+
+    async def _htf_frame(
+        self, source: Any, symbol: str, tf: str, bars: int
+    ) -> pd.DataFrame | None:
+        """Confirm/trend frame with a short TTL cache (D-041)."""
+        key = (symbol, tf)
+        now = time_mod.monotonic()
+        hit = self._htf_cache.get(key)
+        if hit is not None and now - hit[0] < HTF_CACHE_TTL_S:
+            return hit[1]
+        try:
+            df = await source.get_rates(symbol, tf, bars)
+        except Exception:  # noqa: BLE001 — data hiccup: caller skips this close
+            logger.exception("get_rates(%s, %s) failed", symbol, tf)
+            return None
+        if len(df) == 0:
+            return None
+        self._htf_cache[key] = (now, df)
+        return df
 
     async def on_bar_close(
         self,
@@ -193,12 +303,21 @@ class SignalEngine:
             return
 
         try:
-            m15 = await source.get_rates(symbol, cfg.timeframe, max(200, cfg.sfp_lookback + 5))
-            h1_full = await source.get_rates(symbol, cfg.trend_tf, 100)
+            base = await source.get_rates(
+                symbol, cfg.timeframe, max(200, cfg.sfp_lookback + 5)
+            )
         except Exception:  # noqa: BLE001 — data hiccup: skip this close
             logger.exception("get_rates failed at bar close %s", bar_close_time)
             return
-        h1 = closed_h1_asof(h1_full, bar_close_time)
+        if len(base) < cfg.ema_fast + 4:
+            return
+
+        htf: dict[str, pd.DataFrame] = {}
+        for higher in [cfg.trend_tf, *cfg.confirm_tfs]:
+            frame = await self._htf_frame(source, symbol, higher, 100)
+            if frame is None:
+                return  # bridge hiccup — better to skip than evaluate blind
+            htf[higher] = closed_asof(frame, higher, bar_close_time)
 
         # Rule 6 — async news check BEFORE the sync pipeline (graceful degrade)
         news = NewsState()
@@ -211,7 +330,8 @@ class SignalEngine:
             news = NewsState(blocked=not news_ok, skipped=False, value=t.checks[0].value)
 
         ev = evaluate(
-            m15, h1, bar_close_time, cfg, self._last_spread_points, news=news
+            base, htf, bar_close_time, cfg, self._last_spread_points, news=news,
+            point_size=self._point_size,
         )
         if ev.signal is None:
             if ev.near_miss and ev.trace["checks"]:
@@ -244,7 +364,8 @@ class SignalEngine:
         await self._log(
             "info",
             f"SIGNAL {payload['direction']} {symbol} @ {payload['entry']} "
-            f"SL {payload['sl']} TP {payload['tp']} conf {payload['confidence']}",
+            f"SL {payload['sl']} TP {payload['tp']} conf {payload['confidence']} "
+            f"({payload['trigger']})",
         )
 
         from app.engine.tracker import make_tracked

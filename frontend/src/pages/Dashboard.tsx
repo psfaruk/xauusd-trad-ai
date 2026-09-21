@@ -1,101 +1,80 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import TopBar from "../components/TopBar";
-import Chart from "../components/Chart";
-import TimeframeSwitcher from "../components/TimeframeSwitcher";
-import SymbolSwitcher from "../components/SymbolSwitcher";
-import SignalPanel, { type SignalPanelTab } from "../components/SignalPanel";
-import Mt5ConnectDialog from "../components/Mt5ConnectDialog";
-import SettingsDialog from "../components/SettingsDialog";
-import TradingDialog from "../components/TradingDialog";
-import TradePanel from "../components/TradePanel";
-import LogViewer from "../components/LogViewer";
-import TabBar from "../components/TabBar";
-import HomeView from "../components/HomeView";
-import AiTradingView from "../components/AiTradingView";
-import SettingsView from "../components/SettingsView";
+import BottomNav from "../components/BottomNav";
+import ErrorBoundary from "../components/ErrorBoundary";
+import HomeView from "../views/HomeView";
+import ChartsView from "../views/ChartsView";
+import AiView from "../views/AiView";
+import SettingsView from "../views/SettingsView";
 import { useAuth } from "../lib/auth";
 import {
   getCandles, getMt5Status, getSignals, getStats, getHealth, getMe,
-  getTradingStatus, getTradingPositions, getMt5Account, getMt5Positions,
-  getMt5AutoTrade,
-} from "../lib/api";import { WSClient } from "../lib/ws";
+  getMt5Account, getMt5AutoTrade,
+} from "../lib/api";
+import { WSClient } from "../lib/ws";
+import { feed } from "../state/feed";
 import type {
-  AppTab, BrokerConnection, Candle, Mt5Account, Mt5OpenPosition, Mt5Status,
-  Signal, StatsResponse, Timeframe, TradingPosition, TradingStatus, WsMessage,
-  WsMt5AutoMsg, WsMt5StatusMsg,
+  AppTab, Mt5Account, Mt5AutoTradeStatus, Mt5Status, Timeframe, WsMessage,
+  WsMt5AutoMsg,
 } from "../types";
 
 /**
- * Dashboard (D-039 tab architecture): Home / Chart & Signals / AI Trading /
- * Settings. Mobile navigates via the bottom TabBar, desktop via the 3-dot
- * menu — every function lives under one of the tabs (user req). All data
- * flows (WS, queries, polls) stay owned here and are passed down as props.
+ * Dashboard (D-041 rewrite) — a mobile-app-style shell: 4 tabs + bottom nav
+ * on EVERY form factor (no 3-dot menu; all its functions moved into the
+ * tabs). Data architecture:
+ *
+ *  - ONE WebSocket for the whole session (created once per token). The
+ *    message handler is STABLE — it reads symbol/tf through a ref — so
+ *    switching pair/timeframe NEVER tears the socket down again (that was
+ *    the "chart breaks / disconnects" bug). Subscribing is just a send().
+ *  - FAST frames (ticks, forming bars) go into the feed store; leaf
+ *    components subscribe themselves — the app tree does NOT re-render at
+ *    20fps (the "app is slow" bug).
+ *  - Slow state (mt5 status, engine logs, AI events) lives here, capped.
  */
+
+const LOG_CAP = 60;
+const EVENT_CAP = 60;
+
 export default function Dashboard() {
-  const { session } = useAuth();
+  const { session, signOut } = useAuth();
   const token = session?.access_token ?? null;
   const queryClient = useQueryClient();
 
-  /* D-039: active app tab */
+  /* ------------------------------------------------------------- ui state */
   const [activeTab, setActiveTab] = useState<AppTab>("home");
-
-  const [tf, setTf] = useState<Timeframe>("M15");
+  const [tf, setTf] = useState<Timeframe>("M1");
   const [symbol, setSymbol] = useState("XAUUSD");
+  const [focusSignalId, setFocusSignalId] = useState<string | null>(null);
+
+  /* ----------------------------------------------------------- slow state */
   const [mt5, setMt5] = useState<Mt5Status | null>(null);
-  const [dataSource, setDataSource] = useState<"mock" | "mt5" | "live" | "">("");
-  const [liveBar, setLiveBar] = useState<Candle | null>(null);
-  const [lastPrice, setLastPrice] = useState<{ bid: number; ask: number } | null>(null);
-  const [lastTickAt, setLastTickAt] = useState<number | null>(null);
-  const [tps, setTps] = useState<number | null>(null);
-  const [engineLogs, setEngineLogs] = useState<{ level: string; message: string }[]>([]);
+  const [dataSource, setDataSource] = useState("");
+  const [role, setRole] = useState("viewer");
   const [wsState, setWsState] = useState<"connecting" | "open" | "closed">("connecting");
-
-  /* practice plane state (Settings → practice, D-039: clearly optional) */
-  const [trading, setTrading] = useState<TradingStatus | null>(null);
-  const [tradingPositions, setTradingPositions] = useState<TradingPosition[]>([]);
-
-  /* dialog state */
-  const [connectOpen, setConnectOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [tradingOpen, setTradingOpen] = useState(false);
-  const [tradePanelOpen, setTradePanelOpen] = useState(false);
-  const [tradePanelTab, setTradePanelTab] = useState<"trade" | "history">("trade");
-  const [logsOpen, setLogsOpen] = useState(false);
-  const [panelTab, setPanelTab] = useState<SignalPanelTab>("signals");
-
-  /* the USER's broker connection + real account (per-user, D-037) */
-  const [mt5Acct, setMt5Acct] = useState<Mt5Account | null>(null);
-  const [mt5Pos, setMt5Pos] = useState<Mt5OpenPosition[]>([]);
-  /* D-036/D-039: AI auto-trade state + live event feed + refresh trigger */
-  const [mt5AutoArmed, setMt5AutoArmed] = useState(false);
-  const [mt5AutoWhy, setMt5AutoWhy] = useState<{ code: string; text: string } | null>(null);
-  const [mt5AutoEvents, setMt5AutoEvents] = useState<WsMt5AutoMsg[]>([]);
+  const [engineLogs, setEngineLogs] = useState<{ level: string; message: string }[]>([]);
+  const [autoStatus, setAutoStatus] = useState<Mt5AutoTradeStatus | null>(null);
+  const [autoEvents, setAutoEvents] = useState<WsMt5AutoMsg[]>([]);
+  const [brokerAccount, setBrokerAccount] = useState<Mt5Account | null>(null);
   const [aiRefreshKey, setAiRefreshKey] = useState(0);
 
-  const connectedSymbol = mt5?.symbol ?? null;
-  const broker: BrokerConnection | null = mt5?.broker ?? null;
-  const symbols = useMemo(() => {
-    const list = mt5?.symbols?.length ? mt5.symbols : [connectedSymbol ?? "XAUUSD"];
-    return list.filter((s, i) => list.indexOf(s) === i);
-  }, [mt5?.symbols, connectedSymbol]);
-  const [roleState, setRoleState] = useState<string>("viewer");
-  const isAdmin = useMemo(() => roleState === "admin", [roleState]);
+  const isAdmin = useMemo(() => role === "admin", [role]);
 
-  /* ---------------------------------------------------------------- queries */
-
+  /* --------------------------------------------------------------- queries */
   const candlesQuery = useQuery({
     queryKey: ["candles", tf, symbol],
-    enabled: !!token && !!symbol && mt5?.status === "connected",
-    queryFn: () => getCandles(token!, tf, 500, symbol),
+    enabled: !!token,
+    queryFn: () => getCandles(token!, tf, 400, symbol),
     refetchOnWindowFocus: false,
-    staleTime: Infinity,
+    staleTime: 60_000,
+    retry: 2,
+    retryDelay: 1_500,
   });
 
   const signalsQuery = useQuery({
     queryKey: ["signals"],
     enabled: !!token,
-    queryFn: () => getSignals(token!, 100),
+    queryFn: () => getSignals(token!, 150),
     refetchOnWindowFocus: false,
   });
 
@@ -106,29 +85,26 @@ export default function Dashboard() {
     refetchOnWindowFocus: false,
   });
 
+  const symbols = useMemo(() => {
+    const list = mt5?.symbols?.length ? mt5.symbols : ["XAUUSD"];
+    return [...new Set(list)];
+  }, [mt5?.symbols]);
+
+  /* --------------------------------------------------- stable ws handling */
   const wsRef = useRef<WSClient | null>(null);
-
-  const refreshTrading = useCallback(() => {
-    if (!token) return;
-    void getTradingStatus(token).then(setTrading).catch(() => undefined);
-    void getTradingPositions(token).then((r) => setTradingPositions(r.positions)).catch(() => undefined);
-  }, [token]);
-
-  /* ------------------------------------------------------------ ws lifecycle */
+  const subRef = useRef({ symbol, tf });
+  subRef.current = { symbol, tf };
 
   const handleWsMessage = useCallback(
     (msg: WsMessage) => {
       switch (msg.type) {
         case "tick":
-          if (msg.symbol !== symbol) return;
-          setLastPrice({ bid: msg.bid, ask: msg.ask });
-          setLastTickAt(Date.now());
-          if (msg.tps != null) setTps(msg.tps);
+          feed.pushTick(msg);
           break;
         case "bar_open":
         case "bar_update":
         case "bar_close":
-          if (msg.tf === tf && msg.symbol === symbol) setLiveBar(msg.candle);
+          feed.pushBar(msg);
           break;
         case "signal":
         case "signal_update":
@@ -142,390 +118,225 @@ export default function Dashboard() {
                   ...prev,
                   status: msg.status,
                   symbol: msg.symbol ?? prev.symbol,
-                  symbols: (msg as WsMt5StatusMsg).symbols ?? prev.symbols,
-                  feed: (msg as WsMt5StatusMsg).feed ?? prev.feed,
+                  symbols: msg.symbols ?? prev.symbols,
+                  feed: msg.feed ?? prev.feed,
                 }
-              : prev
+              : prev,
           );
-          {
-            const feedTps = (msg as WsMt5StatusMsg).feed?.symbols?.[symbol]?.tps
-              ?? (msg as WsMt5StatusMsg).feed?.tps;
-            if (feedTps != null) setTps(feedTps);
-          }
           break;
         case "engine_log":
-          setEngineLogs((prev) => [...prev.slice(-7), { level: msg.level, message: msg.message }]);
+          setEngineLogs((prev) => [
+            ...prev.slice(-(LOG_CAP - 1)),
+            { level: msg.level, message: msg.message },
+          ]);
           break;
         case "mt5_auto": {
           const ev = msg as WsMt5AutoMsg;
-          setMt5AutoEvents((prev) => [...prev.slice(-29), ev]);
-          if (ev.event === "armed" || ev.event === "disarmed") {
-            setMt5AutoArmed(ev.event === "armed");
-          }
-          // D-039: any execution event refreshes the AI tab data
+          setAutoEvents((prev) => [...prev.slice(-(EVENT_CAP - 1)), ev]);
           if (ev.event === "order" || ev.event === "close") {
             setAiRefreshKey((k) => k + 1);
           }
+          if (ev.event === "armed" || ev.event === "disarmed") {
+            void getMt5AutoTrade(token ?? "")
+              .then((s) => setAutoStatus(s))
+              .catch(() => undefined);
+          }
           break;
         }
-        case "trading_account":
-          setTrading((prev) => ({
-            ...prev,
-            connected: true,
-            mode: msg.mode === "live" ? "live" : "demo",
-            auto_trade: msg.auto_trade,
-            account: {
-              balance: msg.balance,
-              equity: msg.equity,
-              currency: msg.currency,
-            },
-          }));
-          setTradingPositions(msg.positions ?? []);
-          break;
-        case "trading_log":
-          setEngineLogs((prev) => [
-            ...prev.slice(-7),
-            { level: msg.level, message: `[practice] ${msg.message}` },
-          ]);
-          break;
         default:
           break;
       }
     },
-    [tf, symbol, queryClient]
+    [queryClient, token],
   );
 
+  // ONE WS per session — never rebuilt on symbol/tf changes
   useEffect(() => {
     if (!token) return;
     const ws = new WSClient(token);
     wsRef.current = ws;
     const offMsg = ws.on(handleWsMessage);
-    const offStatus = ws.onStatus(setWsState);
+    const offStatus = (ws as WSClient).onStatus(setWsState);
     ws.connect();
     return () => {
       offMsg();
       offStatus();
       ws.close();
       wsRef.current = null;
+      feed.clearAll();
     };
   }, [token, handleWsMessage]);
 
+  // re-subscribe when the watched pair/tf changes (cheap send, no reconnect)
   useEffect(() => {
     const ws = wsRef.current;
-    if (ws && symbol && ws.connected) ws.subscribe(symbol, tf);
+    if (ws && ws.connected) ws.subscribe(symbol, tf);
   }, [symbol, tf, wsState]);
 
-  useEffect(() => {
-    setLiveBar(null);
-    setLastPrice(null);
-    setLastTickAt(null);
-    setTps(null);
-  }, [symbol]);
+  // feed reset on symbol switch
+  const onSymbolChange = useCallback((s: string) => {
+    feed.clearSymbol(s === "XAUUSD" ? "BTCUSD" : "XAUUSD");
+    setSymbol(s);
+  }, []);
 
-  const feedSourceRef = useRef<string>("");
-  useEffect(() => {
-    const fs = mt5?.feed?.symbols?.[symbol];
-    if (!fs) return;
-    const src = `${fs.provider}:${fs.mt5 ? "mt5" : "composite"}`;
-    if (feedSourceRef.current && feedSourceRef.current !== src) {
-      void queryClient.invalidateQueries({ queryKey: ["candles"] });
-    }
-    feedSourceRef.current = src;
-  }, [mt5?.feed, symbol, queryClient]);
-
-  /* the USER's broker account + AI auto state — 10s poll */
-  const refreshMt5Account = useCallback(() => {
-    if (!token) return;
-    getMt5Account(token)
-      .then((a) => {
-        if (a.connected) setMt5Acct(a);
-        else setMt5Acct(null);
-      })
-      .catch(() => setMt5Acct(null));
-    getMt5Positions(token)
-      .then((r) => setMt5Pos(r.positions))
-      .catch(() => setMt5Pos([]));
-    getMt5AutoTrade(token)
-      .then((s) => {
-        setMt5AutoArmed(s.armed);
-        setMt5AutoWhy(s.why ?? null);
-      })
-      .catch(() => undefined);
-    getMt5Status(token)
-      .then((st) =>
-        setMt5((prev) => (prev ? { ...prev, broker: st.broker } : st))
-      )
-      .catch(() => undefined);
-  }, [token]);
-
-  useEffect(() => {
-    refreshMt5Account();
-    const timer = window.setInterval(refreshMt5Account, 10_000);
-    return () => window.clearInterval(timer);
-  }, [refreshMt5Account]);
-
-  useEffect(() => {
-    if (wsState === "open") {
-      void queryClient.invalidateQueries({ queryKey: ["candles"] });
-      if (token) getMt5Status(token).then(setMt5).catch(() => undefined);
-      const ws = wsRef.current;
-      if (ws && symbol) ws.subscribe(symbol, tf);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsState]);
-
-  useEffect(() => {
-    if (!token) return;
-    getMt5Status(token).then(setMt5).catch(() => undefined);
-    getHealth()
-      .then((h) => setDataSource(h.data_source))
-      .catch(() => undefined);
-    getMe(token).then((me) => setRoleState(me.role)).catch(() => undefined);
-    refreshTrading();
-  }, [token, refreshTrading]);
-
-  useEffect(() => {
-    if (!token || wsState === "open") return;
-    const timer = window.setInterval(() => {
-      getMt5Status(token).then(setMt5).catch(() => undefined);
-    }, 10_000);
-    return () => window.clearInterval(timer);
-  }, [token, wsState]);
-
-  /* ------------------------------------------------------------------ render */
-
-  const signals: Signal[] = signalsQuery.data?.signals ?? [];
-  const stats: StatsResponse | null = statsQuery.data ?? null;
-  const activeSignal =
-    signals.find((s) => s.status === "active" && s.symbol === symbol) ?? null;
-  const tradingConnected = trading?.connected === true;
-
-  const navigate = useCallback((tab: AppTab) => setActiveTab(tab), []);
-  const openConnectBroker = useCallback(() => setConnectOpen(true), []);
-
-  const menuActions = {
-    onNavigate: navigate,
-    onOpenConnectBroker: openConnectBroker,
-    onOpenPractice: () => setTradingOpen(true),
-    onOpenTradePanel: () => {
-      setTradePanelTab("trade");
-      setTradePanelOpen(true);
-    },
-    onOpenTradeHistory: () => {
-      setTradePanelTab("history");
-      setTradePanelOpen(true);
-    },
-    onOpenLogs: () => setLogsOpen(true),
-    onOpenEngineSettings: () => setSettingsOpen(true),
-    onOpenSignals: () => {
-      setActiveTab("charts");
-      setPanelTab("signals");
-    },
-    onOpenMarketData: () => {
-      setActiveTab("charts");
-      setPanelTab("market");
-    },
-  };
-
-  const onChartDesync = useCallback(() => {
+  const onDesync = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ["candles"] });
   }, [queryClient]);
 
+  /* ------------------------------------------------------------ polling */
+  const refreshSlow = useCallback(() => {
+    if (!token) return;
+    getMt5Status(token).then(setMt5).catch(() => undefined);
+    getMt5AutoTrade(token).then(setAutoStatus).catch(() => undefined);
+    getMt5Account(token)
+      .then((a) => setBrokerAccount(a.connected ? a : null))
+      .catch(() => undefined); // transient errors keep the previous state —
+      // only an explicit connected:false clears the account (honest UX)
+  }, [token]);
+
+  useEffect(() => {
+    if (!token) return;
+    refreshSlow();
+    getHealth().then((h) => setDataSource(h.data_source)).catch(() => undefined);
+    getMe(token).then((me) => setRole(me.role)).catch(() => undefined);
+    const timer = window.setInterval(refreshSlow, 8_000);
+    return () => window.clearInterval(timer);
+  }, [token, refreshSlow, wsState]);
+
+  // candle refetch on (re)connect
+  useEffect(() => {
+    if (wsState === "open") {
+      void queryClient.invalidateQueries({ queryKey: ["candles"] });
+    }
+  }, [wsState, queryClient]);
+
+  /* -------------------------------------------------------------- derived */
+  const signals = signalsQuery.data?.signals ?? [];
+  const stats = statsQuery.data ?? null;
+  const broker = mt5?.broker ?? null;
+  const autoArmed = autoStatus?.armed ?? false;
+  const autoWhy = autoStatus?.why ?? null;
+  const candles = candlesQuery.data?.candles ?? [];
+
+  const navigate = useCallback((tab: AppTab) => {
+    setActiveTab(tab);
+    if (typeof window !== "undefined") window.scrollTo({ top: 0 });
+  }, []);
+
+  const openSignalAnalysis = useCallback(
+    (id: string) => {
+      setFocusSignalId(id);
+      navigate("charts");
+    },
+    [navigate],
+  );
+
+  /* --------------------------------------------------------------- render */
   return (
-    <div className="flex min-h-screen flex-col bg-zinc-950">
-      <TopBar
-        mt5={mt5}
-        dataSource={dataSource}
-        menuActions={menuActions}
-        isAdmin={isAdmin}
-        onOpenAi={() => setActiveTab("ai")}
-        lastPrice={lastPrice}
-        lastTickAt={lastTickAt}
-        tps={tps}
-        symbol={symbol}
-        activeTab={activeTab}
-      />
+    <div className="flex min-h-screen flex-col overflow-x-hidden bg-zinc-950">
+      {/* slim app header — brand + live connection */}
+      <header className="sticky top-0 z-30 border-b border-zinc-800/70 bg-zinc-950/90 backdrop-blur-md">
+        <div className="mx-auto flex h-12 w-full max-w-3xl items-center gap-2 px-4">
+          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-gold/15 text-[11px] font-black text-gold">
+            Au
+          </span>
+          <span className="truncate text-sm font-bold tracking-tight text-zinc-100">
+            Gold&nbsp;AI&nbsp;Trader
+          </span>
+          <span className="ml-auto flex shrink-0 items-center gap-2 text-[10px] font-semibold">
+            {mt5?.status === "connected" && (
+              <span className="flex items-center gap-1 text-emerald-400">
+                <span className="relative flex h-1.5 w-1.5">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                  <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                </span>
+                MT5
+              </span>
+            )}
+            {mt5?.status === "reconnecting" && (
+              <span className="flex items-center gap-1 text-amber-400">reconnecting…</span>
+            )}
+            {mt5?.status === "disconnected" && (
+              <span className="flex items-center gap-1 text-red-400">offline</span>
+            )}
+            <button
+              type="button"
+              onClick={() => void signOut()}
+              className="rounded-lg border border-zinc-800 px-2 py-1 text-zinc-500 hover:text-zinc-300"
+              aria-label="Sign out"
+            >
+              exit
+            </button>
+          </span>
+        </div>
+      </header>
 
-      <main className="mx-auto w-full max-w-[1600px] flex-1 p-4 pb-24 lg:pb-6">
-        {activeTab === "home" && (
-          <HomeView
-            symbol={symbol}
-            symbols={symbols}
-            onSymbolChange={setSymbol}
-            lastPrice={lastPrice}
-            lastTickAt={lastTickAt}
-            tps={tps}
-            mt5={mt5}
-            broker={broker}
-            brokerAccount={mt5Acct}
-            brokerPositions={mt5Pos}
-            autoArmed={mt5AutoArmed}
-            autoWhy={mt5AutoWhy}
-            signals={signals}
-            stats={stats}
-            engineRunning={!!mt5?.engine_running}
-            onConnectBroker={openConnectBroker}
-            onNavigate={navigate}
-          />
-        )}
-
-        {activeTab === "charts" && (
-          <div className="flex flex-col gap-4 xl:flex-row">
-            {/* CHART area */}
-            <section className="flex min-w-0 flex-1 flex-col gap-3" aria-label="Chart">
-              <div className="flex flex-wrap items-center gap-3">
-                <SymbolSwitcher symbols={symbols} value={symbol} onChange={setSymbol} mt5={mt5} />
-                <TimeframeSwitcher tf={tf} onChange={setTf} />
-                <div className="ml-auto flex items-center gap-3 text-xs">
-                  {lastPrice && (
-                    <span className="font-mono">
-                      <span className="text-zinc-500">bid </span>
-                      <span className="text-zinc-200">{lastPrice.bid.toFixed(2)}</span>
-                      <span className="mx-1 text-zinc-600">/</span>
-                      <span className="text-zinc-500">ask </span>
-                      <span className="text-zinc-200">{lastPrice.ask.toFixed(2)}</span>
-                    </span>
-                  )}
-                  <span
-                    className={`rounded-full border px-2 py-0.5 text-[11px] ${
-                      wsState === "open"
-                        ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                        : wsState === "connecting"
-                          ? "border-amber-500/30 bg-amber-500/10 text-amber-400"
-                          : "border-red-500/30 bg-red-500/10 text-red-400"
-                    }`}
-                  >
-                    ws {wsState}
-                  </span>
-                </div>
-              </div>
-
-              <div className="h-[48vh] min-h-[320px] overflow-hidden rounded-xl border border-zinc-800 bg-[#0c0e14] sm:h-[52vh] sm:min-h-[380px] xl:h-[calc(100vh-220px)]">
-                <Chart
-                  candles={candlesQuery.data?.candles ?? []}
-                  liveBar={liveBar}
-                  liveTick={lastPrice}
-                  market={mt5?.feed?.symbols?.[symbol]?.market}
-                  activeSignal={activeSignal}
-                  tf={tf}
-                  onDesync={onChartDesync}
-                />
-              </div>
-
-              {engineLogs.length > 0 && (
-                <div className="max-h-24 overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-900/40 p-2.5">
-                  {engineLogs.slice(-4).map((log, i) => (
-                    <p key={i} className="truncate font-mono text-[11px] text-zinc-500">
-                      <span className={log.level === "info" ? "text-gold/80" : log.level === "critical" ? "text-red-400" : "text-zinc-400"}>
-                        [{log.level}]
-                      </span>{" "}
-                      {log.message}
-                    </p>
-                  ))}
-                </div>
-              )}
-            </section>
-
-            {/* SIGNAL PANEL */}
-            <section className="w-full min-w-0 xl:w-96" aria-label="Signals">
-              <SignalPanel
-                signals={signals}
-                stats={stats}
-                token={token ?? ""}
-                tab={panelTab}
-                onTabChange={setPanelTab}
-              />
-            </section>
-          </div>
-        )}
-
-        {activeTab === "ai" && (
-          <div className="mx-auto max-w-4xl">
-            <AiTradingView
-              token={token ?? ""}
-              onConnectBroker={openConnectBroker}
-              autoEvents={mt5AutoEvents}
-              refreshKey={aiRefreshKey}
+      <main className="mx-auto w-full max-w-3xl flex-1 px-3 pb-28 pt-3 sm:px-4">
+        <ErrorBoundary label="App">
+          {activeTab === "home" && (
+            <HomeView
+              symbol={symbol}
+              symbols={symbols}
+              onSymbolChange={onSymbolChange}
+              mt5={mt5}
+              broker={broker}
+              brokerAccount={brokerAccount}
+              autoArmed={autoArmed}
+              autoWhy={autoWhy}
+              signals={signals}
+              stats={stats}
+              onOpenAi={() => navigate("ai")}
+              onOpenSettings={() => navigate("settings")}
+              onOpenSignal={openSignalAnalysis}
             />
-          </div>
-        )}
-
-        {activeTab === "settings" && (
-          <div className="mx-auto max-w-4xl">
+          )}
+          {activeTab === "charts" && (
+            <ChartsView
+              symbol={symbol}
+              symbols={symbols}
+              onSymbolChange={onSymbolChange}
+              tf={tf}
+              onTfChange={setTf}
+              candles={candles}
+              candlesLoading={candlesQuery.isLoading}
+              signals={signals}
+              mt5={mt5}
+              wsState={wsState}
+              onDesync={onDesync}
+              focusSignalId={focusSignalId}
+              onFocusSignalConsumed={() => setFocusSignalId(null)}
+            />
+          )}
+          {activeTab === "ai" && (
+            <AiView
+              token={token ?? ""}
+              symbol={symbol}
+              autoStatus={autoStatus}
+              autoEvents={autoEvents}
+              refreshKey={aiRefreshKey}
+              signals={signals}
+              onArmChanged={refreshSlow}
+            />
+          )}
+          {activeTab === "settings" && (
             <SettingsView
               token={token ?? ""}
-              broker={broker}
               mt5={mt5}
+              broker={broker}
+              brokerAccount={brokerAccount}
               isAdmin={isAdmin}
               dataSource={dataSource}
-              wsState={wsState}
-              onConnectBroker={openConnectBroker}
-              onOpenEngineSettings={() => setSettingsOpen(true)}
-              onOpenPractice={() => setTradingOpen(true)}
-              onOpenLogs={() => setLogsOpen(true)}
+              engineLogs={engineLogs}
+              onBrokerConnected={() => {
+                refreshSlow();
+                void queryClient.invalidateQueries({ queryKey: ["candles"] });
+              }}
             />
-          </div>
-        )}
+          )}
+        </ErrorBoundary>
       </main>
 
-      {/* mobile bottom navigation (D-039) */}
-      <TabBar active={activeTab} onChange={setActiveTab} />
-
-      {/* ------------------------------------------------------------- dialogs */}
-
-      <Mt5ConnectDialog
-        open={connectOpen}
-        onClose={() => setConnectOpen(false)}
-        token={token ?? ""}
-        broker={broker}
-        onConnected={(st) => {
-          setMt5(st);
-          void queryClient.invalidateQueries({ queryKey: ["candles"] });
-          refreshMt5Account();
-          setAiRefreshKey((k) => k + 1);
-        }}
-        onDisconnected={(st) => {
-          setMt5(st);
-          setLiveBar(null);
-          refreshMt5Account();
-          setAiRefreshKey((k) => k + 1);
-        }}
-      />
-
-      <SettingsDialog
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        token={token ?? ""}
-        isAdmin={isAdmin}
-      />
-
-      <TradingDialog
-        open={tradingOpen}
-        onClose={() => setTradingOpen(false)}
-        token={token ?? ""}
-        status={trading}
-        onStatusChange={(st) => {
-          setTrading(st);
-          refreshTrading();
-        }}
-      />
-
-      <TradePanel
-        open={tradePanelOpen}
-        onClose={() => setTradePanelOpen(false)}
-        token={token ?? ""}
-        connected={tradingConnected}
-        positions={tradingPositions}
-        lastPrice={lastPrice}
-        onPositionsChanged={refreshTrading}
-        initialTab={tradePanelTab}
-      />
-
-      <LogViewer
-        open={logsOpen}
-        onClose={() => setLogsOpen(false)}
-        token={token ?? ""}
-      />
+      <BottomNav active={activeTab} onChange={navigate} />
     </div>
   );
 }

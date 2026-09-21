@@ -177,8 +177,8 @@ class TestConfigRoutes:
         assert r.status_code == 200
         body = r.json()
         assert body["auto_trade"] is False  # global kill switch OFF by default
-        assert body["config"]["timeframe"] == "M15"
-        assert body["config"]["rr"] == 2.0
+        assert body["config"]["timeframe"] == "M1"
+        assert body["config"]["rr"] == 0.9
         assert body["config"]["magic"] == 234000
 
     def test_put_config_valid(self, client):
@@ -192,7 +192,7 @@ class TestConfigRoutes:
         r = client.get("/api/config", headers=GOOD)
         assert r.json()["config"]["min_atr"] == 1.2
         # restore default
-        cfg["min_atr"] = 0.8
+        cfg["min_atr"] = 0.15
         client.put("/api/config", headers=ADMIN_H, json=cfg)
 
     def test_put_config_invalid_rejected(self, client):

@@ -1,11 +1,12 @@
-"""Backtest runner (verification harness for the SFP engine).
+"""Backtest runner (verification harness for the D-041 M1 engine).
 
 Runs the EXACT same `engine.evaluate()` pipeline as the live engine over a
-historical M15 series (bars replayed one-by-one, H1 context derived with
-`closed_h1_asof` to prevent lookahead), then simulates the SPEC §8.4 tracker:
+historical base-TF series (M1 by default; bars replayed one-by-one, higher
+TF context derived with `closed_asof` to prevent lookahead), then simulates
+the SPEC §8.4 tracker:
 
 - SL/TP from bar highs/lows; when a bar touches BOTH, SL wins (pessimistic),
-- expiry after `expiry_bars` M15 closes -> result_r from the closing price,
+- expiry after `expiry_bars` base closes -> result_r from the closing price,
 - spread applied as an entry cost via `spread_cost_r` (optional, default 0).
 
 Sources of data:
@@ -25,11 +26,13 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from app.engine.config import EngineConfig
-from app.engine.engine import NewsState, closed_h1_asof, evaluate
+from app.engine.engine import NewsState, evaluate
 from app.engine.executor import size_lot
 from app.mt5.base import TIMEFRAME_MINUTES
 
@@ -43,6 +46,7 @@ class BacktestSignal:
     tp: float
     confidence: float
     session: str
+    trigger: str = "sfp"
     status: str = "active"
     result_r: float | None = None
     exit_ts: datetime | None = None
@@ -77,11 +81,23 @@ class BacktestResult:
             slot["signals"] += 1
             if s.status in slot:
                 slot[s.status] += 1
+        by_trigger: dict[str, dict] = {}
+        for s in self.signals:
+            slot = by_trigger.setdefault(
+                s.trigger, {"signals": 0, "won": 0, "lost": 0, "expired": 0}
+            )
+            slot["signals"] += 1
+            if s.status in slot:
+                slot[s.status] += 1
+        hours = None
+        if self.date_from and self.date_to:
+            hours = max((self.date_to - self.date_from).total_seconds() / 3600.0, 1e-9)
         return {
             "bars_tested": self.bars_tested,
             "date_from": self.date_from.isoformat() if self.date_from else None,
             "date_to": self.date_to.isoformat() if self.date_to else None,
             "total_signals": len(self.signals),
+            "signals_per_hour": round(len(self.signals) / hours, 2) if hours else None,
             "won": len(won),
             "lost": len(lost),
             "expired": len(expired),
@@ -95,11 +111,12 @@ class BacktestResult:
             ),
             "max_drawdown_r": round(max_dd, 4),
             "by_session": by_session,
+            "by_trigger": by_trigger,
         }
 
 
-def resample_ohlc(m15: pd.DataFrame, dst_min: int, src_min: int = 15) -> pd.DataFrame:
-    """Aggregate the M15 frame into bigger buckets (dst_min % 15 == 0).
+def resample_ohlc(base: pd.DataFrame, dst_min: int, src_min: int = 1) -> pd.DataFrame:
+    """Aggregate the base frame into bigger buckets (dst_min % src_min == 0).
 
     The trailing bucket is dropped when incomplete (fewer than dst_min/src_min
     bars) so backtests never see a half-formed higher-timeframe bar.
@@ -108,7 +125,7 @@ def resample_ohlc(m15: pd.DataFrame, dst_min: int, src_min: int = 15) -> pd.Data
 
     if dst_min % src_min != 0:
         raise ValueError("resample target must be a multiple of the source tf")
-    df = m15.set_index("time_utc")
+    df = base.set_index("time_utc")
     agg = df.resample(f"{dst_min}min", label="left", closed="left").agg(
         {"o": "first", "h": "max", "l": "min", "c": "last", "v": "sum"}
     )
@@ -174,32 +191,61 @@ class _SimTracker:
 
 
 def run_backtest(
-    m15: pd.DataFrame,
+    base: pd.DataFrame,
     cfg: EngineConfig | None = None,
     spread_points: float = 0.0,
     news: NewsState | None = None,
 ) -> BacktestResult:
-    """Replay the M15 series through the live evaluate() pipeline."""
+    """Replay the base-TF series through the live evaluate() pipeline.
+
+    D-041: the base TF is cfg.timeframe (M1 by default); every confirm/trend
+    TF frame is resampled from the SAME series and sliced with closed_asof
+    so no evaluation ever sees a higher-TF bar that had not closed yet.
+    """
     cfg = cfg or EngineConfig()
     tf_min = TIMEFRAME_MINUTES[cfg.timeframe]
-    if cfg.timeframe != "M15":
-        raise ValueError("backtest base timeframe must be M15 (v1)")
-    h1_full = resample_ohlc(m15, TIMEFRAME_MINUTES[cfg.trend_tf])
 
-    warmup = max(cfg.sfp_lookback, cfg.trend_ema, cfg.rsi_period, cfg.atr_period) + 5
+    # Pre-resample every higher TF once (trend + confirms) + their bar-close
+    # timestamp arrays (searchsorted-based asof slicing — O(log n) per bar).
+    htf_frames: dict[str, pd.DataFrame] = {}
+    htf_close_ts: dict[str, Any] = {}
+    for tf in dict.fromkeys([cfg.trend_tf, *cfg.confirm_tfs]):
+        dst_min = TIMEFRAME_MINUTES[tf]
+        if dst_min % tf_min != 0:
+            raise ValueError(f"confirm tf {tf} must be a multiple of {cfg.timeframe}")
+        frame = resample_ohlc(base, dst_min, src_min=tf_min)
+        htf_frames[tf] = frame
+        htf_close_ts[tf] = (frame["time_utc"] + pd.Timedelta(minutes=dst_min)).values
+
+    # Windowed history depth — mirrors what the LIVE engine fetches through
+    # get_rates (max(200, lookback+5) bars): the backtest sees exactly the
+    # same information the live pipeline sees, no more. Indicators are fully
+    # converged at this depth (Wilder/EMA decay << window).
+    hist_window = max(260, cfg.sfp_lookback + 10)
+
+    # Warmup: enough base bars for the trend EMA on the LARGEST TF to be
+    # defined, plus the base-level indicator needs.
+    trend_min = TIMEFRAME_MINUTES[cfg.trend_tf]
+    warmup = max(
+        int((cfg.trend_ema + 5) * trend_min / tf_min),
+        cfg.sfp_lookback,
+        max(cfg.ema_fast, cfg.atr_period, cfg.rsi_period) + 5,
+    )
     result = BacktestResult(
         cfg=cfg,
-        bars_tested=max(0, len(m15) - warmup),
-        date_from=m15["time_utc"].iloc[warmup].to_pydatetime() if len(m15) > warmup else None,
-        date_to=m15["time_utc"].iloc[-1].to_pydatetime() if len(m15) else None,
+        bars_tested=max(0, len(base) - warmup),
+        date_from=base["time_utc"].iloc[warmup].to_pydatetime() if len(base) > warmup else None,
+        date_to=base["time_utc"].iloc[-1].to_pydatetime() if len(base) else None,
     )
     sim = _SimTracker(cfg)
     cooldown_until = -1
 
-    for i in range(warmup, len(m15)):
-        hist = m15.iloc[: i + 1].reset_index(drop=True)
-        bar = m15.iloc[i]
+    for i in range(warmup, len(base)):
+        hist = base.iloc[max(0, i - hist_window) : i + 1].reset_index(drop=True)
+        bar = base.iloc[i]
         bar_close_time = bar["time_utc"] + timedelta(minutes=tf_min)
+        close_np = np.datetime64(bar_close_time.tz_localize(None)) if bar_close_time.tzinfo \
+            else np.datetime64(bar_close_time)
 
         # no evaluation while a simulated position is open (max_positions=1)
         # but the tracker steps on EVERY closed bar
@@ -209,10 +255,13 @@ def run_backtest(
         if sim.open_sig is not None or i < cooldown_until:
             continue
 
-        h1 = closed_h1_asof(h1_full, bar_close_time)
-        if len(h1) < cfg.trend_ema + 1:
+        htf = {}
+        for tf, frame in htf_frames.items():
+            idx = int(np.searchsorted(htf_close_ts[tf], close_np, side="right"))
+            htf[tf] = frame.iloc[:idx]
+        if len(htf.get(cfg.trend_tf, pd.DataFrame())) < cfg.trend_ema + 1:
             continue
-        ev = evaluate(hist, h1, bar_close_time, cfg, spread_points, news=news)
+        ev = evaluate(hist, htf, bar_close_time, cfg, spread_points, news=news)
         if ev.signal is None:
             continue
         p = ev.signal
@@ -224,11 +273,22 @@ def run_backtest(
             tp=p["tp"],
             confidence=p["confidence"],
             session=p["session"],
+            trigger=p.get("trigger", "sfp"),
         )
         result.signals.append(sig)
         sim.open_sig = sig
         sim.bars_held = 0
         cooldown_until = i + cfg.cooldown_bars + 1
+
+    # D-041 — honest spread cost: a BUY fills at the ask and exits at the bid,
+    # so every trade pays one spread. Deduct it from the realized R using the
+    # signal's own risk distance (XAUUSD point = 0.01).
+    if spread_points and spread_points > 0:
+        cost = spread_points * 0.01
+        for s in result.signals:
+            risk = abs(s.entry - s.sl)
+            if risk > 0 and s.result_r is not None:
+                s.result_r = round(s.result_r - cost / risk, 4)
 
     return result
 
@@ -236,24 +296,24 @@ def run_backtest(
 # ------------------------------------------------------------------ data load
 
 
-def load_mock_history(bars: int = 3000, seed: int = 42) -> pd.DataFrame:
-    """Deterministic 30-day mock history pulled through MockDataSource."""
+def load_mock_history(bars: int = 5000, seed: int = 42) -> pd.DataFrame:
+    """Deterministic mock history pulled through MockDataSource (M1 base)."""
     from app.mt5.mock_source import MockDataSource
 
     src = MockDataSource(seed=seed, time_scale=0.0)
     # freeze clock at the end of the 30-day window
     src.advance_minutes(src.HISTORY_DAYS * 24 * 60 - 1)
-    df = src._rates_sync("M15", bars)  # noqa: SLF001 — test harness access
+    df = src._rates_sync("M1", bars)  # noqa: SLF001 — test harness access
     return df.reset_index(drop=True)
 
 
-def inject_sweep_series(m15: pd.DataFrame, every_bars: int, seed: int = 42) -> pd.DataFrame:
-    """Overlay crafted SFP sweeps onto a mock M15 series (engine sanity mode).
+def inject_sweep_series(base: pd.DataFrame, every_bars: int, seed: int = 42) -> pd.DataFrame:
+    """Overlay crafted SFP sweeps onto a mock base series (engine sanity mode).
 
     Rather than using MockDataSource.inject_sweep (M1-level), this directly
-    rewrites M15 bars so the sweep pattern is exact regardless of aggregation.
+    rewrites base bars so the sweep pattern is exact regardless of aggregation.
     """
-    df = m15.copy()
+    df = base.copy()
     lookback = 20
     atr_proxy = (df["h"] - df["l"]).rolling(14).mean()
     for i in range(lookback + 50, len(df) - 1, every_bars):
@@ -451,47 +511,51 @@ def format_report(res: BacktestResult, label: str) -> str:
     s = res.stats()
     lines = [
         "=" * 64,
-        f" SFP ENGINE BACKTEST — {label}",
+        f" M1 MTF ENGINE BACKTEST — {label}",
         "=" * 64,
         f" period        : {s['date_from']} -> {s['date_to']} UTC",
-        f" M15 bars     : {s['bars_tested']}",
-        f" signals      : {s['total_signals']} (won {s['won']} / lost {s['lost']}"
-        f" / expired {s['expired']} / active {s['active']})",
-        f" win rate     : {s['win_rate']}",
-        f" total R      : {s['total_r']}",
-        f" expectancy   : {s['expectancy']} R per signal",
-        f" profit factor: {s['profit_factor']}",
-        f" max drawdown : {s['max_drawdown_r']} R",
-        " by session   : " + json.dumps(s["by_session"]),
+        f" base bars     : {s['bars_tested']} ({res.cfg.timeframe})",
+        f" signals       : {s['total_signals']} ({s['signals_per_hour']}/h)"
+        f" (won {s['won']} / lost {s['lost']} / expired {s['expired']}"
+        f" / active {s['active']})",
+        f" win rate      : {s['win_rate']}",
+        f" total R       : {s['total_r']}",
+        f" expectancy    : {s['expectancy']} R per signal",
+        f" profit factor : {s['profit_factor']}",
+        f" max drawdown  : {s['max_drawdown_r']} R",
+        " by session    : " + json.dumps(s["by_session"]),
+        " by trigger    : " + json.dumps(s["by_trigger"]),
         "=" * 64,
     ]
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="SFP engine backtest")
-    p.add_argument("--bars", type=int, default=2880, help="M15 bars from mock history")
+    p = argparse.ArgumentParser(description="M1 MTF engine backtest")
+    p.add_argument("--bars", type=int, default=5000, help="M1 bars from mock history")
     p.add_argument("--csv", type=str, default=None, help="OHLCV csv (time_utc,o,h,l,c,v)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--inject-every", type=int, default=0,
                    help="overlay a crafted SFP sweep every N bars (engine sanity mode)")
     p.add_argument("--start-equity", type=float, default=10_000.0,
                    help="risk simulation starting equity (USD)")
+    p.add_argument("--spread", type=float, default=0.0,
+                   help="spread in points charged as entry cost (e.g. 20)")
     p.add_argument("--json", type=str, default=None, help="write stats+signals JSON here")
     p.add_argument("--csv-out", type=str, default=None, help="write signals CSV here")
     args = p.parse_args(argv)
 
     if args.csv:
-        m15 = load_csv(args.csv)
+        base = load_csv(args.csv)
         label = f"CSV {args.csv}"
     else:
-        m15 = load_mock_history(args.bars, seed=args.seed)
-        label = f"mock seed={args.seed} bars={len(m15)}"
+        base = load_mock_history(args.bars, seed=args.seed)
+        label = f"mock seed={args.seed} bars={len(base)}"
     if args.inject_every:
-        m15 = inject_sweep_series(m15, args.inject_every, seed=args.seed)
+        base = inject_sweep_series(base, args.inject_every, seed=args.seed)
         label += f" +injected-sweep-every-{args.inject_every}"
 
-    res = run_backtest(m15)
+    res = run_backtest(base, spread_points=args.spread)
     print(format_report(res, label))
     risk = simulate_risk(res, start_equity=args.start_equity)
     print(format_risk_report(risk))
@@ -512,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
                     "tp": s.tp,
                     "confidence": s.confidence,
                     "session": s.session,
+                    "trigger": s.trigger,
                     "status": s.status,
                     "result_r": s.result_r,
                     "exit_ts": s.exit_ts.isoformat() if s.exit_ts else None,
@@ -527,7 +592,8 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "ts": s.ts, "direction": s.direction, "entry": s.entry,
                     "sl": s.sl, "tp": s.tp, "confidence": s.confidence,
-                    "session": s.session, "status": s.status, "result_r": s.result_r,
+                    "session": s.session, "trigger": s.trigger,
+                    "status": s.status, "result_r": s.result_r,
                 }
                 for s in res.signals
             ]

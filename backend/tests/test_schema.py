@@ -57,7 +57,7 @@ class TestSchemaApply:
                 )
                 row = seed.first()
                 assert row is not None
-                assert row[0] == "M15"  # SPEC §8.6 default
+                assert row[0] == "M1"  # D-041 M1 default
                 assert row[1] is False  # auto_trade OFF by default (§0.6)
         finally:
             await engine.dispose()

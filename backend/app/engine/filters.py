@@ -14,12 +14,45 @@ from app.engine.config import EngineConfig
 from app.engine.indicators import atr, ema, rsi
 from app.engine.trace import Trace
 
-# Confidence weights (SPEC §8.2) — sum of pass-score contributions.
-W_TREND = 0.30
-W_SFP = 0.30
-W_RSI = 0.20
-W_SESSION = 0.10
+# Confidence weights (SPEC §8.2, D-041 rebalance) — pass-score contributions.
+W_TREND = 0.25
+W_MTF = 0.20
+W_TRIGGER = 0.25
+W_RSI = 0.15
+W_SESSION = 0.05
 W_ATR = 0.10
+
+
+def check_mtf(
+    frames: dict[str, pd.DataFrame],
+    direction: str,
+    cfg: EngineConfig,
+    trace: Trace,
+) -> int:
+    """D-041 rule 1b — multi-timeframe confirmation.
+
+    Every confirm TF frame (closed bars only) must sit on the same side of
+    its EMA(trend_ema) as the trade direction. Returns how many agreed;
+    the caller hard-gates on `cfg.min_tf_agree`.
+    """
+    agreed = 0
+    for tf in cfg.confirm_tfs:
+        df = frames.get(tf)
+        if df is None or len(df) < cfg.trend_ema + 1:
+            trace.add(f"mtf_{tf.lower()}", False, "insufficient history")
+            continue
+        close = float(df["c"].iloc[-1])
+        ema_val = float(ema(df["c"], cfg.trend_ema).iloc[-1])
+        ok = close > ema_val if direction == "BUY" else close < ema_val
+        if ok:
+            agreed += 1
+        trace.add(
+            f"mtf_{tf.lower()}",
+            ok,
+            f"{tf} close {close:.2f} {'>' if direction == 'BUY' else '<'}"
+            f" EMA{cfg.trend_ema} {ema_val:.2f} — {'agrees' if ok else 'conflicts'}",
+        )
+    return agreed
 
 
 def check_trend(h1: pd.DataFrame, cfg: EngineConfig, trace: Trace) -> bool:
@@ -41,9 +74,9 @@ def check_trend(h1: pd.DataFrame, cfg: EngineConfig, trace: Trace) -> bool:
     return False
 
 
-def check_rsi(m15: pd.DataFrame, cfg: EngineConfig, trace: Trace) -> tuple[bool, float]:
+def check_rsi(base: pd.DataFrame, cfg: EngineConfig, trace: Trace) -> tuple[bool, float]:
     """Rule 3 — RSI(14) window per direction. Returns (pass, rsi_value)."""
-    value = rsi(m15["c"], cfg.rsi_period)
+    value = rsi(base["c"], cfg.rsi_period)
     lo, hi = (
         (cfg.rsi_buy_min, cfg.rsi_buy_max)
         if trace.direction == "BUY"
@@ -54,9 +87,9 @@ def check_rsi(m15: pd.DataFrame, cfg: EngineConfig, trace: Trace) -> tuple[bool,
     return passed, value
 
 
-def check_atr(m15: pd.DataFrame, cfg: EngineConfig, trace: Trace) -> tuple[bool, float]:
+def check_atr(base: pd.DataFrame, cfg: EngineConfig, trace: Trace) -> tuple[bool, float]:
     """Rule 4 — ATR(14) >= min_atr. Returns (pass, atr_value)."""
-    value = atr(m15, cfg.atr_period)
+    value = atr(base, cfg.atr_period)
     passed = value >= cfg.min_atr
     trace.add("atr", passed, f"{value:.2f} (min {cfg.min_atr})")
     return passed, value
