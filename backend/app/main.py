@@ -49,7 +49,7 @@ from app.engine.config import ConfigRepo
 from app.engine.repo import SignalRepo
 from app.mt5.connection import ConnectionManager, SourceResolution, resolve_data_source
 from app.services.external import ExternalMarketService
-from app.services.news import NewsService, NullNewsService
+from app.services.news import NewsService
 from app.services.ws_hub import WSHub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -104,19 +104,24 @@ async def lifespan(app: FastAPI):
     # keeps retrying (WS venue workers + REST loop) and NEVER substitutes
     # demo prices.
     app.state.hub = WSHub()
-    if settings.fmp_api_key:
-        app.state.news = NewsService(
-            http_factory=lambda: _get_http(app),
-            api_key=settings.fmp_api_key,
-        )
-    else:
-        app.state.news = NullNewsService()
+    # D-044 — news is ALWAYS on: ForexFactory needs no key; FMP adds
+    # coverage when a key exists. High-impact USD events gate the engine
+    # (news_blackout_min) and feed the Economic Events panel.
+    app.state.news = NewsService(
+        http_factory=lambda: _get_http(app),
+        api_key=settings.fmp_api_key,
+    )
     app.state.config_repo = ConfigRepo()
     app.state.signals = SignalRepo(app.state.db_engine)
     # D-042 — ICT/SMC analysis snapshots for the chart overlays + strip
+    # D-044 — + COT institutional positioning + news panel data
     from app.services.analysis import AnalysisService
+    from app.services.cot import CotService
 
-    app.state.analysis = AnalysisService()
+    app.state.cot = CotService(http_factory=lambda: _get_http(app))
+    app.state.analysis = AnalysisService(
+        news_service=app.state.news, cot_service=app.state.cot
+    )
     resolution = await resolve_data_source(
         settings, http_factory=lambda: _get_http(app)
     )
@@ -250,6 +255,11 @@ async def lifespan(app: FastAPI):
         restored = await app.state.trading.try_restore_planes()
         if restored:
             logger.info("restored %d user trading plane(s)", restored)
+        # D-044 — every persisted practice plane comes back at boot (armed
+        # accounts keep executing AI signals even before the user opens the app)
+        practice = await app.state.trading.restore_practice_planes()
+        if practice:
+            logger.info("restored %d practice plane(s)", practice)
     except Exception:  # noqa: BLE001 — trading plane boot issues must not kill API
         logger.exception("trading plane init failed")
 

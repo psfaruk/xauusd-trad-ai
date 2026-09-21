@@ -11,16 +11,24 @@ D-043: every snapshot also carries `drawings` — the professional
 auto-drawing layer (hlines, trendlines, fib+OTE, notes, entry setups)
 built from the same frames, recomputed on each cache miss so the chart
 keeps re-drawing as the market moves.
+
+D-044: the snapshot is a full MARKET INTELLIGENCE packet —
+  flow  — order-flow statistics (USD traded value, delta, tape
+          velocity, whale entry zones)
+  news  — upcoming high-impact USD economic events
+  cot   — weekly CFTC institutional positioning (gold)
 """
 
 from __future__ import annotations
 
 import logging
 import time as time_mod
+from datetime import UTC, datetime
 from typing import Any
 
 from app.analysis.context import ANALYSIS_TFS, analyze_frame, mtf_bias
 from app.analysis.drawings import build_drawings
+from app.analysis.orderflow import flow_stats
 
 logger = logging.getLogger("xauusd.analysis")
 
@@ -29,8 +37,15 @@ BARS_PER_TF = {"M1": 260, "M5": 200, "M15": 160, "H1": 140, "H4": 120}
 
 
 class AnalysisService:
-    def __init__(self, ttl_s: float = CACHE_TTL_S) -> None:
+    def __init__(
+        self,
+        ttl_s: float = CACHE_TTL_S,
+        news_service: Any | None = None,
+        cot_service: Any | None = None,
+    ) -> None:
         self._ttl = float(ttl_s)
+        self._news = news_service
+        self._cot = cot_service
         self._cache: dict[str, tuple[float, dict]] = {}
 
     def invalidate(self, symbol: str | None = None) -> None:
@@ -81,9 +96,45 @@ class AnalysisService:
             )
         else:
             payload["drawings"] = []
+        # D-044 — order-flow statistics off the M1 tape
+        payload["flow"] = flow_stats(frames["M1"]) if frames.get("M1") is not None else {}
+        # D-044 — news events + weekly institutional positioning
+        payload["news"] = await self._news_block()
+        payload["cot"] = await self._cot_block()
         if snapshots:
             self._cache[symbol] = (now, payload)
         return payload
+
+    async def _news_block(self) -> dict:
+        if self._news is None:
+            return {"events": []}
+        try:
+            events = await self._news.upcoming(hours=48)
+        except Exception:  # noqa: BLE001 — panel must never break the snapshot
+            events = None
+        if not events:
+            return {"events": [], "available": bool(events)}
+        now = datetime.now(tz=UTC)
+        blackout = False
+        for e in events:
+            try:
+                when = datetime.fromisoformat(e["time"])
+                mins = abs((when - now).total_seconds()) / 60.0
+                if e.get("impact") == "high" and mins <= 30:
+                    blackout = True
+                    break
+            except (ValueError, KeyError):
+                continue
+        return {"events": events, "blackout_now": blackout, "available": True}
+
+    async def _cot_block(self) -> dict:
+        if self._cot is None:
+            return {}
+        try:
+            snap = await self._cot.snapshot()
+        except Exception:  # noqa: BLE001
+            snap = None
+        return snap or {}
 
     async def _live_price(
         self, source: Any, symbol: str, frames: dict[str, Any]

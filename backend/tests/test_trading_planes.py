@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from app.config import Settings
 from app.engine.config import DEFAULT_CONFIG, ConfigRepo
 from app.mt5.mock_source import MockDataSource
@@ -77,13 +75,15 @@ async def test_user_plane_connect_and_isolation() -> None:
 
 
 async def test_user_plane_auto_trade_requires_connection() -> None:
+    # D-044 — arming no longer needs a broker link: the practice plane is
+    # auto-provisioned on demand and the arm persists.
     mgr, _ = _manager()
-    with pytest.raises(ValueError):
-        await mgr.set_auto_trade(USER_A, True)  # not connected yet
-    await mgr.connect(USER_A, {"server": "s", "login": "1", "password": "x"})
-    out = await mgr.set_auto_trade(USER_A, True)
+    out = await mgr.set_auto_trade(USER_A, True)  # auto-provisions the plane
     assert out["auto_trade"] is True
     assert mgr.plane(USER_A).executor.auto_trade
+    out = await mgr.set_auto_trade(USER_A, False)
+    assert out["auto_trade"] is False
+    assert not mgr.plane(USER_A).executor.auto_trade
 
 
 async def test_signal_relay_only_armed_planes() -> None:

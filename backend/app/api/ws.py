@@ -61,6 +61,19 @@ async def ws_endpoint(ws: WebSocket) -> None:
     hub = ws.app.state.hub
     await hub.register(client)
     hb_task = asyncio.create_task(hub.heartbeat_loop(client))
+    # D-044 — auto-provision the user's practice plane so their account
+    # events (balance/positions) start streaming immediately (best-effort;
+    # the REST routes ensure it too on first touch).
+    trading = getattr(ws.app.state, "trading", None)
+
+    async def _ensure_plane() -> None:
+        try:
+            await trading.ensure_plane(user["id"])  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — plane provisions on next API touch
+            pass
+
+    if trading is not None:
+        asyncio.create_task(_ensure_plane())
     try:
         while True:
             raw = await ws.receive_text()

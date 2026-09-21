@@ -151,6 +151,9 @@ class EngineRuntime:
     # ----------------------------------------------------------------- loops
 
     async def _account_loop(self) -> None:
+        """D-044 — institution-account events are ADMIN-ONLY (the terminal
+        balance/positions are company data; each user's own account streams
+        to them via their trading plane's broadcast_user loop)."""
         try:
             while not self._stopped.is_set():
                 info = self._source.account_info()
@@ -158,7 +161,7 @@ class EngineRuntime:
                     info = await info
                 if info is not None:
                     positions = await self._source.get_positions()
-                    await self._hub.broadcast_all(
+                    await self._hub.broadcast_admins(
                         "account",
                         {
                             "balance": info["balance"],

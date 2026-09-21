@@ -1,18 +1,18 @@
 /**
- * SettingsView (D-041) — every former 3-dot-menu function lives in a tab now;
- * this one hosts: account, broker connection (the ONE connect flow), engine
- * settings (admin), practice trading (paper, optional), logs and about.
+ * SettingsView (D-041/D-044) — every former 3-dot-menu function lives in a
+ * tab; this one hosts: YOUR trading account (auto-provisioned practice
+ * plane), broker link (per-user, encrypted), engine settings (admin), data &
+ * privacy, logs and about.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  getConfig, getLogs, getTradingStatus, getTradingTrades, postMt5Connect,
-  postMt5Disconnect, postTradingAutoTrade, postTradingConnect,
-  postTradingDisconnect, putConfig,
+  getConfig, getLogs, getTradingStatus, postMt5Connect, postMt5Disconnect,
+  postTradingReset, putConfig,
 } from "../lib/api";
 import type {
   BrokerConnection, EngineConfig, LogEntry, Mt5Account, Mt5Status,
-  TradeRecord, TradingStatus,
+  TradingStatus,
 } from "../types";
 import { Badge, Btn, Card, Dot, EmptyState, Field, SectionTitle, Stat, inputCls } from "../components/ui";
 import { useAuth } from "../lib/auth";
@@ -22,6 +22,7 @@ interface Props {
   mt5: Mt5Status | null;
   broker: BrokerConnection | null;
   brokerAccount: Mt5Account | null;
+  tradingAccount: TradingStatus | null;
   isAdmin: boolean;
   dataSource: string;
   engineLogs: { level: string; message: string }[];
@@ -41,8 +42,8 @@ function BrokerCard({
   account: Mt5Account | null;
   onConnected: () => void;
 }) {
-  const connected = broker?.status === "connected" || account?.connected === true;
-  const [server, setServer] = useState("Exness-MT5Trial6");
+  const linked = broker?.status === "connected" || broker?.status === "linked";
+  const [server, setServer] = useState("");
   const [login, setLogin] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -77,11 +78,11 @@ function BrokerCard({
   return (
     <Card>
       <SectionTitle
-        title="Broker Account"
+        title="Broker Link"
         right={
-          connected ? (
+          linked ? (
             <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400">
-              <Dot tone="green" /> connected
+              <Dot tone="green" /> {broker?.status === "linked" ? "linked" : "connected"}
             </span>
           ) : broker?.status === "reconnecting" ? (
             <span className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-400">
@@ -89,50 +90,43 @@ function BrokerCard({
             </span>
           ) : (
             <span className="flex items-center gap-1.5 text-[10px] font-semibold text-zinc-500">
-              <Dot tone="zinc" /> not connected
+              <Dot tone="zinc" /> not linked
             </span>
           )
         }
       />
-      {connected ? (
+      {linked ? (
         <>
-          <div className="grid grid-cols-2 gap-2">
-            <Stat label="Balance" value={account?.balance?.toFixed(2) ?? "—"} hint={account?.currency ?? undefined} />
-            <Stat label="Equity" value={account?.equity?.toFixed(2) ?? "—"} />
-            <Stat label="Leverage" value={account?.leverage ? `1:${account.leverage}` : "—"} />
-            <Stat label="Type" value={account?.type ?? "—"} />
-          </div>
-          <p className="mt-2.5 truncate text-[10px] text-zinc-500">
-            {account?.broker ?? broker?.server ?? "—"}
-            {account?.login != null && ` · #${account.login}`}
-            {account?.server != null && ` · ${account.server}`}
+          <p className="text-[11px] leading-relaxed text-zinc-400">
+            {broker?.login_masked ?? broker?.login ?? "—"} @ {broker?.server ?? "—"} —
+            credentials are encrypted and stored for your account only.
           </p>
           <div className="mt-3">
             <Btn variant="danger" onClick={() => void disconnect()} disabled={busy} className="w-full">
-              {busy ? "Disconnecting…" : "Disconnect"}
+              {busy ? "Unlinking…" : "Unlink Broker"}
             </Btn>
           </div>
         </>
       ) : (
         <>
           <p className="mb-3 text-[11px] leading-relaxed text-zinc-400">
-            Connect your MetaTrader 5 broker account (e.g. Exness). The terminal login
-            happens on the server — you only connect once here.
+            Link your broker account to activate live routing for your trades.
+            Your credentials are encrypted per-user and never shared.
           </p>
           <div className="flex flex-col gap-2">
-            <Field label="Server">
-              <input className={inputCls} value={server} onChange={(e) => setServer(e.target.value)} placeholder="Exness-MT5Trial6" />
+            <Field label="Broker server">
+              <input className={inputCls} value={server} onChange={(e) => setServer(e.target.value)} placeholder="e.g. YourBroker-Real" />
             </Field>
             <div className="grid grid-cols-2 gap-2">
               <Field label="Login">
-                <input className={inputCls} value={login} onChange={(e) => setLogin(e.target.value)} inputMode="numeric" placeholder="414350770" />
+                <input className={inputCls} value={login} onChange={(e) => setLogin(e.target.value)} inputMode="numeric" placeholder="—" />
               </Field>
               <Field label="Password">
                 <input className={inputCls} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
               </Field>
             </div>
             <Btn variant="gold" onClick={() => void connect()} disabled={busy || !login || !password || !server} className="mt-1 w-full">
-              {busy ? "Connecting…" : "Connect Broker"}
+              {busy ? "Linking…" : "Link Broker"}
             </Btn>
           </div>
           {error && (
@@ -269,125 +263,110 @@ function EngineCard({ token, isAdmin }: { token: string; isAdmin: boolean }) {
   );
 }
 
-/* ------------------------------------------------------- practice trading */
+/* ------------------------------------------------- D-044 your account */
 
-function PracticeCard({ token }: { token: string }) {
+function YourAccountCard({ token }: { token: string }) {
   const [status, setStatus] = useState<TradingStatus | null>(null);
-  const [login, setLogin] = useState("");
-  const [password, setPassword] = useState("");
-  const [server, setServer] = useState("Exness-MT5Trial6");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [trades, setTrades] = useState<TradeRecord[] | null>(null);
+  const [reset, setReset] = useState(false);
 
   const reload = useCallback(() => {
     getTradingStatus(token).then(setStatus).catch(() => setStatus(null));
-    getTradingTrades(token, 10).then((r) => setTrades(r.trades)).catch(() => setTrades([]));
   }, [token]);
   useEffect(reload, [reload]);
+  useEffect(() => {
+    const t = window.setInterval(reload, 10_000);
+    return () => window.clearInterval(t);
+  }, [reload]);
 
-  const connected = status?.connected === true;
-
-  const connect = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await postTradingConnect(token, { server, login, password, mode: "demo" });
-      reload();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "connect failed");
-    } finally {
-      setBusy(false);
+  const doReset = async () => {
+    if (!reset) {
+      setReset(true); // two-tap confirm
+      window.setTimeout(() => setReset(false), 3000);
+      return;
     }
-  };
-
-  const disconnect = async () => {
     setBusy(true);
+    setReset(false);
     try {
-      await postTradingDisconnect(token);
+      await postTradingReset(token);
       reload();
     } finally {
       setBusy(false);
     }
   };
 
-  const toggleAuto = async () => {
-    if (!status) return;
-    setBusy(true);
-    try {
-      const enable = !status.auto_trade;
-      await postTradingAutoTrade(token, enable, enable ? "ENABLE" : undefined);
-      reload();
-    } finally {
-      setBusy(false);
-    }
-  };
+  const account = status?.account ?? null;
 
   return (
     <Card>
       <SectionTitle
-        title="Practice Trading (Paper)"
+        title="Your Trading Account"
         right={
-          connected ? (
+          status?.connected ? (
             <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400">
-              <Dot tone="green" /> active
+              <Dot tone="green" /> {status?.mode ?? "practice"}
             </span>
           ) : (
-            <Badge tone="zinc">optional</Badge>
+            <Badge tone="amber">starting…</Badge>
           )
         }
       />
       <p className="mb-3 text-[11px] leading-relaxed text-zinc-400">
-        Simulated (paper) account for testing the AI signals without real money —
-        completely optional, your broker account above is separate.
+        Your personal account on the institutional market feed — balance,
+        positions, risk settings and trade history are yours alone. Orders
+        fill at live market prices with SL/TP managed automatically.
       </p>
-      {connected ? (
-        <>
-          <div className="grid grid-cols-2 gap-2">
-            <Stat label="Paper balance" value={status?.account?.balance?.toFixed(2) ?? "—"} hint={status?.account?.currency} />
-            <Stat label="Paper equity" value={status?.account?.equity?.toFixed(2) ?? "—"} />
-          </div>
-          <div className="mt-3 grid grid-cols-2 gap-2">
-            <Btn variant={status?.auto_trade ? "success" : "default"} onClick={() => void toggleAuto()} disabled={busy}>
-              Copy signals: {status?.auto_trade ? "ON" : "OFF"}
-            </Btn>
-            <Btn variant="danger" onClick={() => void disconnect()} disabled={busy}>
-              Disconnect
-            </Btn>
-          </div>
-          {trades && trades.length > 0 && (
-            <ul className="mt-3 flex max-h-40 min-w-0 flex-col gap-1.5 overflow-y-auto pr-1">
-              {trades.map((t, i) => (
-                <li key={i} className="flex items-center gap-2 rounded-lg border border-zinc-800/70 bg-zinc-900/40 px-3 py-1.5 text-[11px]">
-                  <Badge tone={t.side.toLowerCase().includes("buy") ? "green" : "red"}>{t.side}</Badge>
-                  <span className="min-w-0 flex-1 truncate font-mono text-zinc-400 tabular-nums">
-                    {t.volume} @ {t.price_open?.toFixed(2)}
-                    {t.price_close != null && ` → ${t.price_close.toFixed(2)}`}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </>
-      ) : (
-        <div className="flex flex-col gap-2">
-          <Field label="Server">
-            <input className={inputCls} value={server} onChange={(e) => setServer(e.target.value)} />
-          </Field>
-          <div className="grid grid-cols-2 gap-2">
-            <Field label="Login">
-              <input className={inputCls} value={login} onChange={(e) => setLogin(e.target.value)} inputMode="numeric" />
-            </Field>
-            <Field label="Password">
-              <input className={inputCls} type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-            </Field>
-          </div>
-          <Btn onClick={() => void connect()} disabled={busy || !login || !password} className="mt-1 w-full">
-            {busy ? "Connecting…" : "Start practice account"}
-          </Btn>
-        </div>
-      )}
-      {error && <p className="mt-2.5 break-words text-[11px] text-red-300">{error}</p>}
+      <div className="grid grid-cols-2 gap-2">
+        <Stat label="Balance" value={account?.balance?.toFixed(2) ?? "—"} hint={account?.currency ?? "USD"} loading={status === null} />
+        <Stat
+          label="Equity"
+          value={account?.equity?.toFixed(2) ?? "—"}
+          loading={status === null}
+          tone={
+            account?.balance != null && account?.equity != null
+              ? account.equity >= account.balance ? "up" : "down"
+              : "default"
+          }
+        />
+      </div>
+      <div className="mt-3">
+        <Btn variant={reset ? "danger" : "default"} onClick={() => void doReset()} disabled={busy} className="w-full">
+          {busy ? "Resetting…" : reset ? "Tap again to confirm reset" : "Reset account (flat, $10,000)"}
+        </Btn>
+      </div>
+    </Card>
+  );
+}
+
+/* ---------------------------------------------- D-044 data & privacy */
+
+function DataPrivacyCard() {
+  return (
+    <Card>
+      <SectionTitle title="Data & Privacy" />
+      <div className="flex flex-col gap-2.5 text-[11px] leading-relaxed text-zinc-400">
+        <p>
+          <span className="font-semibold text-zinc-200">Market data.</span> Real-time
+          prices, volume and history are licensed and aggregated by the operating
+          institution from institutional market-data providers. Every user sees
+          the same public market data.
+        </p>
+        <p>
+          <span className="font-semibold text-zinc-200">Your account.</span> Your
+          balance, positions, risk settings and trade history are stored per-user
+          and are never visible to any other user.
+        </p>
+        <p>
+          <span className="font-semibold text-zinc-200">Credentials.</span> Linked
+          broker credentials are encrypted (at rest and in transit) and never
+          displayed again after saving or shared with third parties.
+        </p>
+        <p>
+          <span className="font-semibold text-zinc-200">Analytics.</span> Economic
+          calendars and positioning reports are sourced from public official
+          publications (e.g. CFTC) and refresh automatically.
+        </p>
+      </div>
     </Card>
   );
 }
@@ -458,16 +437,17 @@ export default function SettingsView({
 
   return (
     <div className="flex min-w-0 flex-col gap-3">
+      <YourAccountCard token={token} />
       <BrokerCard token={token} broker={broker} account={brokerAccount} onConnected={onBrokerConnected} />
       <EngineCard token={token} isAdmin={isAdmin} />
-      <PracticeCard token={token} />
+      <DataPrivacyCard />
       <LogsCard token={token} engineLogs={engineLogs} />
 
       <Card>
         <SectionTitle title="Account" />
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <Badge tone="zinc">{email}</Badge>
-          <Badge tone={isAdmin ? "gold" : "blue"}>{isAdmin ? "admin" : "viewer"}</Badge>
+          <Badge tone={isAdmin ? "gold" : "blue"}>{isAdmin ? "admin" : "member"}</Badge>
           <Badge tone="green">data: {dataSource || mt5?.status || "live"}</Badge>
           <Btn variant="default" onClick={() => void signOut()} className="ml-auto">
             Sign out
@@ -478,9 +458,9 @@ export default function SettingsView({
       <Card>
         <SectionTitle title="About" />
         <p className="text-[11px] leading-relaxed text-zinc-400">
-          XAUUSD AI Trading Platform — real MetaTrader 5 data only (no demo prices).
-          Engine: M1 entries with H1 trend + M5/M15 multi-timeframe confirmation.
-          Signals and orders execute through your connected broker terminal.
+          Gold AI Trading — institutional-grade market data only. Engine: M1
+          entries with H1 trend + M5/M15 multi-timeframe confirmation, order-flow
+          and news-window filtering. Every account is isolated per user.
         </p>
       </Card>
     </div>

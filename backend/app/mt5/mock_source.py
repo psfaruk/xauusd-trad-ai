@@ -38,6 +38,7 @@ from app.mt5.base import (
     empty_rates,
     validate_tf,
 )
+from app.mt5.paper import PaperPlaneMixin
 
 TRADE_RETCODE_DONE = 10009
 
@@ -89,7 +90,7 @@ class _Account:
     leverage: int = 500
 
 
-class MockDataSource(DataSource):
+class MockDataSource(PaperPlaneMixin, DataSource):
     """Deterministic synthetic market for tests and demo (DATA_SOURCE=mock)."""
 
     SYMBOL = "XAUUSDm"  # Exness-style symbol name (SPEC C3)

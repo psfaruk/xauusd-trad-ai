@@ -168,7 +168,7 @@ export default function ChartsView({
             ))}
             {feedProvider?.mt5 && (
               <span className="ml-auto shrink-0 self-center text-[10px] text-zinc-600">
-                MT5 terminal · {feedProvider.provider ?? ""}
+                Institutional feed
               </span>
             )}
           </div>

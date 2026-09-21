@@ -9,13 +9,13 @@ import SettingsView from "../views/SettingsView";
 import { useAuth } from "../lib/auth";
 import {
   getCandles, getMt5Status, getSignals, getStats, getHealth, getMe,
-  getMt5Account, getMt5AutoTrade,
+  getMt5Account, getMt5AutoTrade, getTradingStatus,
 } from "../lib/api";
 import { WSClient } from "../lib/ws";
 import { feed } from "../state/feed";
 import type {
-  AppTab, Mt5Account, Mt5AutoTradeStatus, Mt5Status, Timeframe, WsMessage,
-  WsMt5AutoMsg,
+  AppTab, Mt5Account, Mt5AutoTradeStatus, Mt5Status, Timeframe, TradingStatus,
+  WsMessage, WsMt5AutoMsg, WsTradingAccountMsg, WsTradingLogMsg,
 } from "../types";
 
 /**
@@ -56,6 +56,7 @@ export default function Dashboard() {
   const [autoStatus, setAutoStatus] = useState<Mt5AutoTradeStatus | null>(null);
   const [autoEvents, setAutoEvents] = useState<WsMt5AutoMsg[]>([]);
   const [brokerAccount, setBrokerAccount] = useState<Mt5Account | null>(null);
+  const [tradingAccount, setTradingAccount] = useState<TradingStatus | null>(null);
   const [aiRefreshKey, setAiRefreshKey] = useState(0);
 
   const isAdmin = useMemo(() => role === "admin", [role]);
@@ -152,6 +153,38 @@ export default function Dashboard() {
           }
           break;
         }
+        case "trading_account": {
+          // D-044 — the USER's own plane state, pushed every 5s (realtime)
+          const ev = msg as WsTradingAccountMsg;
+          setTradingAccount((prev) => ({
+            ...(prev ?? {}),
+            connected: true,
+            mode: ev.mode,
+            auto_trade: ev.auto_trade,
+            account: {
+              ...(prev?.account ?? {}),
+              balance: ev.balance,
+              equity: ev.equity,
+              currency: ev.currency,
+            },
+          }));
+          break;
+        }
+        case "trading_log": {
+          // D-044 — per-user plane activity into the AI Activity feed
+          const ev = msg as WsTradingLogMsg;
+          setAutoEvents((prev) => [
+            ...prev.slice(-(EVENT_CAP - 1)),
+            {
+              type: "mt5_auto",
+              ts: new Date().toISOString(),
+              level: ev.level,
+              message: ev.message,
+              event: "log" as const,
+            },
+          ]);
+          break;
+        }
         default:
           break;
       }
@@ -197,11 +230,22 @@ export default function Dashboard() {
     if (!token) return;
     getMt5Status(token).then(setMt5).catch(() => undefined);
     getMt5AutoTrade(token).then(setAutoStatus).catch(() => undefined);
+    // D-044 — the USER's own trading account (auto-provisioned practice
+    // plane; total per-user isolation)
+    getTradingStatus(token)
+      .then((st) =>
+        setTradingAccount((prev) => ({ ...prev, ...st, connected: st.connected }))
+      )
+      .catch(() => undefined);
+  }, [token]);
+
+  const refreshAdmin = useCallback(() => {
+    // D-044 — the INSTITUTION account is admin-only data
+    if (!token || !isAdmin) return;
     getMt5Account(token)
       .then((a) => setBrokerAccount(a.connected ? a : null))
-      .catch(() => undefined); // transient errors keep the previous state —
-      // only an explicit connected:false clears the account (honest UX)
-  }, [token]);
+      .catch(() => undefined);
+  }, [token, isAdmin]);
 
   useEffect(() => {
     if (!token) return;
@@ -211,6 +255,14 @@ export default function Dashboard() {
     const timer = window.setInterval(refreshSlow, 8_000);
     return () => window.clearInterval(timer);
   }, [token, refreshSlow, wsState]);
+
+  // institution account poll starts once the role is known (admin only)
+  useEffect(() => {
+    if (!token || !isAdmin) return;
+    refreshAdmin();
+    const timer = window.setInterval(refreshAdmin, 8_000);
+    return () => window.clearInterval(timer);
+  }, [token, isAdmin, refreshAdmin]);
 
   // candle refetch on (re)connect
   useEffect(() => {
@@ -259,7 +311,7 @@ export default function Dashboard() {
                   <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
                   <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
                 </span>
-                MT5
+                LIVE
               </span>
             )}
             {mt5?.status === "reconnecting" && (
@@ -289,7 +341,8 @@ export default function Dashboard() {
               onSymbolChange={onSymbolChange}
               mt5={mt5}
               broker={broker}
-              brokerAccount={brokerAccount}
+              tradingAccount={tradingAccount}
+              isAdmin={isAdmin}
               autoArmed={autoArmed}
               autoWhy={autoWhy}
               signals={signals}
@@ -334,6 +387,7 @@ export default function Dashboard() {
               mt5={mt5}
               broker={broker}
               brokerAccount={brokerAccount}
+              tradingAccount={tradingAccount}
               isAdmin={isAdmin}
               dataSource={dataSource}
               engineLogs={engineLogs}

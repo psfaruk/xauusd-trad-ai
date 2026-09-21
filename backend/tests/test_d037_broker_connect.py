@@ -58,11 +58,13 @@ def _terminal_ok() -> dict:
 async def test_demo_mode_binds_without_terminal():
     svc = _svc(demo_mode=True)
     res = await svc.connect("user-a", "Exness-MT5Trial6", "123", "pw")
-    assert res["status"] == "connected"
-    assert res["mode"] == "demo"
+    # D-044 — non-admin/demo links return "linked" (per-user broker
+    # profile; no institution-terminal data exposed)
+    assert res["status"] == "linked"
+    assert res["mode"] == "broker-link"
     st = await svc.status("user-a")
-    assert st["status"] == "connected"
-    assert st["login"] == "123"
+    assert st["status"] == "linked"
+    assert "•" in st["login_masked"]
 
 
 async def test_live_connect_binds_terminal_session(monkeypatch):

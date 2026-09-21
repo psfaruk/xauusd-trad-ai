@@ -1,12 +1,13 @@
 /**
- * HomeView (D-041) — mobile-app style home: live price hero, AI auto-trade
- * status, latest signal, performance stats, broker account. Skeletons until
+ * HomeView (D-041/D-044) — mobile-app style home: live price hero, AI
+ * auto-trade status, latest signal, performance stats, the USER's own
+ * trading account (practice plane — isolated per user). Skeletons until
  * REAL data arrives (user requirement: loading until data comes).
  */
 
 import { useTick } from "../state/feed";
 import type {
-  BrokerConnection, Mt5Account, Mt5Status, Signal, StatsResponse,
+  BrokerConnection, Mt5Status, Signal, StatsResponse, TradingStatus,
 } from "../types";
 import { Badge, Btn, Card, Dot, SectionTitle, Skeleton, Stat } from "../components/ui";
 import { LatestSignalCard } from "../components/SignalDetail";
@@ -18,7 +19,8 @@ interface Props {
   onSymbolChange: (s: string) => void;
   mt5: Mt5Status | null;
   broker: BrokerConnection | null;
-  brokerAccount: Mt5Account | null;
+  tradingAccount: TradingStatus | null;
+  isAdmin: boolean;
   autoArmed: boolean;
   autoWhy: { code: string; text: string } | null;
   signals: Signal[];
@@ -54,7 +56,7 @@ function PriceHero({
             <Badge tone="gold">XAU / Gold</Badge>
           </div>
           <p className="mt-0.5 text-[10px] text-zinc-500">
-            Real MT5 feed{tick?.tps != null && ` · ${tick.tps.toFixed(1)} ticks/s`}
+            Institutional market feed{tick?.tps != null && ` · ${tick.tps.toFixed(1)} ticks/s`}
           </p>
         </div>
         <Badge tone={market === "open" ? "green" : market === "closed" ? "amber" : "red"} pulse={market === "open"}>
@@ -99,7 +101,8 @@ export default function HomeView({
   onSymbolChange,
   mt5,
   broker,
-  brokerAccount,
+  tradingAccount,
+  isAdmin,
   autoArmed,
   autoWhy,
   signals,
@@ -112,7 +115,8 @@ export default function HomeView({
   const market = mt5?.feed?.symbols?.[symbol]?.market ?? "unknown";
   const feedProvider = mt5?.feed?.symbols?.[symbol];
   const latest = signals[0] ?? null;
-  const brokerConnected = broker?.status === "connected" || brokerAccount?.connected;
+  const account = tradingAccount?.account ?? null;
+  const brokerLinked = broker?.status === "connected" || broker?.status === "linked";
   const winRate = stats?.win_rate;
   const expectancy = stats?.expectancy;
 
@@ -184,63 +188,58 @@ export default function HomeView({
 
       <LatestSignalCard signal={latest} onOpen={() => latest && onOpenSignal(latest.id)} />
 
-      {/* broker account */}
+      {/* the user's own trading account (D-044 — isolated practice plane) */}
       <Card>
         <SectionTitle
-          title="Broker Account"
+          title="Your Trading Account"
           right={
-            brokerConnected ? (
+            tradingAccount?.connected ? (
               <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400">
-                <Dot tone="green" /> connected
+                <Dot tone="green" /> active
               </span>
             ) : (
               <span className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-400">
-                <Dot tone="amber" /> not connected
+                <Dot tone="amber" /> starting…
               </span>
             )
           }
         />
-        {brokerConnected ? (
-          <>
-            <div className="grid grid-cols-2 gap-2">
-              <Stat
-                label="Balance"
-                value={brokerAccount?.balance != null ? brokerAccount.balance.toFixed(2) : "—"}
-                loading={brokerAccount == null}
-                hint={brokerAccount?.currency ?? undefined}
-              />
-              <Stat
-                label="Equity"
-                value={brokerAccount?.equity != null ? brokerAccount.equity.toFixed(2) : "—"}
-                loading={brokerAccount == null}
-              />
-            </div>
-            <p className="mt-2.5 truncate text-[10px] text-zinc-500">
-              {brokerAccount?.server ?? broker?.server ?? "—"}
-              {brokerAccount?.login != null && ` · #${brokerAccount.login}`}
-            </p>
-          </>
-        ) : (
-          <>
-            <p className="text-[11px] leading-relaxed text-zinc-400">
-              Connect your Exness (MetaTrader 5) account to receive real prices and let the
-              AI trade for you.
-            </p>
-            <div className="mt-3">
-              <Btn variant="gold" onClick={onOpenSettings} className="w-full">
-                Connect Broker
-              </Btn>
-            </div>
-          </>
-        )}
+        <div className="grid grid-cols-2 gap-2">
+          <Stat
+            label="Balance"
+            value={account?.balance != null ? account.balance.toFixed(2) : "—"}
+            loading={tradingAccount === null}
+            hint={account?.currency ?? "USD"}
+          />
+          <Stat
+            label="Equity"
+            value={account?.equity != null ? account.equity.toFixed(2) : "—"}
+            loading={tradingAccount === null}
+            tone={
+              account?.balance != null && account?.equity != null
+                ? account.equity >= account.balance ? "up" : "down"
+                : "default"
+            }
+          />
+        </div>
+        <p className="mt-2.5 truncate text-[10px] text-zinc-500">
+          {brokerLinked
+            ? `Broker linked · ${broker?.login_masked ?? broker?.server ?? "—"}`
+            : "Practice account · link your broker in Settings"}
+        </p>
+        <div className="mt-3">
+          <Btn variant="gold" onClick={onOpenAi} className="w-full">
+            Trade with AI →
+          </Btn>
+        </div>
       </Card>
 
       {/* feed transparency */}
       <Card>
         <SectionTitle title="Market Data" />
         <div className="flex flex-wrap items-center gap-2 text-[10px] text-zinc-500">
-          <Badge tone={feedProvider?.mt5 ? "green" : "zinc"}>
-            {feedProvider?.mt5 ? "MT5 terminal" : feedProvider?.provider ?? "—"}
+          <Badge tone={feedProvider?.mt5 || feedProvider?.provider ? "green" : "zinc"}>
+            {feedProvider?.mt5 ? "Institutional feed" : feedProvider?.provider ?? "—"}
           </Badge>
           {mt5?.status === "connected" && <Badge tone="green">platform connected</Badge>}
           {mt5?.status === "reconnecting" && <Badge tone="amber" pulse>reconnecting…</Badge>}

@@ -180,3 +180,86 @@ def whale_summary(df: pd.DataFrame, lookback: int = 60) -> dict[str, Any]:
         "bias": "buy" if buys > sells else ("sell" if sells > buys else "neutral"),
         "last": recent[-1] if recent else None,
     }
+
+
+def flow_stats(
+    df: pd.DataFrame, contract_size: float = 100.0
+) -> dict[str, Any]:
+    """D-044 — session order-flow statistics off the M1 tape.
+
+    Everything a professional flow panel shows, estimated honestly from
+    broker data (tick volume + OHLC):
+
+    - usd_24h / usd_1h   — estimated traded value in USD
+                           (tick_volume x contract x typical price)
+    - volume_24h         — raw tick volume (activity)
+    - buy_pct / delta_1h — aggressive buy-vs-sell split (delta proxy)
+    - velocity           — ticks per minute over the last hour vs the
+                           day average (tape speed — institutions trade
+                           in bursts)
+    - whale_zones        — price bands where the largest volume spikes
+                           traded (institutional entry areas)
+    """
+    n = len(df)
+    if n < 20:
+        return {}
+    out: dict[str, Any] = {}
+    try:
+        vol = df["v"].astype(float)
+        typical = (df["h"].astype(float) + df["l"].astype(float) + df["c"].astype(float)) / 3.0
+        usd = (vol * contract_size * typical).astype(float)
+        day = df.iloc[-1440:] if n > 1440 else df
+        hour = df.iloc[-60:] if n > 60 else df
+        out["usd_24h"] = float(usd.iloc[-len(day):].sum())
+        out["usd_1h"] = float(usd.iloc[-len(hour):].sum())
+        out["volume_24h"] = int(vol.iloc[-len(day):].sum())
+        # aggressive-side split over the last hour (delta proxy weighted)
+        d1h = sum(
+            delta_proxy(hour.iloc[i]) * float(hour["v"].iloc[i])
+            for i in range(len(hour))
+        )
+        v1h = float(hour["v"].sum())
+        out["delta_1h"] = round(d1h, 1)
+        out["buy_pct_1h"] = (
+            round(100.0 * (0.5 + 0.5 * (d1h / v1h if v1h > 0 else 0.0)), 1)
+        )
+        # tape velocity: ticks/min last 15m vs 24h average
+        v15 = float(df["v"].iloc[-15:].sum()) / 15.0 if n >= 15 else None
+        vavg = float(day["v"].sum()) / max(len(day), 1)
+        out["velocity"] = round(v15 / vavg, 2) if v15 is not None and vavg > 0 else None
+        # whale zones — cluster the biggest volume bars into price bands
+        events = detect_whale_events(df, lookback=60, max_events=24)
+        zones: list[dict[str, Any]] = []
+        atr = atr_series(df, 14)
+        band = 0.25 * float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else 0.5
+        for e in sorted(events, key=lambda x: -x["vol_z"])[-18:]:
+            price = float(e["price"])
+            for z in zones:
+                if abs((z["lo"] + z["hi"]) / 2.0 - price) <= band:
+                    z["lo"] = min(z["lo"], price - band)
+                    z["hi"] = max(z["hi"], price + band)
+                    z["events"] += 1
+                    z["vol_z"] = max(z["vol_z"], e["vol_z"])
+                    z["side"] = e["side"] if z["side"] == e["side"] else "mixed"
+                    break
+            else:
+                zones.append(
+                    {
+                        "lo": price - band,
+                        "hi": price + band,
+                        "price": price,
+                        "side": e["side"],
+                        "kind": e["kind"],
+                        "vol_z": e["vol_z"],
+                        "events": 1,
+                        "t": e["t"],
+                        "note": e["note"],
+                    }
+                )
+        out["whale_zones"] = sorted(
+            zones, key=lambda z: -z["vol_z"]
+        )[:5]
+        out["bias"] = whale_summary(df).get("bias", "neutral")
+    except Exception:  # noqa: BLE001 — flow panel must never break the snapshot
+        return {}
+    return out

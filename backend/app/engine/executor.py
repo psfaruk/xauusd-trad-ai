@@ -486,8 +486,22 @@ class OrderExecutor:
         if self._hub is None:
             return
         try:
-            await self._hub.broadcast_all(
-                "engine_log", {"level": level, "message": message}
-            )
+            # D-044 — a USER plane's order/skip events go ONLY to that user;
+            # only the platform executor (owner=None) broadcasts globally.
+            if self._owner is not None:
+                await self._hub.broadcast_user(
+                    self._owner,
+                    "mt5_auto",
+                    {
+                        "event": "log",
+                        "level": level,
+                        "ts": datetime.now(tz=UTC).isoformat(),
+                        "message": message,
+                    },
+                )
+            else:
+                await self._hub.broadcast_all(
+                    "engine_log", {"level": level, "message": message}
+                )
         except Exception:  # noqa: BLE001
             pass

@@ -126,24 +126,36 @@ class BrokerConnectionService:
 
     # ----------------------------------------------------------- connect
     async def connect(self, user_id: str, server: str, login: str,
-                      password: str) -> dict[str, Any]:
-        """Verify (server, login) against the live terminal session and bind."""
+                      password: str, admin: bool = True) -> dict[str, Any]:
+        """Link a broker account to THIS user (D-044 per-user isolation).
+
+        - admin=True: verify (server, login) against the live INSTITUTION
+          terminal session and bind (the institution's own account).
+        - admin=False (public user): store the user's OWN broker profile
+          (Fernet-encrypted) with status "linked" — no institution-terminal
+          data is exposed or required. Execution stays on the user's
+          practice plane until the institution provisions live routing.
+        """
         async with self._lock:
-            if self._demo:
-                # mock plane (tests / ALLOW_DEMO): record without a terminal
+            if self._demo or not admin:
+                masked = self._mask(login)
                 conn = BrokerConnection(
                     user_id=user_id, login=login, server=server,
-                    account={"login": login, "server": server,
+                    account={"login": masked, "server": server,
                              "currency": "USD", "balance": None},
                 )
                 self._connections[user_id] = conn
                 await self._persist(conn, password)
                 return {
-                    "status": "connected",
-                    "login": login,
+                    "status": "linked",
+                    "login_masked": masked,
                     "server": server,
-                    "account": dict(conn.account),
-                    "mode": "demo",
+                    "mode": "broker-link",
+                    "detail": (
+                        "Broker linked to your account. Trading executes on "
+                        "your practice balance; live routing is activated by "
+                        "the institution after verification."
+                    ),
                 }
             res = await asyncio.to_thread(self._terminal_account)
             acct = res.get("account", {}) or {}
@@ -151,7 +163,7 @@ class BrokerConnectionService:
 
             if term.get("server_connected") is not True:
                 raise BrokerUnavailableError(
-                    "the MetaTrader 5 terminal has no active broker session on "
+                    "the trading terminal has no active broker session on "
                     "this host (market/server down or not provisioned)"
                 )
 
@@ -182,6 +194,13 @@ class BrokerConnectionService:
                 "server": conn.server,
                 "account": dict(conn.account),
             }
+
+    @staticmethod
+    def _mask(login: str) -> str:
+        """Never echo a full account number back (privacy)."""
+        if len(login) <= 2:
+            return "••"
+        return f"{login[:2]}{'•' * max(len(login) - 4, 2)}{login[-2:]}"
 
     @staticmethod
     def _snapshot(acct: dict, term: dict) -> dict[str, Any]:
@@ -272,6 +291,15 @@ class BrokerConnectionService:
         conn = self._connections.get(user_id)
         if conn is None:
             return {"status": "disconnected"}
+        if conn.account.get("balance") is None and not conn.account.get("name"):
+            # D-044 broker-LINK (public user): per-user profile only — no
+            # institution-terminal data to expose or refresh.
+            return {
+                "status": "linked",
+                "login_masked": self._mask(conn.login),
+                "server": conn.server,
+                "connected_at": conn.connected_at,
+            }
         if self._demo:
             return {
                 "status": "connected",

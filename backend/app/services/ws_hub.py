@@ -95,6 +95,14 @@ class WSHub:
             if client.user.get("id") == user_id:
                 await self._send(client, msg)
 
+    async def broadcast_admins(self, event_type: str, payload: dict) -> None:
+        """D-044 — institution-account events (balance/positions of the
+        company terminal) reach ADMIN sockets only."""
+        msg = {"type": event_type, **payload}
+        for client in list(self._clients):
+            if client.user.get("role") == "admin":
+                await self._send(client, msg)
+
     async def heartbeat_loop(self, client: Client) -> None:
         """Per-client heartbeat — exits when the socket dies."""
         try:

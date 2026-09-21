@@ -72,6 +72,31 @@ create table if not exists trades (
   opened_at timestamptz, closed_at timestamptz
 );
 
+-- D-044: per-user trading accounts (auto-provisioned practice plane for
+-- every user — balance/settings persisted so a restart never loses state).
+create table if not exists user_accounts (
+  owner uuid primary key references profiles(id) on delete cascade,
+  kind text not null default 'practice' check (kind in ('practice','broker')),
+  balance double precision not null default 10000,
+  currency text not null default 'USD',
+  auto_trade boolean not null default false,
+  settings jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+-- D-044: open positions of the per-user practice planes (restored on boot).
+create table if not exists user_positions (
+  ticket bigint primary key,
+  owner uuid not null references profiles(id) on delete cascade,
+  symbol text not null,
+  side text not null check (side in ('BUY','SELL')),
+  volume double precision not null,
+  price_open double precision not null,
+  sl double precision, tp double precision,
+  opened_at timestamptz not null default now()
+);
+create index if not exists user_positions_owner_idx on user_positions (owner);
+
 create table if not exists logs (
   id bigint generated always as identity primary key,
   ts timestamptz not null default now(),

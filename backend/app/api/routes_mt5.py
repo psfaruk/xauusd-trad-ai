@@ -1,24 +1,31 @@
 """routes_mt5 — MT5 endpoints.
 
 Phase 2 (SPEC §7.1):
-POST /api/mt5/connect     (auth)  per-user broker connect (D-037)
-POST /api/mt5/disconnect  (auth)  drop the user's broker connection
-GET  /api/mt5/status      (auth)  per-user connection state + account
+POST /api/mt5/connect     (auth)  per-user broker link (D-037/D-044)
+POST /api/mt5/disconnect  (auth)  drop the user's broker link
+GET  /api/mt5/status      (auth)  per-user connection state + platform feed
 
-D-034 — real MT5 terminal bridge (MCP):
-GET  /api/mt5/account     (auth + connection) live account snapshot
-GET  /api/mt5/positions   (auth + connection) open positions + orders
-GET  /api/mt5/history     (auth + connection) closed-position history
+D-034 — the REAL terminal bridge (INSTITUTION-OPERATED, D-044):
+GET  /api/mt5/account     (admin) live institution account snapshot
+GET  /api/mt5/positions   (admin) open positions + orders
+GET  /api/mt5/history     (admin) closed-position history
 GET  /api/mt5/symbols     (auth)  Market Watch symbols (read-only)
-POST /api/mt5/order       (auth + connection) market order (REAL account)
-POST /api/mt5/close       (auth + connection) close a position by ticket
+POST /api/mt5/order       (admin) market order (institution account)
+POST /api/mt5/close       (admin) close a position by ticket
 
-D-036 — AI signal -> auto-order on the REAL account:
-GET  /api/mt5/auto-trade  (auth)  arm state + readiness + risk summary
-POST /api/mt5/auto-trade  (admin OR connected user) {enabled, confirm}
+D-036/D-044 — AI signal -> auto-order:
+GET  /api/mt5/auto-trade  (auth)  PER-USER arm state + the user's OWN
+                                   account balance/risk (admins additionally
+                                   get the institution terminal block)
+POST /api/mt5/auto-trade  (auth)  arm/disarm — non-admins arm THEIR OWN
+                                   practice plane; admins arm the institution
+                                   terminal executor.
 
-D-037 — every trading route is scoped to the requesting user's OWN broker
-connection: users only ever see/trade the account they connected.
+D-044 institutional isolation: the trading terminal is company infrastructure
+— its account/balance/positions/history are visible to ADMINS ONLY. Every
+regular user trades on their own auto-provisioned practice plane (own
+balance, own positions, own risk settings) via /api/trading/* and the
+per-user auto-trade endpoints below.
 """
 
 from __future__ import annotations
@@ -28,7 +35,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.auth import CurrentUser
+from app.auth import AdminUser, CurrentUser
 from app.mt5.auto_trader import ArmError
 from app.mt5.broker_connect import (
     AccountMismatchError,
@@ -83,8 +90,18 @@ def _is_demo(request: Request) -> bool:
     return getattr(request.app.state, "data_source", "") == "mock"
 
 
+def _trading(request: Request):
+    svc = getattr(request.app.state, "trading", None)
+    if svc is None:
+        raise HTTPException(
+            status_code=503,
+            detail="trading service not initialized on this server",
+        )
+    return svc
+
+
 def _require_connection(request: Request, user: CurrentUser) -> None:
-    """D-037: trading routes only for users with an active broker connection."""
+    """D-037: broker-link routes only for users with an active link."""
     try:
         _broker(request).get(user["id"])
     except NotConnectedError as exc:
@@ -110,16 +127,17 @@ async def _mcp_call(fn, *args, **kwargs):
 
 @router.post("/connect")
 async def mt5_connect(body: ConnectBody, request: Request, user: CurrentUser) -> dict:
-    """D-037: connect THIS user's broker account through the REAL terminal.
+    """D-037/D-044: link a broker account to THIS user.
 
-    The entered (server, login) must match the live terminal session; the
-    password is Fernet-encrypted at rest. On success the user is bound to
-    the account and every /api/mt5/* route serves THEIR connection.
+    Admins bind the institution terminal session (verified, live data);
+    regular users store their OWN broker profile encrypted per-user —
+    execution stays on their practice plane, isolation is total.
     """
     svc = _broker(request)
     try:
         result = await svc.connect(
-            user["id"], body.server, body.login, body.password
+            user["id"], body.server, body.login, body.password,
+            admin=user.get("role") == "admin",
         )
     except AccountMismatchError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -171,10 +189,11 @@ async def mt5_status(request: Request, user: CurrentUser) -> dict:
 
 
 # ------------------------------------------------------------------ D-034
+# D-044: the terminal is INSTITUTION infrastructure — these routes are
+# admin-only. Regular users trade their own practice planes (/api/trading).
 @router.get("/account")
-async def mt5_account(request: Request, user: CurrentUser) -> dict:
-    """Live account through the real MetaTrader 5 terminal (user-scoped)."""
-    _require_connection(request, user)
+async def mt5_account(request: Request, user: AdminUser) -> dict:
+    """Institution account through the real terminal (admin only)."""
     res = await _mcp_call(terminal_client().account)
     acct = res.get("account", {})
     term = res.get("terminal", {})
@@ -200,8 +219,7 @@ async def mt5_account(request: Request, user: CurrentUser) -> dict:
 
 
 @router.get("/positions")
-async def mt5_positions(request: Request, user: CurrentUser) -> dict:
-    _require_connection(request, user)
+async def mt5_positions(request: Request, user: AdminUser) -> dict:
     res = await _mcp_call(terminal_client().positions)
     return {"positions": res.get("positions", []), "orders": res.get("orders", [])}
 
@@ -209,11 +227,10 @@ async def mt5_positions(request: Request, user: CurrentUser) -> dict:
 @router.get("/history")
 async def mt5_history(
     request: Request,
-    user: CurrentUser,
+    user: AdminUser,
     days: int = Query(default=30, ge=1, le=365),
     symbol: str | None = Query(default=None, max_length=32),
 ) -> dict:
-    _require_connection(request, user)
     res = await _mcp_call(terminal_client().history, days=days, symbol=symbol)
     return {"positions": res.get("positions", [])}
 
@@ -226,9 +243,8 @@ async def mt5_symbols(user: CurrentUser) -> dict:
 
 
 @router.post("/order")
-async def mt5_order(body: OrderBody, request: Request, user: CurrentUser) -> dict:
-    """Market order on the REAL account — executed by MetaTrader 5 (MCP)."""
-    _require_connection(request, user)
+async def mt5_order(body: OrderBody, request: Request, user: AdminUser) -> dict:
+    """Market order on the INSTITUTION account (admin only)."""
     res = await _mcp_call(
         terminal_client().market_order,
         symbol=body.symbol,
@@ -252,8 +268,7 @@ async def mt5_order(body: OrderBody, request: Request, user: CurrentUser) -> dic
 
 
 @router.post("/close")
-async def mt5_close(body: CloseBody, request: Request, user: CurrentUser) -> dict:
-    _require_connection(request, user)
+async def mt5_close(body: CloseBody, request: Request, user: AdminUser) -> dict:
     res = await _mcp_call(
         terminal_client().close_position, symbol=body.symbol, ticket=body.ticket
     )
@@ -278,10 +293,131 @@ def _auto_trader(request: Request):
     return trader
 
 
+def _markets_snapshot(request: Request) -> dict:
+    """Per-symbol broker-market state from the institution feed (public
+    info: market open/closed — no account details)."""
+    trader = getattr(request.app.state, "mt5_auto", None)
+    if trader is None:
+        return {}
+    try:
+        state = trader._market_state  # noqa: SLF001 — route glue
+    except AttributeError:
+        return {}
+    out: dict = {}
+    for sym in ("XAUUSD", "BTCUSD"):
+        try:
+            open_, detail = state(sym)
+        except Exception:  # noqa: BLE001
+            open_, detail = True, "market state unknown"
+        out[sym] = {"open": bool(open_), "detail": detail}
+    return out
+
+
+async def _user_auto_status(request: Request, user: CurrentUser) -> dict:
+    """D-044 — the USER's own auto-trade state (practice plane).
+
+    Mirrors the admin payload shape but every number is the user's OWN
+    account: balance/equity of their plane, their risk settings, their
+    skip reason. Institution-terminal details never appear here.
+    """
+    trading = getattr(request.app.state, "trading", None)
+    owner = user["id"]
+    if trading is None:
+        # degraded server (no trading service): honest minimal state
+        return {
+            "armed": False,
+            "scope": "account",
+            "account": None,
+            "markets": _markets_snapshot(request),
+            "why": {
+                "code": "not_armed",
+                "text": "AI auto-trade is OFF for your account.",
+            },
+            "risk": {},
+            "last_skip_reason": None,
+        }
+    try:
+        plane = await trading.ensure_plane(owner)
+        info = plane.source.account_info()
+        if asyncio.iscoroutine(info):
+            info = await info
+        armed = plane.executor.auto_trade
+        balance = float(info.get("balance")) if info else None
+        skip = plane.executor.last_skip_reason
+    except Exception:  # noqa: BLE001 — degraded feed/DB: fall back to stored
+        account = await trading._load_account(owner)  # noqa: SLF001 — route glue
+        armed = bool(account and account.get("auto_trade"))
+        balance = float(account.get("balance")) if account else None
+        info = None
+        skip = None
+    markets = _markets_snapshot(request)
+    if not armed:
+        why = {
+            "code": "not_armed",
+            "text": (
+                "AI auto-trade is OFF for your account — turn the switch on"
+                " in the AI Trading tab."
+            ),
+        }
+    elif balance is not None and balance <= 0:
+        why = {
+            "code": "no_balance",
+            "text": (
+                "Your practice balance is exhausted — reset it in Settings"
+                " to keep trading."
+            ),
+        }
+    elif (
+        markets.get("XAUUSD", {}).get("open") is False
+        and markets.get("BTCUSD", {}).get("open") is False
+    ):
+        why = {
+            "code": "market_closed",
+            "text": (
+                "Markets are closed (weekend/holiday) — signals stay, your"
+                " orders resume at open."
+            ),
+        }
+    else:
+        why = {
+            "code": "ready",
+            "text": (
+                "Armed and ready — every confirmed AI signal executes on"
+                " your account automatically."
+            ),
+        }
+    settings = await trading.user_settings(owner)
+    return {
+        "armed": armed,
+        "scope": "account",
+        "account": {
+            "mode": "practice",
+            "balance": balance,
+            "equity": float(info.get("equity")) if info else None,
+            "currency": (info or {}).get("currency", "USD"),
+        },
+        "markets": markets,
+        "why": why,
+        "risk": {k: settings.get(k) for k in (
+            "risk_mode", "risk_percent", "fixed_lot", "max_positions",
+            "daily_max_loss_pct", "max_spread_points", "rr", "min_sl_atr",
+        )},
+        "last_skip_reason": skip,
+    }
+
+
 @router.get("/auto-trade")
 async def mt5_auto_trade_status(request: Request, user: CurrentUser) -> dict:
-    """AI-signal -> auto-order state on the REAL MT5 terminal."""
-    return await _auto_trader(request).status()
+    """AI auto-trade state. D-044: per-user — regular users see THEIR OWN
+    account (practice plane); admins get the institution terminal block."""
+    if user.get("role") != "admin":
+        return await _user_auto_status(request, user)
+    try:
+        st = await _auto_trader(request).status()
+    except HTTPException:
+        return await _user_auto_status(request, user)
+    st["scope"] = "institution"
+    return st
 
 
 class AutoTradeLiveBody(BaseModel):
@@ -293,27 +429,23 @@ class AutoTradeLiveBody(BaseModel):
 async def mt5_auto_trade_arm(
     body: AutoTradeLiveBody, request: Request, user: CurrentUser
 ) -> dict:
-    """Arm/disarm REAL auto-execution (D-042: simple toggle — the typed
-    "ENABLE" confirmation was replaced by the app's switch button plus
-    the money-management setup window; a legacy `confirm` field is still
-    accepted and ignored so older clients keep working).
+    """Arm/disarm auto-trading (D-042: simple switch toggle).
 
-    D-037: any user with an ACTIVE broker connection may arm auto-trade —
-    orders execute on the account THEY connected (verified against the
-    terminal session). Admins may arm without a connection (platform plane).
+    D-044: non-admins arm THEIR OWN practice plane — orders execute on
+    their isolated account, never on institution infrastructure. Admins
+    arm the institution terminal executor (real orders).
     """
     if user.get("role") != "admin":
         try:
-            _broker(request).get(user["id"])
-        except NotConnectedError as exc:
-            raise HTTPException(
-                status_code=428,
-                detail="connect your broker account before arming auto-trade",
-            ) from exc
+            await _trading(request).set_auto_trade(user["id"], body.enabled)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        st = await _user_auto_status(request, user)
+        return {"armed": st["armed"], "account": st["account"], "scope": "account"}
     trader = _auto_trader(request)
     try:
         await trader.arm(body.enabled, owner=user["id"])
     except ArmError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     st = await trader.status()
-    return {"armed": st["armed"], "terminal": st["terminal"]}
+    return {"armed": st["armed"], "terminal": st["terminal"], "scope": "institution"}

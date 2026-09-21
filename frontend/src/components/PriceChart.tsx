@@ -806,7 +806,7 @@ export default function PriceChart({
           <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
           <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
         </span>
-        LIVE · MT5
+        LIVE · INSTITUTIONAL FEED
       </span>
     ) : market === "closed" ? (
       <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[10px] font-semibold tracking-wide text-amber-300 backdrop-blur">
@@ -855,8 +855,8 @@ export default function PriceChart({
             {market === "unavailable" && !wsConnected
               ? "Reconnecting to real market data…"
               : market === "closed"
-                ? "Loading real broker history from MetaTrader 5…"
-                : `Loading real ${symbol} ${tf} data from MetaTrader 5…`}
+                ? "Loading institutional market history…"
+                : `Loading real ${symbol} ${tf} market data…`}
           </p>
         </div>
       )}

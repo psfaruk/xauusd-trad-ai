@@ -524,10 +524,19 @@ async def test_routes_auto_trade() -> None:
              "headers": [], "query_string": b"", "app": app_obj}
         )
 
-    # GET status
-    st = await routes_mt5.mt5_auto_trade_status(make_req(app), user={"id": "u1"})
+    # GET status — D-044: per-user. An ADMIN (or a server without the
+    # trading service) gets the institution-terminal block; a regular user
+    # gets their own account scope with no terminal details.
+    st = await routes_mt5.mt5_auto_trade_status(
+        make_req(app), user={"id": "admin-1", "role": "admin"}
+    )
     assert st["armed"] is False
     assert st["terminal"]["available"] is True
+    st_user = await routes_mt5.mt5_auto_trade_status(
+        make_req(app), user={"id": "u1", "role": "viewer"}
+    )
+    assert st_user["scope"] == "account"
+    assert "terminal" not in st_user or st_user.get("terminal") is None
 
     # D-042 — arm is a simple toggle now: no typed confirmation needed
     res = await routes_mt5.mt5_auto_trade_arm(

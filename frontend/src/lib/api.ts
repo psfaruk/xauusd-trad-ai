@@ -3,7 +3,7 @@ import type {
   ConfigResponse, EngineConfig, TradingStatus, TradingPosition, TradeRecord,
   OrderResult, ExternalSnapshot, LogEntry, Mt5Account, Mt5OpenPosition,
   Mt5HistoryPosition, Mt5Symbol, Mt5OrderResult, Mt5AutoTradeStatus,
-  AnalysisResponse,
+  AnalysisResponse, UserSettings,
 } from "../types";
 
 /**
@@ -262,6 +262,31 @@ export function postTradingAutoTrade(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled, confirm }),
+  }, token);
+}
+
+/* --------------------------------------- D-044 per-user settings + reset */
+
+export function getTradingSettings(token: string): Promise<UserSettings> {
+  return request<UserSettings>("/api/trading/settings", {}, token);
+}
+
+export function putTradingSettings(
+  token: string,
+  settings: Partial<UserSettings>
+): Promise<{ settings: Partial<UserSettings> }> {
+  return request<{ settings: Partial<UserSettings> }>("/api/trading/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  }, token);
+}
+
+export function postTradingReset(
+  token: string
+): Promise<{ balance: number; auto_trade: boolean }> {
+  return request<{ balance: number; auto_trade: boolean }>("/api/trading/reset", {
+    method: "POST",
   }, token);
 }
 

@@ -90,29 +90,16 @@ async def candles(
 
 @router.get("/positions")
 async def positions(request: Request, user: CurrentUser) -> dict:
-    mgr = request.app.state.mt5
-    if mgr.state.status != "connected":
+    """D-044 — the USER's own practice-plane positions (isolated per user;
+    institution-terminal positions are admin-only via /api/mt5/positions)."""
+    trading = getattr(request.app.state, "trading", None)
+    if trading is None:
         return {"positions": []}
     try:
-        rows = await mgr.get_positions()
+        rows = await trading.positions(user["id"])
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"positions failed: {exc}") from exc
-    return {
-        "positions": [
-            {
-                "ticket": p.ticket,
-                "symbol": p.symbol,
-                "side": p.side,
-                "volume": p.volume,
-                "price_open": p.price_open,
-                "sl": p.sl,
-                "tp": p.tp,
-                "profit": p.profit,
-                "time": p.time.isoformat(),
-            }
-            for p in rows
-        ]
-    }
+    return {"positions": rows}
 
 
 @router.get("/market/external")

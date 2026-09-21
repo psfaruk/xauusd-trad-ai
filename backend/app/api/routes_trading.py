@@ -1,10 +1,14 @@
-"""routes_trading — per-user trading plane endpoints (Phase 4 agent flow).
+"""routes_trading — per-user trading plane endpoints (Phase 4 + D-044).
 
-Any authenticated user can connect their OWN MT5/Exness account (demo mode
-works everywhere; live needs the Windows bridge — D-024), place manual
-orders, close positions, review their trade history and arm per-account
-auto-trade with a typed confirmation. Every route is owner-scoped: users
-can only ever touch their own plane.
+Every authenticated user gets an auto-provisioned PRACTICE plane (own
+balance, positions, trades, risk settings) priced off the institutional
+market feed — isolation is total: a user can only ever touch their own
+plane. Broker links (mt5_connections) stay per-user and encrypted.
+
+D-044 additions:
+GET  /api/trading/settings  (auth)  the user's money-management settings
+PUT  /api/trading/settings  (auth)  validated per-user update (live-apply)
+POST /api/trading/reset     (auth)  reset the practice account (flat, $10k)
 """
 
 from __future__ import annotations
@@ -13,7 +17,6 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.auth import CurrentUser
-from app.engine.config import AUTO_TRADE_CONFIRM
 
 router = APIRouter(prefix="/api/trading", tags=["trading"])
 
@@ -34,7 +37,7 @@ class ManualOrderBody(BaseModel):
 
 class AutoTradeBody(BaseModel):
     enabled: bool
-    confirm: str | None = None
+    confirm: str | None = None  # legacy field, ignored (D-042 switch button)
 
 
 def _manager(request: Request):
@@ -145,14 +148,62 @@ async def trading_mt5_history(
 
 @router.post("/auto-trade")
 async def trading_auto_trade(body: AutoTradeBody, request: Request, user: CurrentUser) -> dict:
+    """Arm/disarm the user's OWN plane (D-044: no typed confirmation — the
+    app's switch button + money-management window own this flow)."""
     if not await _budget(request, "arm", 10):
         raise HTTPException(status_code=429, detail="too many arm/disarm requests")
-    if body.enabled and body.confirm != AUTO_TRADE_CONFIRM:
-        raise HTTPException(
-            status_code=400,
-            detail=f'typed confirmation required: {{"confirm": "{AUTO_TRADE_CONFIRM}"}}',
-        )
     try:
         return await _manager(request).set_auto_trade(user["id"], body.enabled)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ------------------------------------------------------ D-044 settings/reset
+
+class SettingsBody(BaseModel):
+    risk_mode: str | None = Field(default=None, pattern="^(percent|fixed)$")
+    risk_percent: float | None = Field(default=None, ge=0.01, le=10.0)
+    fixed_lot: float | None = Field(default=None, ge=0.01, le=100.0)
+    max_positions: int | None = Field(default=None, ge=1, le=50)
+    daily_max_loss_pct: float | None = Field(default=None, ge=0.5, le=100.0)
+    rr: float | None = Field(default=None, ge=0.5, le=10.0)
+    min_sl_atr: float | None = Field(default=None, ge=0.3, le=6.0)
+    max_spread_points: int | None = Field(default=None, ge=5, le=500)
+
+
+@router.get("/settings")
+async def trading_settings(request: Request, user: CurrentUser) -> dict:
+    """The user's money-management settings + practice account balance."""
+    try:
+        return await _manager(request).user_settings(user["id"])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"settings load failed: {exc}") from exc
+
+
+@router.put("/settings")
+async def trading_put_settings(
+    body: SettingsBody, request: Request, user: CurrentUser
+) -> dict:
+    """Validate + persist the user's settings; live-applies to their plane."""
+    if not await _budget(request, "settings", 30):
+        raise HTTPException(status_code=429, detail="too many settings updates")
+    try:
+        clean = await _manager(request).set_user_settings(
+            user["id"], body.model_dump(exclude_none=True)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"settings save failed: {exc}") from exc
+    return {"settings": clean}
+
+
+@router.post("/reset")
+async def trading_reset(request: Request, user: CurrentUser) -> dict:
+    """Reset the practice account: flat, back to the starting balance."""
+    if not await _budget(request, "reset", 5):
+        raise HTTPException(status_code=429, detail="too many resets — take a breath")
+    try:
+        return await _manager(request).reset_practice_account(user["id"])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"reset failed: {exc}") from exc

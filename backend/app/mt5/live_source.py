@@ -57,6 +57,7 @@ from app.mt5.base import (
     empty_rates,
     validate_tf,
 )
+from app.mt5.paper import PaperPlaneMixin
 
 logger = logging.getLogger("xauusd.live")
 
@@ -1000,7 +1001,7 @@ class MarketFeed:
 # LiveDataSource
 # =========================================================================
 
-class LiveDataSource(DataSource):
+class LiveDataSource(PaperPlaneMixin, DataSource):
     """REAL-TIME market + paper account (DATA_SOURCE=live).
 
     MT5 terminal first (real broker prices, D-035), crypto composite 24/7

@@ -76,45 +76,54 @@ class TestMt5Routes:
         assert client.get("/api/mt5/status").status_code == 401
 
     def test_trading_routes_require_broker_connection_428(self, client):
-        """D-037: without a broker connection the trading routes answer
-        428 (connect required) — honest, never another user's account."""
+        """D-044: the terminal is INSTITUTION infrastructure — its account,
+        positions, history and orders are ADMIN-ONLY. A regular user gets
+        403 (never another user's or the company's account data)."""
         r = client.get("/api/mt5/account", headers=GOOD)
-        assert r.status_code == 428
+        assert r.status_code == 403
         r = client.get("/api/mt5/positions", headers=GOOD)
-        assert r.status_code == 428
+        assert r.status_code == 403
         r = client.get("/api/mt5/history", headers=GOOD)
-        assert r.status_code == 428
+        assert r.status_code == 403
         r = client.post(
             "/api/mt5/order", headers=GOOD,
             json={"symbol": "XAUUSDm", "side": "buy", "volume": 0.01},
         )
-        assert r.status_code == 428
+        assert r.status_code == 403
 
     def test_auto_trade_arm_requires_connection_428(self, client):
-        """D-037: non-admin without a broker connection cannot arm."""
+        """D-044: non-admins arm THEIR OWN practice plane (no broker link
+        needed — the plane auto-provisions and executes on their account)."""
         r = client.post(
             "/api/mt5/auto-trade", headers=GOOD,
             json={"enabled": True, "confirm": "ENABLE"},
         )
-        assert r.status_code == 428
+        assert r.status_code == 200
+        body = r.json()
+        assert body["armed"] is True
+        assert body["scope"] == "account"
+        # disarm also works
+        r = client.post(
+            "/api/mt5/auto-trade", headers=GOOD, json={"enabled": False}
+        )
+        assert r.status_code == 200
 
     def test_connect_any_user_d037(self, client):
-        """D-037: any authenticated user connects THEIR OWN broker account
-        (mock demo plane accepts entered credentials and binds the user)."""
+        """D-044: any authenticated user links THEIR OWN broker profile
+        (encrypted per-user; demo binds without touching the terminal)."""
         r = client.post(
             "/api/mt5/connect", headers=GOOD,
             json={"server": "Exness-MT5Trial", "login": "123", "password": "x"},
         )
         assert r.status_code == 200
         body = r.json()
-        assert body["status"] == "connected"
-        assert body["login"] == "123"
+        assert body["status"] == "linked"
+        assert "•" in body["login_masked"]
         # per-user status carries the broker block
         r = client.get("/api/mt5/status", headers=GOOD)
         assert r.status_code == 200
-        assert r.json()["broker"]["status"] == "connected"
-        assert r.json()["broker"]["login"] == "123"
-        # a DIFFERENT user is NOT connected (per-user isolation)
+        assert r.json()["broker"]["status"] == "linked"
+        # a DIFFERENT user is NOT linked (per-user isolation)
         r = client.get("/api/mt5/status", headers=ADMIN_H)
         assert r.json()["broker"]["status"] == "disconnected"
 
@@ -132,9 +141,8 @@ class TestMt5Routes:
             json={"server": "Exness-MT5Trial", "login": "123", "password": "pw"},
         )
         assert r.status_code == 200
-        assert r.json()["status"] == "connected"
-        assert r.json()["login"] == "123"
-        assert r.json()["engine_running"] is True
+        assert r.json()["status"] in ("connected", "linked")
+        assert r.json().get("engine_running") is True
 
 
 class TestCandlesRoute:
@@ -283,15 +291,25 @@ class TestWebSocket:
             assert got_subscribed and got_tick and got_bar
 
     def test_ws_global_events_reach_all_clients(self, client):
-        """mt5_status broadcast goes to clients without a market subscription."""
+        """mt5_status broadcast goes to clients without a market subscription.
+
+        D-044: connecting auto-provisions the caller's practice plane, so
+        per-user `trading_account` pushes may arrive first — drain them."""
         with client.websocket_connect("/ws?token=good-token") as ws:
             ws.send_text(json.dumps({"type": "ping"}))
-            msg = json.loads(ws.receive_text())
-            assert msg["type"] == "heartbeat"
+            deadline = time.time() + 10
+            got_heartbeat = False
+            while time.time() < deadline:
+                msg = json.loads(ws.receive_text())
+                if msg["type"] == "trading_account":
+                    continue  # D-044 per-user plane push
+                assert msg["type"] == "heartbeat"
+                got_heartbeat = True
+                break
+            assert got_heartbeat
             # trigger a status broadcast via admin disconnect (D-037: the
             # platform stays connected; the broker block goes disconnected)
             client.post("/api/mt5/disconnect", headers=ADMIN_H)
-            deadline = time.time() + 10
             got_status = False
             while time.time() < deadline:
                 msg = json.loads(ws.receive_text())

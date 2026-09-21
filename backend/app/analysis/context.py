@@ -266,12 +266,51 @@ def build_confluence(
         ),
     })
 
+    # 10 — D-044 cumulative delta confirmation (bonus, not gating): the
+    # aggressive buy-vs-sell flow of the last 30 M1 bars agrees with the
+    # trade direction (or is flat — never blocks)
+    cd = of.cumulative_delta(base.iloc[-30:])
+    cd_ok = (cd >= 0) if want_bull else (cd <= 0)
+    factors.append({
+        "name": "delta_confirms",
+        "ok": bool(cd_ok),
+        "detail": (
+            f"30-bar delta {cd:+.0f} {'supports' if cd_ok else 'fades'}"
+            f" the {direction.lower()}"
+        ),
+    })
+
+    # 11 — D-044 active institutional participation (bonus, not gating):
+    # the last hour's traded value runs above the 24h hourly average
+    try:
+        vol = base["v"].astype(float)
+        tp_typ = (
+            base["h"].astype(float) + base["l"].astype(float)
+            + base["c"].astype(float)
+        ) / 3.0
+        usd = (vol * 100.0 * tp_typ).astype(float)
+        usd_1h = float(usd.iloc[-60:].sum())
+        usd_avg = float(usd.iloc[-1440:].sum()) / 24.0 if len(usd) >= 60 else usd_1h
+        flow_ok = usd_avg <= 0 or usd_1h >= usd_avg
+        detail = (
+            f"1h flow ${usd_1h / 1e6:.1f}M vs ${usd_avg / 1e6:.1f}M/h avg"
+            f" ({'active' if flow_ok else 'quiet'})"
+        )
+    except Exception:  # noqa: BLE001 — flow math must never break the pipeline
+        flow_ok, detail = True, "flow unavailable"
+    factors.append({
+        "name": "flow_active",
+        "ok": bool(flow_ok),
+        "detail": detail,
+    })
+
     return factors
 
 
 CONFLUENCE_GATE = ("structure_m1", "htf_structure", "ob_retest",
                    "fvg_fill", "liquidity_sweep", "zone")
-CONFLUENCE_BONUS = ("volume", "killzone", "whale_bias")
+CONFLUENCE_BONUS = ("volume", "killzone", "whale_bias", "delta_confirms",
+                    "flow_active")
 
 
 def confluence_score(factors: list[dict]) -> int:
@@ -281,7 +320,7 @@ def confluence_score(factors: list[dict]) -> int:
 
 
 def bonus_score(factors: list[dict]) -> int:
-    """How many BONUS factors passed (0..3)."""
+    """How many BONUS factors passed (0..5)."""
     return sum(1 for f in factors
                if f["name"] in CONFLUENCE_BONUS and f["ok"])
 

@@ -253,7 +253,7 @@ def evaluate(
     ) / max(W_TREND + W_MTF + W_TRIGGER + W_RSI + W_SESSION + W_ATR, 1e-9)
     if cfg.smc_enabled and factors:
         gate = confluence_score(factors) / 6.0
-        bonus = bonus_score(factors) / 3.0
+        bonus = bonus_score(factors) / 5.0  # D-044: 5 bonus factors
         confidence = (1.0 - W_CONFLUENCE) * base_confidence + W_CONFLUENCE * (
             0.7 * gate + 0.3 * bonus
         )

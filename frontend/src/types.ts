@@ -123,10 +123,11 @@ export interface Mt5FeedVenueStatus {
   err: string | null;
 }
 
-/** D-037: the USER's own broker connection (per-user, real terminal). */
+/** D-037/D-044: the USER's own broker link (per-user, encrypted). */
 export interface BrokerConnection {
-  status: "connected" | "disconnected" | "reconnecting";
+  status: "connected" | "linked" | "disconnected" | "reconnecting";
   login?: string;
+  login_masked?: string;
   server?: string;
   connected_at?: number;
   account?: {
@@ -295,6 +296,7 @@ export interface TradeRecord {
   sl: number | null;
   tp: number | null;
   price_close: number | null;
+  profit: number | null;
   opened_at: string | null;
   closed_at: string | null;
   signal_direction?: string | null;
@@ -422,13 +424,13 @@ export interface WsTradingLogMsg {
   message: string;
 }
 
-/** D-036 — live AI auto-execution events (arm/order/skip/close). */
+/** D-036/D-044 — live AI auto-execution events (arm/order/skip/close/log). */
 export interface WsMt5AutoMsg {
   type: "mt5_auto";
   ts: string;
   level: string;
   message: string;
-  event: "armed" | "disarmed" | "order" | "skip" | "close";
+  event: "armed" | "disarmed" | "order" | "skip" | "close" | "log";
   ok?: boolean;
   signal_id?: string;
   symbol?: string;
@@ -534,13 +536,23 @@ export interface Mt5OrderResult {
   symbol: string | null;
 }
 
-/* --------------------------------------------- D-036 AI signal -> MT5 order */
+/* --------------------------------------------- D-036/D-044 AI auto-trade */
 
 export interface Mt5AutoTradeStatus {
   armed: boolean;
   armed_at: string | null;
   armed_by: string | null;
-  terminal: {
+  /** D-044: "account" (the user's own practice plane) or "institution". */
+  scope?: "account" | "institution";
+  /** D-044 — the USER's own account (regular users; replaces `terminal`). */
+  account?: {
+    mode: string;
+    balance: number | null;
+    equity: number | null;
+    currency: string;
+  } | null;
+  /** Institution-terminal block — ADMIN payloads only. */
+  terminal?: {
     available: boolean;
     trade_allowed: boolean;
     server: string | null;
@@ -548,7 +560,7 @@ export interface Mt5AutoTradeStatus {
     balance: number | null;
     equity: number | null;
     currency: string | null;
-  };
+  } | null;
   /** D-039: per-symbol broker market state (weekend/holiday logic). */
   markets?: Record<string, { open: boolean; detail: string }>;
   /** D-039: honest one-line diagnosis — why the AI is (not) trading. */
@@ -560,9 +572,72 @@ export interface Mt5AutoTradeStatus {
     max_positions: number;
     daily_max_loss_pct: number;
     max_spread_points: number;
-    timeframe: string;
+    rr?: number;
+    min_sl_atr?: number;
+    timeframe?: string;
   };
   last_skip_reason: string | null;
+}
+
+/* -------------------------------------------- D-044 per-user money settings */
+
+export interface UserSettings {
+  risk_mode: "percent" | "fixed";
+  risk_percent: number;
+  fixed_lot: number;
+  max_positions: number;
+  daily_max_loss_pct: number;
+  rr: number;
+  min_sl_atr: number;
+  max_spread_points: number;
+  balance?: number;
+  currency?: string;
+}
+
+/* --------------------------------------- D-044 market intelligence blocks */
+
+export interface FlowStats {
+  usd_24h?: number;
+  usd_1h?: number;
+  volume_24h?: number;
+  delta_1h?: number;
+  buy_pct_1h?: number;
+  velocity?: number | null;
+  bias?: string;
+  whale_zones?: {
+    lo: number;
+    hi: number;
+    price: number;
+    side: string;
+    kind: string;
+    vol_z: number;
+    events: number;
+    t: string;
+    note: string;
+  }[];
+}
+
+export interface NewsBlock {
+  events: {
+    time: string;
+    impact: "high" | "medium";
+    title: string;
+    forecast?: string | null;
+    previous?: string | null;
+  }[];
+  blackout_now?: boolean;
+  available?: boolean;
+}
+
+export interface CotBlock {
+  report_date?: string;
+  open_interest?: number;
+  large_speculators?: { long: number; short: number; net: number; net_change: number };
+  commercial_hedgers?: { long: number; short: number; net: number };
+  small_traders?: { long: number; short: number; net: number };
+  net_percentile_52w?: number;
+  bias?: string;
+  note?: string;
 }
 
 /** D-039: app-level navigation tabs (mobile bottom bar / desktop ⋮ menu). */
@@ -656,6 +731,12 @@ export interface AnalysisResponse {
   errors: string[];
   /** D-043 — professional auto-drawings (hlines/trendlines/fib/notes/setup) */
   drawings?: ChartDrawing[];
+  /** D-044 — order-flow statistics (USD value, delta, whale zones) */
+  flow?: FlowStats;
+  /** D-044 — upcoming high-impact USD economic events */
+  news?: NewsBlock;
+  /** D-044 — weekly CFTC institutional positioning */
+  cot?: CotBlock;
 }
 
 /* ------------------------------------------------- D-043: chart drawings */

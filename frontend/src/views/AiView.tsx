@@ -1,23 +1,33 @@
 /**
- * AiView (D-041/D-042) — the AI Trading tab: the auto-trading switch with
- * its money-management setup window (D-042 — replaced the typed "ENABLE"),
- * honest "why is the AI trading / not trading" status, the live execution
- * event feed, the manual order pad, open positions and trade history.
+ * AiView (D-041/D-042/D-044) — the AI Trading tab.
+ *
+ * D-044 institutional multi-user model:
+ *  - the auto-trading switch arms THE USER'S OWN account (practice plane:
+ *    own balance, own positions, own risk settings — full isolation);
+ *  - the money-management window edits the user's per-user settings and is
+ *    rendered through a React PORTAL (position:fixed inside a
+ *    backdrop-blur ancestor is contained by that ancestor — the D-044
+ *    "panel cut in half off-screen" bug);
+ *  - manual orders / positions / history all run on the user's own plane;
+ *  - Market Intelligence: order-flow (USD traded value, delta, whale
+ *    zones), upcoming high-impact news and weekly CFTC positioning.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import {
-  getConfig,
-  getMt5History,
-  getMt5Positions,
+  getAnalysis,
+  getTradingPositions,
+  getTradingSettings,
+  getTradingTrades,
   postMt5AutoTrade,
-  postMt5Close,
-  postMt5Order,
-  putConfig,
+  postTradingClose,
+  postTradingOrder,
+  putTradingSettings,
 } from "../lib/api";
 import type {
-  EngineConfig, Mt5AutoTradeStatus, Mt5HistoryPosition, Mt5OpenPosition,
-  Mt5OrderResult, Signal, WsMt5AutoMsg,
+  AnalysisResponse, Mt5AutoTradeStatus, Signal, TradeRecord,
+  TradingPosition, UserSettings, WsMt5AutoMsg,
 } from "../types";
 import {
   Badge, Btn, Card, EmptyState, Field, SectionTitle, Stat, inputCls,
@@ -26,7 +36,7 @@ import { fmtTime } from "../components/SignalDetail";
 
 interface Props {
   token: string;
-  symbol: string; // broker-side platform symbol for manual orders
+  symbol: string;
   autoStatus: Mt5AutoTradeStatus | null;
   autoEvents: WsMt5AutoMsg[];
   refreshKey: number;
@@ -56,39 +66,25 @@ function ToggleSwitch({
       aria-checked={on}
       disabled={busy}
       onClick={() => onToggle(!on)}
-      className={`relative flex h-9 w-[76px] shrink-0 items-center rounded-full border transition-colors disabled:opacity-50 ${
-        on ? "border-emerald-500/60 bg-emerald-500/20" : "border-zinc-700 bg-zinc-800"
+      className={`relative h-8 w-14 shrink-0 rounded-full border transition-colors disabled:opacity-50 ${
+        on ? "border-emerald-500/50 bg-emerald-500/25" : "border-zinc-700 bg-zinc-800"
       }`}
     >
       <span
         className={`absolute top-1/2 h-7 w-7 -translate-y-1/2 rounded-full shadow-lg transition-all ${
-          on ? "left-[44px] bg-emerald-400" : "left-1 bg-zinc-500"
-        } ${busy ? "animate-pulse" : ""}`}
-      />
-      <span
-        className={`select-none px-2.5 text-[10px] font-bold tracking-wide ${
-          on ? "text-emerald-300" : "text-zinc-500"
+          on ? "left-[calc(100%-1.75rem)] bg-emerald-400" : "left-0.5 bg-zinc-500"
         }`}
-        style={{ marginLeft: on ? "6px" : "40px" }}
-      >
-        {busy ? "…" : on ? labelOn : labelOff}
+      />
+      <span className={`absolute inset-y-0 flex items-center text-[9px] font-bold tracking-wide ${
+        on ? "left-2.5 text-emerald-200" : "right-2.5 text-zinc-400"
+      }`}>
+        {on ? labelOn : labelOff}
       </span>
     </button>
   );
 }
 
-/* --------------------------------------- D-042 money-management window */
-
-interface MoneyForm {
-  risk_mode: "percent" | "fixed";
-  fixed_lot: string;
-  risk_percent: string;
-  max_positions: string;
-  daily_max_loss_pct: string;
-  rr: string;
-  min_sl_atr: string;
-  max_spread_points: string;
-}
+/* ------------------------------------------- D-044 money management modal */
 
 function MoneyManagementModal({
   token,
@@ -101,29 +97,17 @@ function MoneyManagementModal({
   onDone: () => void;
   onClose: () => void;
 }) {
-  const [form, setForm] = useState<MoneyForm | null>(null);
+  const [form, setForm] = useState<UserSettings | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    getConfig(token)
-      .then((res) => {
-        const c = res.config;
-        setForm({
-          risk_mode: (c.risk_mode as "percent" | "fixed") ?? "percent",
-          fixed_lot: String(c.fixed_lot ?? 0.01),
-          risk_percent: String(c.risk_percent ?? 0.5),
-          max_positions: String(c.max_positions ?? 3),
-          daily_max_loss_pct: String(c.daily_max_loss_pct ?? 3),
-          rr: String(c.rr ?? 1.1),
-          min_sl_atr: String(c.min_sl_atr ?? 1.3),
-          max_spread_points: String(c.max_spread_points ?? 35),
-        });
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : "config load failed"));
+    getTradingSettings(token)
+      .then(setForm)
+      .catch((e) => setError(e instanceof Error ? e.message : "failed to load"));
   }, [token]);
 
-  const set = (k: keyof MoneyForm, v: string) =>
+  const set = (k: keyof UserSettings, v: string) =>
     setForm((f) => (f ? { ...f, [k]: v } : f));
 
   const saveAndArm = async () => {
@@ -131,19 +115,16 @@ function MoneyManagementModal({
     setBusy(true);
     setError(null);
     try {
-      const cur = await getConfig(token);
-      const merged: EngineConfig = {
-        ...cur.config,
+      await putTradingSettings(token, {
         risk_mode: form.risk_mode,
-        fixed_lot: Math.max(0.01, parseFloat(form.fixed_lot) || 0.01),
-        risk_percent: Math.min(100, Math.max(0.05, parseFloat(form.risk_percent) || 0.5)),
-        max_positions: Math.min(10, Math.max(1, parseInt(form.max_positions, 10) || 3)),
-        daily_max_loss_pct: Math.min(90, Math.max(0.5, parseFloat(form.daily_max_loss_pct) || 3)),
-        rr: Math.max(0.2, parseFloat(form.rr) || 1.1),
-        min_sl_atr: Math.max(0.3, parseFloat(form.min_sl_atr) || 1.3),
-        max_spread_points: Math.max(5, parseInt(form.max_spread_points, 10) || 35),
-      };
-      await putConfig(token, merged);
+        risk_percent: parseFloat(String(form.risk_percent)) || 0.5,
+        fixed_lot: parseFloat(String(form.fixed_lot)) || 0.01,
+        max_positions: parseInt(String(form.max_positions), 10) || 3,
+        daily_max_loss_pct: parseFloat(String(form.daily_max_loss_pct)) || 3,
+        rr: parseFloat(String(form.rr)) || 1.1,
+        min_sl_atr: parseFloat(String(form.min_sl_atr)) || 1.5,
+        max_spread_points: parseInt(String(form.max_spread_points), 10) || 35,
+      });
       await postMt5AutoTrade(token, { enabled: true });
       onDone();
     } catch (e) {
@@ -153,9 +134,12 @@ function MoneyManagementModal({
     }
   };
 
-  return (
+  // D-044 — PORTAL: render at document.body. position:fixed inside the
+  // Card (backdrop-blur ancestor) is positioned relative to that ancestor,
+  // which pushed this panel halfway off the screen.
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/70 p-0 backdrop-blur-sm sm:items-center sm:p-4">
-      <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-2xl border border-zinc-700/80 bg-zinc-900 shadow-2xl sm:rounded-2xl">
+      <div className="max-h-[88vh] w-full max-w-md overflow-y-auto rounded-t-2xl border border-zinc-700/80 bg-zinc-900 shadow-2xl sm:rounded-2xl">
         <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b border-zinc-800 bg-zinc-900/95 px-4 py-3 backdrop-blur">
           <div className="min-w-0">
             <p className="text-sm font-bold text-zinc-100">Money Management</p>
@@ -206,13 +190,13 @@ function MoneyManagementModal({
                   label="Risk per trade (% of balance)"
                   hint={
                     balance != null && balance > 0
-                      ? `≈ $${((balance * (parseFloat(form.risk_percent) || 0)) / 100).toFixed(2)} per trade at $${balance.toFixed(0)} balance`
+                      ? `≈ $${((balance * (parseFloat(String(form.risk_percent)) || 0)) / 100).toFixed(2)} per trade at $${balance.toFixed(0)} balance`
                       : "0.5% keeps a losing streak survivable"
                   }
                 >
                   <input
                     className={inputCls}
-                    value={form.risk_percent}
+                    value={String(form.risk_percent)}
                     onChange={(e) => set("risk_percent", e.target.value)}
                     inputMode="decimal"
                   />
@@ -221,7 +205,7 @@ function MoneyManagementModal({
                 <Field label="Lot size" hint="Fixed volume for every AI order">
                   <input
                     className={inputCls}
-                    value={form.fixed_lot}
+                    value={String(form.fixed_lot)}
                     onChange={(e) => set("fixed_lot", e.target.value)}
                     inputMode="decimal"
                   />
@@ -232,7 +216,7 @@ function MoneyManagementModal({
                 <Field label="Max open trades" hint="Multiple entries can run together">
                   <input
                     className={inputCls}
-                    value={form.max_positions}
+                    value={String(form.max_positions)}
                     onChange={(e) => set("max_positions", e.target.value)}
                     inputMode="numeric"
                   />
@@ -240,7 +224,7 @@ function MoneyManagementModal({
                 <Field label="Daily loss limit (%)">
                   <input
                     className={inputCls}
-                    value={form.daily_max_loss_pct}
+                    value={String(form.daily_max_loss_pct)}
                     onChange={(e) => set("daily_max_loss_pct", e.target.value)}
                     inputMode="decimal"
                   />
@@ -248,7 +232,7 @@ function MoneyManagementModal({
                 <Field label="Reward : Risk" hint="Take-profit multiple of the stop distance">
                   <input
                     className={inputCls}
-                    value={form.rr}
+                    value={String(form.rr)}
                     onChange={(e) => set("rr", e.target.value)}
                     inputMode="decimal"
                   />
@@ -256,7 +240,7 @@ function MoneyManagementModal({
                 <Field label="Min stop (ATR×)" hint="Wider stop = less spread noise">
                   <input
                     className={inputCls}
-                    value={form.min_sl_atr}
+                    value={String(form.min_sl_atr)}
                     onChange={(e) => set("min_sl_atr", e.target.value)}
                     inputMode="decimal"
                   />
@@ -266,7 +250,7 @@ function MoneyManagementModal({
               <Field label="Max spread (points)" hint="AI skips signals when the spread is wider">
                 <input
                   className={inputCls}
-                  value={form.max_spread_points}
+                  value={String(form.max_spread_points)}
                   onChange={(e) => set("max_spread_points", e.target.value)}
                   inputMode="numeric"
                 />
@@ -283,15 +267,16 @@ function MoneyManagementModal({
                   {busy ? "Arming…" : "Save & Turn ON Auto-Trading"}
                 </Btn>
                 <p className="text-center text-[10px] leading-relaxed text-zinc-500">
-                  Real orders will be placed on your connected broker account
-                  with SL/TP attached and managed by the app.
+                  Orders execute on YOUR account with SL/TP attached and
+                  managed by the app.
                 </p>
               </div>
             </>
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -311,6 +296,8 @@ function ArmCard({
   const [error, setError] = useState<string | null>(null);
   const armed = status?.armed ?? false;
   const why = status?.why;
+  const account = status?.account ?? null; // D-044: the user's OWN account
+  const isAdminScope = status?.scope === "institution";
 
   const toggle = async (enable: boolean) => {
     if (enable) {
@@ -350,7 +337,7 @@ function ArmCard({
         <>
           <p className="min-w-0 text-[11px] leading-relaxed text-zinc-400">
             {armed
-              ? "Engine armed. Every M1 bar close is analyzed (H1/H4 structure, M5 + M15 confirmation, ICT zones & liquidity, pattern trigger) and confirmed signals execute as real orders automatically."
+              ? "Engine armed. Every M1 bar close is analyzed (H1/H4 structure, M5 + M15 confirmation, ICT zones & liquidity, order flow, news windows, pattern trigger) and confirmed signals execute on your account automatically."
               : why?.text ?? "Turn the switch on to enable automatic execution."}
           </p>
 
@@ -365,26 +352,26 @@ function ArmCard({
             <ToggleSwitch on={armed} busy={busy} onToggle={(next) => void toggle(next)} />
           </div>
 
-          {/* terminal health row */}
+          {/* account health row — D-044: the USER's own account */}
           <div className="mt-3 grid grid-cols-3 gap-2">
             <Stat
-              label="Terminal"
-              value={status.terminal.available ? "online" : "offline"}
-              tone={status.terminal.available ? "up" : "down"}
-            />
-            <Stat
-              label="Trading"
-              value={status.terminal.trade_allowed ? "allowed" : "blocked"}
-              tone={status.terminal.trade_allowed ? "up" : "down"}
+              label="Account"
+              value={account ? "active" : isAdminScope ? "admin" : "—"}
+              tone={account ? "up" : "default"}
             />
             <Stat
               label="Balance"
-              value={
-                status.terminal.balance != null
-                  ? status.terminal.balance.toFixed(2)
-                  : "—"
+              value={account?.balance != null ? account.balance.toFixed(2) : "—"}
+              hint={account?.currency ?? undefined}
+            />
+            <Stat
+              label="Equity"
+              value={account?.equity != null ? account.equity.toFixed(2) : "—"}
+              tone={
+                account?.equity != null && account.balance != null
+                  ? account.equity >= account.balance ? "up" : "down"
+                  : "default"
               }
-              hint={status.terminal.currency ?? undefined}
             />
           </div>
           {status.markets && (
@@ -411,7 +398,7 @@ function ArmCard({
       {showMoney && status && (
         <MoneyManagementModal
           token={token}
-          balance={status.terminal.balance ?? null}
+          balance={account?.balance ?? null}
           onDone={() => {
             setShowMoney(false);
             onArmChanged();
@@ -419,6 +406,174 @@ function ArmCard({
           onClose={() => setShowMoney(false)}
         />
       )}
+    </Card>
+  );
+}
+
+/* -------------------------------------------- D-044 market intelligence */
+
+function fmtUsd(v: number | undefined | null): string {
+  if (v == null || !isFinite(v)) return "—";
+  if (v >= 1e9) return `$${(v / 1e9).toFixed(1)}B`;
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(0)}K`;
+  return `$${v.toFixed(0)}`;
+}
+
+function MarketIntelligenceCard({ token, symbol }: { token: string; symbol: string }) {
+  const [snap, setSnap] = useState<AnalysisResponse | null>(null);
+
+  const reload = useCallback(() => {
+    getAnalysis(token, symbol)
+      .then(setSnap)
+      .catch(() => undefined);
+  }, [token, symbol]);
+
+  useEffect(() => {
+    reload();
+    const t = window.setInterval(reload, 20_000); // realtime refresh
+    return () => window.clearInterval(t);
+  }, [reload]);
+
+  const flow = snap?.flow;
+  const news = snap?.news;
+  const cot = snap?.cot;
+
+  return (
+    <Card>
+      <SectionTitle
+        title="Market Intelligence"
+        right={
+          <Badge tone={news?.blackout_now ? "red" : "zinc"}>
+            {news?.blackout_now ? "NEWS WINDOW" : "live"}
+          </Badge>
+        }
+      />
+      {/* order flow */}
+      <div className="grid grid-cols-3 gap-2">
+        <Stat label="Flow 24h" value={fmtUsd(flow?.usd_24h)} hint="est. traded value" />
+        <Stat label="Flow 1h" value={fmtUsd(flow?.usd_1h)} hint="est. traded value" />
+        <Stat
+          label="Buy pressure 1h"
+          value={flow?.buy_pct_1h != null ? `${flow.buy_pct_1h.toFixed(0)}%` : "—"}
+          tone={
+            flow?.buy_pct_1h != null
+              ? flow.buy_pct_1h >= 55 ? "up" : flow.buy_pct_1h <= 45 ? "down" : "default"
+              : "default"
+          }
+        />
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
+        {flow?.velocity != null && (
+          <Badge tone={flow.velocity >= 1.5 ? "green" : flow.velocity <= 0.5 ? "amber" : "zinc"}>
+            tape speed {flow.velocity.toFixed(2)}×
+          </Badge>
+        )}
+        {flow?.delta_1h != null && (
+          <Badge tone={flow.delta_1h >= 0 ? "green" : "red"}>
+            delta 1h {flow.delta_1h >= 0 ? "+" : ""}{flow.delta_1h.toFixed(0)}
+          </Badge>
+        )}
+        {flow?.bias && (
+          <Badge tone={flow.bias === "buy" ? "green" : flow.bias === "sell" ? "red" : "zinc"}>
+            whale flow {flow.bias}
+          </Badge>
+        )}
+      </div>
+
+      {/* institutional entry zones (whale) */}
+      {flow?.whale_zones && flow.whale_zones.length > 0 && (
+        <div className="mt-3 min-w-0">
+          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+            Institutional activity zones
+          </p>
+          <ul className="flex min-w-0 flex-col gap-1.5">
+            {flow.whale_zones.slice(0, 3).map((z, i) => (
+              <li
+                key={i}
+                className="flex min-w-0 items-center gap-2 rounded-lg border border-zinc-800/70 bg-zinc-900/40 px-3 py-2"
+              >
+                <Badge tone={z.side === "buy" ? "green" : z.side === "sell" ? "red" : "zinc"}>
+                  {z.kind}
+                </Badge>
+                <span className="min-w-0 flex-1 truncate font-mono text-[11px] tabular-nums text-zinc-300">
+                  {z.lo.toFixed(2)} – {z.hi.toFixed(2)}
+                </span>
+                <span className="shrink-0 text-[9px] text-zinc-500">
+                  vol z{z.vol_z.toFixed(1)} · {fmtTime(z.t)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* economic events */}
+      <div className="mt-3 min-w-0">
+        <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+          High-impact economic events
+        </p>
+        {news?.events?.length ? (
+          <ul className="flex max-h-44 min-w-0 flex-col gap-1.5 overflow-y-auto pr-1">
+            {news.events.slice(0, 6).map((e, i) => {
+              const mins = (new Date(e.time).getTime() - Date.now()) / 60000;
+              const when =
+                mins > 0
+                  ? mins < 60 ? `in ${Math.round(mins)}m` : `in ${(mins / 60).toFixed(1)}h`
+                  : "passed";
+              return (
+                <li
+                  key={i}
+                  className="flex min-w-0 items-center gap-2 rounded-lg border border-zinc-800/70 bg-zinc-900/40 px-3 py-2"
+                >
+                  <Badge tone={e.impact === "high" ? "red" : "amber"}>{e.impact}</Badge>
+                  <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-300">{e.title}</span>
+                  <span className="shrink-0 text-[9px] text-zinc-500">{when}</span>
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <p className="text-[11px] text-zinc-500">
+            {news?.available === false
+              ? "Calendar temporarily unavailable."
+              : "No high-impact USD events in the next 48 hours."}
+          </p>
+        )}
+      </div>
+
+      {/* CFTC positioning */}
+      <div className="mt-3 min-w-0">
+        <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+          Institutional positioning (CFTC weekly)
+        </p>
+        {cot?.large_speculators ? (
+          <>
+            <div className="grid grid-cols-3 gap-2">
+              <Stat
+                label="Large specs net"
+                value={`${(cot.large_speculators.net / 1000).toFixed(0)}K`}
+                tone={cot.large_speculators.net >= 0 ? "up" : "down"}
+              />
+              <Stat
+                label="Weekly change"
+                value={`${cot.large_speculators.net_change >= 0 ? "+" : ""}${(cot.large_speculators.net_change / 1000).toFixed(1)}K`}
+                tone={cot.large_speculators.net_change >= 0 ? "up" : "down"}
+              />
+              <Stat
+                label="52w percentile"
+                value={cot.net_percentile_52w != null ? `${cot.net_percentile_52w.toFixed(0)}%` : "—"}
+                hint={cot.report_date}
+              />
+            </div>
+            {cot.note && (
+              <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-500">{cot.note}</p>
+            )}
+          </>
+        ) : (
+          <p className="text-[11px] text-zinc-500">Positioning report unavailable.</p>
+        )}
+      </div>
     </Card>
   );
 }
@@ -441,7 +596,7 @@ function EventFeed({ events }: { events: WsMt5AutoMsg[] }) {
             <li
               key={`${ev.ts}-${i}`}
               className={`flex min-w-0 items-start gap-2 rounded-lg border px-3 py-2 ${
-                ev.event === "order" && ev.ok
+                (ev.event === "order" || ev.event === "log") && ev.ok !== false
                   ? "border-emerald-500/20 bg-emerald-500/5"
                   : ev.event === "skip"
                     ? "border-zinc-800 bg-zinc-900/40"
@@ -494,16 +649,15 @@ function ManualTradeCard({
   const [sl, setSl] = useState("");
   const [tp, setTp] = useState("");
   const [busy, setBusy] = useState<"buy" | "sell" | null>(null);
-  const [result, setResult] = useState<Mt5OrderResult | null>(null);
+  const [result, setResult] = useState<{ ok: boolean; retcode?: number; comment?: string; price?: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const place = async (side: "buy" | "sell") => {
-    setBusy(side);
+  const place = async (side: "BUY" | "SELL") => {
+    setBusy(side === "buy" ? "buy" : "sell");
     setError(null);
     setResult(null);
     try {
-      const res = await postMt5Order(token, {
-        symbol,
+      const res = await postTradingOrder(token, {
         side,
         volume: parseFloat(volume),
         sl: sl ? parseFloat(sl) : undefined,
@@ -520,7 +674,7 @@ function ManualTradeCard({
 
   return (
     <Card>
-      <SectionTitle title="Manual Order" right={<Badge tone="zinc">real account</Badge>} />
+      <SectionTitle title="Manual Order" right={<Badge tone="zinc">your account</Badge>} />
       <div className="grid grid-cols-2 gap-2">
         <Field label="Symbol">
           <select
@@ -549,18 +703,18 @@ function ManualTradeCard({
         </Field>
       </div>
       <div className="mt-3 grid grid-cols-2 gap-2">
-        <Btn variant="success" onClick={() => void place("buy")} disabled={busy != null || parseFloat(volume) <= 0}>
+        <Btn variant="success" onClick={() => void place("BUY")} disabled={busy != null || parseFloat(volume) <= 0}>
           {busy === "buy" ? "Sending…" : "BUY"}
         </Btn>
-        <Btn variant="danger" onClick={() => void place("sell")} disabled={busy != null || parseFloat(volume) <= 0}>
+        <Btn variant="danger" onClick={() => void place("SELL")} disabled={busy != null || parseFloat(volume) <= 0}>
           {busy === "sell" ? "Sending…" : "SELL"}
         </Btn>
       </div>
       {result && (
         <p className={`mt-2.5 break-words rounded-lg border px-3 py-2 text-[11px] ${result.ok ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-red-500/30 bg-red-500/10 text-red-300"}`}>
-          {result.ok ? "Order filled" : "Order rejected"} · retcode {result.retcode}
+          {result.ok ? "Order filled" : "Order rejected"}{result.retcode != null && ` · ${result.retcode}`}
           {result.price != null && ` @ ${result.price}`}
-          {result.detail ? ` — ${result.detail}` : ""}
+          {result.comment ? ` — ${result.comment}` : ""}
         </p>
       )}
       {error && (
@@ -583,12 +737,12 @@ function PositionsCard({
   refreshKey: number;
   onChanged: () => void;
 }) {
-  const [positions, setPositions] = useState<Mt5OpenPosition[]>([]);
+  const [positions, setPositions] = useState<TradingPosition[]>([]);
   const [loading, setLoading] = useState(true);
   const [closing, setClosing] = useState<number | null>(null);
 
   const reload = useCallback(() => {
-    getMt5Positions(token)
+    getTradingPositions(token)
       .then((r) => setPositions(r.positions ?? []))
       .catch(() => setPositions([]))
       .finally(() => setLoading(false));
@@ -600,10 +754,10 @@ function PositionsCard({
     return () => window.clearInterval(t);
   }, [reload, refreshKey]);
 
-  const close = async (symbol: string, ticket: number) => {
+  const close = async (ticket: number) => {
     setClosing(ticket);
     try {
-      await postMt5Close(token, { symbol, ticket });
+      await postTradingClose(token, ticket);
       reload();
       onChanged();
     } catch {
@@ -630,18 +784,20 @@ function PositionsCard({
         <ul className="flex min-w-0 flex-col gap-1.5">
           {positions.map((p) => (
             <li
-              key={p.position_id}
+              key={p.ticket}
               className="flex min-w-0 items-center gap-2.5 rounded-xl border border-zinc-800/70 bg-zinc-900/40 px-3 py-2.5"
             >
-              <Badge tone={p.action.toLowerCase().includes("buy") ? "green" : "red"}>
-                {p.action}
+              <Badge tone={p.side.toLowerCase().includes("buy") ? "green" : "red"}>
+                {p.side}
               </Badge>
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-xs font-semibold text-zinc-200">
                   {p.symbol} · {p.volume} lots @ {p.price_open.toFixed(2)}
                 </span>
                 <span className="block text-[10px] text-zinc-500">
-                  #{p.position_id} · {fmtTime(p.create_time)}
+                  #{p.ticket} · {fmtTime(p.time)}
+                  {p.sl != null && ` · SL ${p.sl.toFixed(2)}`}
+                  {p.tp != null && ` · TP ${p.tp.toFixed(2)}`}
                 </span>
               </span>
               {p.profit != null && (
@@ -655,11 +811,11 @@ function PositionsCard({
               )}
               <Btn
                 variant="default"
-                disabled={closing === p.position_id}
-                onClick={() => void close(p.symbol, p.position_id)}
+                disabled={closing === p.ticket}
+                onClick={() => void close(p.ticket)}
                 className="shrink-0 !px-2.5 !py-1"
               >
-                {closing === p.position_id ? "…" : "Close"}
+                {closing === p.ticket ? "…" : "Close"}
               </Btn>
             </li>
           ))}
@@ -672,23 +828,27 @@ function PositionsCard({
 /* -------------------------------------------------------------- history */
 
 function HistoryCard({ token, refreshKey }: { token: string; refreshKey: number }) {
-  const [rows, setRows] = useState<Mt5HistoryPosition[] | null>(null);
+  const [rows, setRows] = useState<TradeRecord[] | null>(null);
 
   useEffect(() => {
-    getMt5History(token, 7)
-      .then((r) => setRows(r.positions ?? []))
+    getTradingTrades(token, 100)
+      .then((r) => setRows(r.trades ?? []))
       .catch(() => setRows([]));
   }, [token, refreshKey]);
 
-  const totalProfit = useMemo(
-    () => (rows ?? []).reduce((acc, r) => acc + (r.profit ?? 0), 0),
+  const closed = useMemo(
+    () => (rows ?? []).filter((r) => r.closed_at != null).slice(0, 50),
     [rows],
+  );
+  const totalProfit = useMemo(
+    () => closed.reduce((acc, r) => acc + (r.profit ?? 0), 0),
+    [closed],
   );
 
   return (
     <Card>
       <SectionTitle
-        title="Trade History (7 days)"
+        title="Trade History"
         right={
           rows ? (
             <Badge tone={totalProfit >= 0 ? "green" : "red"}>
@@ -702,33 +862,34 @@ function HistoryCard({ token, refreshKey }: { token: string; refreshKey: number 
           <div className="h-10 animate-pulse rounded-lg bg-zinc-800/60" />
           <div className="h-10 animate-pulse rounded-lg bg-zinc-800/60" />
         </div>
-      ) : rows.length === 0 ? (
+      ) : closed.length === 0 ? (
         <EmptyState title="No closed trades yet" hint="Closed AI and manual trades show here." />
       ) : (
         <ul className="flex max-h-80 min-w-0 flex-col gap-1.5 overflow-y-auto pr-1">
-          {rows.slice(0, 50).map((r) => (
+          {closed.map((r, i) => (
             <li
-              key={`${r.position_id}-${r.close_time}`}
+              key={`${r.ticket}-${i}`}
               className="flex min-w-0 items-center gap-2.5 rounded-xl border border-zinc-800/70 bg-zinc-900/40 px-3 py-2"
             >
-              <Badge tone={r.type.toLowerCase().includes("buy") ? "green" : "red"}>
-                {r.type}
+              <Badge tone={r.side.toLowerCase().includes("buy") ? "green" : "red"}>
+                {r.side}
               </Badge>
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-xs font-semibold text-zinc-200">
-                  {r.symbol} · {r.open_volume} lots @ {r.open_price.toFixed(2)} → {r.close_price.toFixed(2)}
+                  {r.volume} lots @ {r.price_open.toFixed(2)}
+                  {r.price_close != null && ` → ${r.price_close.toFixed(2)}`}
                 </span>
                 <span className="block text-[10px] text-zinc-500">
-                  {fmtTime(r.close_time)}
-                  {r.comment ? ` · ${r.comment.slice(0, 24)}` : ""}
+                  {r.closed_at ? fmtTime(r.closed_at) : ""}
+                  {r.signal_id ? " · AI signal" : " · manual"}
                 </span>
               </span>
               <span
                 className={`shrink-0 font-mono text-xs font-bold tabular-nums ${
-                  r.profit >= 0 ? "text-emerald-400" : "text-red-400"
+                  (r.profit ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"
                 }`}
               >
-                {r.profit >= 0 ? "+" : ""}{r.profit.toFixed(2)}
+                {(r.profit ?? 0) >= 0 ? "+" : ""}{(r.profit ?? 0).toFixed(2)}
               </span>
             </li>
           ))}
@@ -779,6 +940,7 @@ export default function AiView({
       )}
 
       <EventFeed events={autoEvents} />
+      <MarketIntelligenceCard token={token} symbol={symbol} />
       <ManualTradeCard token={token} symbols={symbols} refresh={bump} />
       <PositionsCard token={token} refreshKey={refreshKey + tick} onChanged={bump} />
       <HistoryCard token={token} refreshKey={refreshKey + tick} />
