@@ -158,3 +158,65 @@ class TestLegacyConfigUpgrade:
             EngineConfig(confirm_tfs=["H4"])  # H4 >= trend_tf H1
         with pytest.raises(ValueError):
             EngineConfig(min_tf_agree=3)  # can never be satisfied
+
+
+class TestConfigRepoJsonbDict:
+    """D-043 regression: asyncpg/SQLAlchemy returns jsonb as a dict, but
+    ConfigRepo.load used to json.loads() it unconditionally (TypeError ->
+    silent fallback to code defaults -> saved settings lost on restart)."""
+
+    class _Result:
+        def __init__(self, row):
+            self._row = row
+
+        def first(self):
+            return self._row
+
+    class _ConnCtx:
+        def __init__(self, row):
+            self._row = row
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def execute(self, *_a, **_kw):
+            return TestConfigRepoJsonbDict._Result(self._row)
+
+    class _Engine:
+        def __init__(self, row):
+            self._row = row
+
+        def connect(self):
+            return TestConfigRepoJsonbDict._ConnCtx(self._row)
+
+    @pytest.mark.asyncio
+    async def test_dict_payload_loads(self):
+        from app.engine.config import ConfigRepo
+
+        payload = EngineConfig(rr=1.4, min_confluence=5).model_dump()
+        repo = ConfigRepo()
+        cfg, auto = await repo.load(self._Engine((payload, True)))  # dict row
+        assert cfg.rr == 1.4 and cfg.min_confluence == 5
+        assert auto is True
+
+    @pytest.mark.asyncio
+    async def test_string_payload_still_loads(self):
+        import json as _json
+
+        from app.engine.config import ConfigRepo
+
+        payload = _json.dumps(EngineConfig(rr=1.2).model_dump())
+        repo = ConfigRepo()
+        cfg, _ = await repo.load(self._Engine((payload, False)))  # str row
+        assert cfg.rr == 1.2
+
+    @pytest.mark.asyncio
+    async def test_garbage_payload_falls_back(self):
+        from app.engine.config import ConfigRepo
+
+        repo = ConfigRepo()
+        cfg, _ = await repo.load(self._Engine((42, False)))  # nonsense type
+        assert cfg == ConfigRepo()._mem_config

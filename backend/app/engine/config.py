@@ -274,7 +274,19 @@ class ConfigRepo:
                 # schema.sql seeds it; if missing (fresh DB without seed) insert defaults
                 await self.save(db_engine, self._mem_config, self._mem_auto_trade)
                 return self._mem_config, self._mem_auto_trade
-            raw = json.loads(row[0])
+            # D-043: asyncpg/SQLAlchemy returns jsonb columns as dict
+            # already — json.loads() only for string payloads (sqlite/mem)
+            raw = row[0]
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    logger.warning("engine_config.config is not valid JSON — defaults")
+                    return self._mem_config, self._mem_auto_trade
+            if not isinstance(raw, dict):
+                logger.warning("engine_config.config has unexpected type %s — defaults",
+                               type(raw).__name__)
+                return self._mem_config, self._mem_auto_trade
             raw, upgraded = upgrade_legacy_payload(raw)
             cfg = EngineConfig.model_validate(raw)
             if upgraded:

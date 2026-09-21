@@ -320,7 +320,9 @@ class McpMarketFeed:
                 drift, shift,
             )
         else:
-            logger.info("MT5 terminal clock verified (drift %.1fs)", drift)
+            # D-043: called on every BTCUSD poll (~12/s) — demoted to DEBUG
+            # so production logs stop flooding
+            logger.debug("MT5 terminal clock verified (drift %.1fs)", drift)
 
     # ----------------------------------------------------------------- state
 
