@@ -11,8 +11,7 @@ import {
   postTradingReset, putConfig,
 } from "../lib/api";
 import type {
-  BrokerConnection, EngineConfig, LogEntry, Mt5Account, Mt5Status,
-  TradingStatus,
+  BrokerConnection, EngineConfig, LogEntry, Mt5Status, TradingStatus,
 } from "../types";
 import { Badge, Btn, Card, Dot, EmptyState, Field, SectionTitle, Stat, inputCls } from "../components/ui";
 import { useAuth } from "../lib/auth";
@@ -21,8 +20,6 @@ interface Props {
   token: string;
   mt5: Mt5Status | null;
   broker: BrokerConnection | null;
-  brokerAccount: Mt5Account | null;
-  tradingAccount: TradingStatus | null;
   isAdmin: boolean;
   dataSource: string;
   engineLogs: { level: string; message: string }[];
@@ -34,12 +31,10 @@ interface Props {
 function BrokerCard({
   token,
   broker,
-  account,
   onConnected,
 }: {
   token: string;
   broker: BrokerConnection | null;
-  account: Mt5Account | null;
   onConnected: () => void;
 }) {
   const linked = broker?.status === "connected" || broker?.status === "linked";
@@ -423,7 +418,6 @@ export default function SettingsView({
   token,
   mt5,
   broker,
-  brokerAccount,
   isAdmin,
   dataSource,
   engineLogs,
@@ -438,7 +432,7 @@ export default function SettingsView({
   return (
     <div className="flex min-w-0 flex-col gap-3">
       <YourAccountCard token={token} />
-      <BrokerCard token={token} broker={broker} account={brokerAccount} onConnected={onBrokerConnected} />
+      <BrokerCard token={token} broker={broker} onConnected={onBrokerConnected} />
       <EngineCard token={token} isAdmin={isAdmin} />
       <DataPrivacyCard />
       <LogsCard token={token} engineLogs={engineLogs} />

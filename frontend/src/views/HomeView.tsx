@@ -20,13 +20,11 @@ interface Props {
   mt5: Mt5Status | null;
   broker: BrokerConnection | null;
   tradingAccount: TradingStatus | null;
-  isAdmin: boolean;
   autoArmed: boolean;
   autoWhy: { code: string; text: string } | null;
   signals: Signal[];
   stats: StatsResponse | null;
   onOpenAi: () => void;
-  onOpenSettings: () => void;
   onOpenSignal: (id: string) => void;
 }
 
@@ -102,13 +100,11 @@ export default function HomeView({
   mt5,
   broker,
   tradingAccount,
-  isAdmin,
   autoArmed,
   autoWhy,
   signals,
   stats,
   onOpenAi,
-  onOpenSettings,
   onOpenSignal,
 }: Props) {
   const tick = useTick(symbol);

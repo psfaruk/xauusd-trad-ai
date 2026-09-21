@@ -26,7 +26,7 @@ import {
   putTradingSettings,
 } from "../lib/api";
 import type {
-  AnalysisResponse, Mt5AutoTradeStatus, Signal, TradeRecord,
+  AnalysisResponse, Mt5AutoTradeStatus, OrderResult, Signal, TradeRecord,
   TradingPosition, UserSettings, WsMt5AutoMsg,
 } from "../types";
 import {
@@ -352,24 +352,45 @@ function ArmCard({
             <ToggleSwitch on={armed} busy={busy} onToggle={(next) => void toggle(next)} />
           </div>
 
-          {/* account health row — D-044: the USER's own account */}
+          {/* account health row — D-044: the user's OWN account (admins see
+              the institution-terminal block from their auto-trade status) */}
           <div className="mt-3 grid grid-cols-3 gap-2">
             <Stat
               label="Account"
-              value={account ? "active" : isAdminScope ? "admin" : "—"}
-              tone={account ? "up" : "default"}
+              value={
+                isAdminScope
+                  ? (status.terminal?.available ? "online" : "offline")
+                  : account ? "active" : "—"
+              }
+              tone={
+                isAdminScope
+                  ? (status.terminal?.available ? "up" : "down")
+                  : account ? "up" : "default"
+              }
             />
             <Stat
               label="Balance"
-              value={account?.balance != null ? account.balance.toFixed(2) : "—"}
-              hint={account?.currency ?? undefined}
+              value={
+                (isAdminScope ? status.terminal?.balance : account?.balance) != null
+                  ? (isAdminScope ? status.terminal!.balance! : account!.balance!).toFixed(2)
+                  : "—"
+              }
+              hint={(isAdminScope ? status.terminal?.currency : account?.currency) ?? undefined}
             />
             <Stat
               label="Equity"
-              value={account?.equity != null ? account.equity.toFixed(2) : "—"}
+              value={
+                (isAdminScope ? status.terminal?.equity : account?.equity) != null
+                  ? (isAdminScope ? status.terminal!.equity! : account!.equity!).toFixed(2)
+                  : "—"
+              }
               tone={
-                account?.equity != null && account.balance != null
-                  ? account.equity >= account.balance ? "up" : "down"
+                (isAdminScope ? status.terminal : account) != null &&
+                (isAdminScope ? status.terminal!.equity : account!.equity) != null &&
+                (isAdminScope ? status.terminal!.balance : account!.balance) != null
+                  ? (isAdminScope ? status.terminal!.equity! : account!.equity!) >=
+                    (isAdminScope ? status.terminal!.balance! : account!.balance!)
+                    ? "up" : "down"
                   : "default"
               }
             />
@@ -649,11 +670,11 @@ function ManualTradeCard({
   const [sl, setSl] = useState("");
   const [tp, setTp] = useState("");
   const [busy, setBusy] = useState<"buy" | "sell" | null>(null);
-  const [result, setResult] = useState<{ ok: boolean; retcode?: number; comment?: string; price?: number } | null>(null);
+  const [result, setResult] = useState<OrderResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const place = async (side: "BUY" | "SELL") => {
-    setBusy(side === "buy" ? "buy" : "sell");
+    setBusy(side === "BUY" ? "buy" : "sell");
     setError(null);
     setResult(null);
     try {

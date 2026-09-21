@@ -255,7 +255,7 @@ export interface ConfigResponse {
 
 export interface TradingStatus {
   connected: boolean;
-  mode?: "demo" | "live" | null;
+  mode?: "demo" | "live" | "practice" | null;
   status?: string;
   detail?: string;
   server?: string | null;

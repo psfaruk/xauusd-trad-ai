@@ -9,12 +9,12 @@ import SettingsView from "../views/SettingsView";
 import { useAuth } from "../lib/auth";
 import {
   getCandles, getMt5Status, getSignals, getStats, getHealth, getMe,
-  getMt5Account, getMt5AutoTrade, getTradingStatus,
+  getMt5AutoTrade, getTradingStatus,
 } from "../lib/api";
 import { WSClient } from "../lib/ws";
 import { feed } from "../state/feed";
 import type {
-  AppTab, Mt5Account, Mt5AutoTradeStatus, Mt5Status, Timeframe, TradingStatus,
+  AppTab, Mt5AutoTradeStatus, Mt5Status, Timeframe, TradingStatus,
   WsMessage, WsMt5AutoMsg, WsTradingAccountMsg, WsTradingLogMsg,
 } from "../types";
 
@@ -55,7 +55,6 @@ export default function Dashboard() {
   const [engineLogs, setEngineLogs] = useState<{ level: string; message: string }[]>([]);
   const [autoStatus, setAutoStatus] = useState<Mt5AutoTradeStatus | null>(null);
   const [autoEvents, setAutoEvents] = useState<WsMt5AutoMsg[]>([]);
-  const [brokerAccount, setBrokerAccount] = useState<Mt5Account | null>(null);
   const [tradingAccount, setTradingAccount] = useState<TradingStatus | null>(null);
   const [aiRefreshKey, setAiRefreshKey] = useState(0);
 
@@ -159,7 +158,7 @@ export default function Dashboard() {
           setTradingAccount((prev) => ({
             ...(prev ?? {}),
             connected: true,
-            mode: ev.mode,
+            mode: ev.mode as TradingStatus["mode"],
             auto_trade: ev.auto_trade,
             account: {
               ...(prev?.account ?? {}),
@@ -231,21 +230,14 @@ export default function Dashboard() {
     getMt5Status(token).then(setMt5).catch(() => undefined);
     getMt5AutoTrade(token).then(setAutoStatus).catch(() => undefined);
     // D-044 — the USER's own trading account (auto-provisioned practice
-    // plane; total per-user isolation)
+    // plane; total per-user isolation). Admins additionally see the
+    // institution-terminal block inside the auto-trade status.
     getTradingStatus(token)
       .then((st) =>
         setTradingAccount((prev) => ({ ...prev, ...st, connected: st.connected }))
       )
       .catch(() => undefined);
   }, [token]);
-
-  const refreshAdmin = useCallback(() => {
-    // D-044 — the INSTITUTION account is admin-only data
-    if (!token || !isAdmin) return;
-    getMt5Account(token)
-      .then((a) => setBrokerAccount(a.connected ? a : null))
-      .catch(() => undefined);
-  }, [token, isAdmin]);
 
   useEffect(() => {
     if (!token) return;
@@ -255,14 +247,6 @@ export default function Dashboard() {
     const timer = window.setInterval(refreshSlow, 8_000);
     return () => window.clearInterval(timer);
   }, [token, refreshSlow, wsState]);
-
-  // institution account poll starts once the role is known (admin only)
-  useEffect(() => {
-    if (!token || !isAdmin) return;
-    refreshAdmin();
-    const timer = window.setInterval(refreshAdmin, 8_000);
-    return () => window.clearInterval(timer);
-  }, [token, isAdmin, refreshAdmin]);
 
   // candle refetch on (re)connect
   useEffect(() => {
@@ -342,13 +326,11 @@ export default function Dashboard() {
               mt5={mt5}
               broker={broker}
               tradingAccount={tradingAccount}
-              isAdmin={isAdmin}
               autoArmed={autoArmed}
               autoWhy={autoWhy}
               signals={signals}
               stats={stats}
               onOpenAi={() => navigate("ai")}
-              onOpenSettings={() => navigate("settings")}
               onOpenSignal={openSignalAnalysis}
             />
           )}
@@ -386,8 +368,6 @@ export default function Dashboard() {
               token={token ?? ""}
               mt5={mt5}
               broker={broker}
-              brokerAccount={brokerAccount}
-              tradingAccount={tradingAccount}
               isAdmin={isAdmin}
               dataSource={dataSource}
               engineLogs={engineLogs}
