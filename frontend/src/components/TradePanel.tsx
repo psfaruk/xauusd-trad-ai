@@ -126,7 +126,7 @@ export default function TradePanel({
         <div className="flex-1 overflow-y-auto p-5">
           {!connected && (
             <p className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-300">
-              Connect your trading account first (menu → Trading → My Trading Account).
+              Connect your trading account first (menu → Trading → Practice Trading (paper)).
             </p>
           )}
 

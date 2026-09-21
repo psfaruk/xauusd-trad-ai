@@ -54,7 +54,7 @@ export default function DotMenu({ actions, isAdmin }: DotMenuProps) {
       items: [
         { label: "Connect Broker", hint: "your Exness MT5 account · per-user", onClick: actions.onOpenPlatformMt5 },
         { label: "MT5 Account (live)", hint: "real Exness balance · positions · orders", onClick: actions.onOpenMt5Account },
-        { label: "My Trading Account", hint: "connect your MT5 / Exness account", onClick: actions.onOpenTrading },
+        { label: "Practice Trading (paper)", hint: "simulated trades on live prices · no real money", onClick: actions.onOpenTrading },
         { label: "Trade Panel", hint: "manual orders & open positions", onClick: actions.onOpenTradePanel },
         { label: "Trade History", hint: "my executed trades", onClick: actions.onOpenTradeHistory },
       ],
