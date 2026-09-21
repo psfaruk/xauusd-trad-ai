@@ -121,13 +121,30 @@ never simulated. The watchdog supervises Xvfb + openbox + the terminal and
 skips the whole stack automatically where it is not installed (e.g. Railway,
 which keeps serving real-time market DATA only).
 
-**MT5 = the primary MARKET-DATA source too (D-035).** While the broker feed
-for a symbol is ticking (market open), quotes AND candles come from the real
-forex market through the terminal (1s tick poll + authoritative M1..D1 chart
-history). When forex closes (weekend) or the terminal is down, the platform
-transparently falls back to the 24/7 crypto composite and switches back to
-the broker feed automatically at the Monday open — the badge always shows
-which source is live (`LIVE · MT5 · broker feed` vs `LIVE · crypto composite`).
+**MT5 = the ONLY market-data source (D-037, user-fixed directive).** Quotes
+AND candles come exclusively from the real forex market through the terminal
+(4/s tick poll + authoritative M1..D1 chart history). The former
+crypto-composite fallback is disabled by default (`MT5_ONLY=1`; set
+`MT5_ONLY=0` only on hosts without a terminal). When a symbol is closed
+(gold on weekends) the per-symbol state is reported honestly
+(`market: open | closed | unavailable`) and the terminal keeps serving its
+real chart HISTORY — nothing is ever synthesized; BTCUSDm is 24/7 so the
+platform stays alive every day of the week. The last candle ANIMATES toward
+every real broker tick with a requestAnimationFrame easing loop — the
+MetaTrader-terminal 60fps feel, no stepping.
+
+**Every user connects THEIR OWN broker account (D-037).** ⋮ →
+**Connect Broker**: enter your Exness server/login/password — the backend
+verifies it against the LIVE terminal session (password Fernet-encrypted at
+rest) and binds it to YOUR user. Balance, positions, trade history, manual
+orders and AI auto-trade then run on that account and are visible ONLY
+inside your session — another user sees nothing of it (per-user isolation,
+honest 428 "connect your broker account first" until connected). The
+connection state shows as a `BROKER <login>@<server>` chip in the dashboard
+footer; account details one click away in the MT5 Account panel. The
+terminal stack is fully self-healing: the watchdog restarts a dead terminal
+and it AUTO-RELOGS-IN in ~15s (stored session), and Market Watch entries
+lost to an abrupt kill are re-added automatically within 60s.
 
 **AI signal → auto-order on the REAL account (D-036).** The AI engines
 (XAUUSD + BTCUSD, M15 SFP pipeline) can now place REAL orders automatically

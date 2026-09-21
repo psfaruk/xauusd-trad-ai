@@ -1,31 +1,40 @@
-"""routes_mt5 — SPEC §7.1 mt5 endpoints (Phase 2) + D-034 real-account panel.
+"""routes_mt5 — MT5 endpoints.
 
-POST /api/mt5/connect     (admin) connect + discover symbol + start engine
-POST /api/mt5/disconnect  (admin) clean shutdown
-GET  /api/mt5/status      (auth)  {status, symbol, account, broker offset}
+Phase 2 (SPEC §7.1):
+POST /api/mt5/connect     (auth)  per-user broker connect (D-037)
+POST /api/mt5/disconnect  (auth)  drop the user's broker connection
+GET  /api/mt5/status      (auth)  per-user connection state + account
 
 D-034 — real MT5 terminal bridge (MCP):
-GET  /api/mt5/account     (auth)  live account: balance/equity/margin/connected
-GET  /api/mt5/positions   (auth)  open positions + pending orders
-GET  /api/mt5/history     (auth)  closed-position history (days=1..365)
-GET  /api/mt5/symbols     (auth)  Market Watch symbols (Exness set)
-POST /api/mt5/order       (auth)  market order on the REAL account (MCP)
-POST /api/mt5/close       (auth)  close a position by ticket (MCP)
+GET  /api/mt5/account     (auth + connection) live account snapshot
+GET  /api/mt5/positions   (auth + connection) open positions + orders
+GET  /api/mt5/history     (auth + connection) closed-position history
+GET  /api/mt5/symbols     (auth)  Market Watch symbols (read-only)
+POST /api/mt5/order       (auth + connection) market order (REAL account)
+POST /api/mt5/close       (auth + connection) close a position by ticket
 
 D-036 — AI signal -> auto-order on the REAL account:
-GET  /api/mt5/auto-trade  (auth)  arm state + terminal readiness + risk summary
-POST /api/mt5/auto-trade  (admin) {enabled, confirm:"ENABLE"} — typed confirm
+GET  /api/mt5/auto-trade  (auth)  arm state + readiness + risk summary
+POST /api/mt5/auto-trade  (admin OR connected user) {enabled, confirm}
+
+D-037 — every trading route is scoped to the requesting user's OWN broker
+connection: users only ever see/trade the account they connected.
 """
 
 from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.auth import CurrentUser, require_admin
+from app.auth import CurrentUser
 from app.mt5.auto_trader import ArmError
+from app.mt5.broker_connect import (
+    AccountMismatchError,
+    BrokerUnavailableError,
+    NotConnectedError,
+)
 from app.mt5.mcp import MCPError, terminal_client
 
 router = APIRouter(prefix="/api/mt5", tags=["mt5"])
@@ -56,6 +65,28 @@ def _manager(request: Request):
     return request.app.state.mt5
 
 
+def _broker(request: Request):
+    svc = getattr(request.app.state, "broker_connect", None)
+    if svc is None:
+        raise HTTPException(
+            status_code=503,
+            detail="broker connection service not initialized on this server",
+        )
+    return svc
+
+
+def _is_demo(request: Request) -> bool:
+    return getattr(request.app.state, "data_source", "") == "mock"
+
+
+def _require_connection(request: Request, user: CurrentUser) -> None:
+    """D-037: trading routes only for users with an active broker connection."""
+    try:
+        _broker(request).get(user["id"])
+    except NotConnectedError as exc:
+        raise HTTPException(status_code=428, detail=str(exc)) from exc
+
+
 async def _mcp_call(fn, *args, **kwargs):
     """Run a blocking MCP call in a worker thread; map errors to 502."""
     try:
@@ -69,33 +100,71 @@ async def _mcp_call(fn, *args, **kwargs):
 
 @router.post("/connect")
 async def mt5_connect(body: ConnectBody, request: Request, user: CurrentUser) -> dict:
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="admin role required")
-    mgr = _manager(request)
-    creds = body.model_dump()
-    creds["mode"] = "platform"
+    """D-037: connect THIS user's broker account through the REAL terminal.
+
+    The entered (server, login) must match the live terminal session; the
+    password is Fernet-encrypted at rest. On success the user is bound to
+    the account and every /api/mt5/* route serves THEIR connection.
+    """
+    svc = _broker(request)
     try:
-        return await mgr.connect(creds, owner=user["id"])
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001 — DataSourceError etc -> 502
-        raise HTTPException(status_code=502, detail=f"MT5 connect failed: {exc}") from exc
+        result = await svc.connect(
+            user["id"], body.server, body.login, body.password
+        )
+    except AccountMismatchError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except BrokerUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    # ensure the platform data plane (engines + feed) is running too
+    mgr = _manager(request)
+    try:
+        if mgr.state.status != "connected":
+            creds = body.model_dump()
+            creds["mode"] = "platform"
+            platform = await mgr.connect(creds, owner=user["id"])
+            # surface the platform plane (symbol discovery, feed info) too
+            for k, v in platform.items():
+                if k != "status":
+                    result.setdefault(k, v)
+    except Exception as exc:  # noqa: BLE001 — data plane best-effort
+        # the broker connection itself is fine; the feed keeps retrying
+        result["note"] = f"market feed starting in background ({type(exc).__name__})"
+    result["engine_running"] = mgr.state.status == "connected"
+    return result
 
 
-@router.post("/disconnect", dependencies=[Depends(require_admin)])
-async def mt5_disconnect(request: Request) -> dict:
-    return await _manager(request).disconnect()
+@router.post("/disconnect")
+async def mt5_disconnect(request: Request, user: CurrentUser) -> dict:
+    """Drop the requesting user's broker connection (never anyone else's)."""
+    result = await _broker(request).disconnect(user["id"])
+    # D-037: tell every WS client about the (per-user) state change — the
+    # platform market plane keeps running for everyone else.
+    hub = getattr(request.app.state, "hub", None)
+    if hub is not None:
+        try:
+            st = await _manager(request).status()
+            st["broker"] = result
+            await hub.broadcast_all("mt5_status", st)
+        except Exception:  # noqa: BLE001 — broadcast is best-effort
+            pass
+    return result
 
 
 @router.get("/status")
 async def mt5_status(request: Request, user: CurrentUser) -> dict:
-    return await _manager(request).status()
+    """Platform market state (symbol/feed/engine) + the USER's broker
+    connection (D-037: per-user, `broker` block)."""
+    st = await _manager(request).status()
+    st["broker"] = await _broker(request).status(user["id"])
+    return st
 
 
 # ------------------------------------------------------------------ D-034
 @router.get("/account")
-async def mt5_account(user: CurrentUser) -> dict:
-    """Live Exness account through the real MetaTrader 5 terminal (MCP)."""
+async def mt5_account(request: Request, user: CurrentUser) -> dict:
+    """Live account through the real MetaTrader 5 terminal (user-scoped)."""
+    _require_connection(request, user)
     res = await _mcp_call(terminal_client().account)
     acct = res.get("account", {})
     term = res.get("terminal", {})
@@ -121,30 +190,35 @@ async def mt5_account(user: CurrentUser) -> dict:
 
 
 @router.get("/positions")
-async def mt5_positions(user: CurrentUser) -> dict:
+async def mt5_positions(request: Request, user: CurrentUser) -> dict:
+    _require_connection(request, user)
     res = await _mcp_call(terminal_client().positions)
     return {"positions": res.get("positions", []), "orders": res.get("orders", [])}
 
 
 @router.get("/history")
 async def mt5_history(
+    request: Request,
     user: CurrentUser,
     days: int = Query(default=30, ge=1, le=365),
     symbol: str | None = Query(default=None, max_length=32),
 ) -> dict:
+    _require_connection(request, user)
     res = await _mcp_call(terminal_client().history, days=days, symbol=symbol)
     return {"positions": res.get("positions", [])}
 
 
 @router.get("/symbols")
 async def mt5_symbols(user: CurrentUser) -> dict:
+    """Market Watch symbols (read-only market data — no connection needed)."""
     res = await _mcp_call(terminal_client().symbols)
     return {"symbols": res}
 
 
 @router.post("/order")
-async def mt5_order(body: OrderBody, user: CurrentUser) -> dict:
+async def mt5_order(body: OrderBody, request: Request, user: CurrentUser) -> dict:
     """Market order on the REAL account — executed by MetaTrader 5 (MCP)."""
+    _require_connection(request, user)
     res = await _mcp_call(
         terminal_client().market_order,
         symbol=body.symbol,
@@ -168,7 +242,8 @@ async def mt5_order(body: OrderBody, user: CurrentUser) -> dict:
 
 
 @router.post("/close")
-async def mt5_close(body: CloseBody, user: CurrentUser) -> dict:
+async def mt5_close(body: CloseBody, request: Request, user: CurrentUser) -> dict:
+    _require_connection(request, user)
     res = await _mcp_call(
         terminal_client().close_position, symbol=body.symbol, ticket=body.ticket
     )
@@ -204,11 +279,16 @@ class AutoTradeLiveBody(BaseModel):
     confirm: str | None = Field(default=None, max_length=16)
 
 
-@router.post("/auto-trade", dependencies=[Depends(require_admin)])
+@router.post("/auto-trade")
 async def mt5_auto_trade_arm(
     body: AutoTradeLiveBody, request: Request, user: CurrentUser
 ) -> dict:
-    """Arm/disarm REAL auto-execution (typed confirmation "ENABLE")."""
+    """Arm/disarm REAL auto-execution (typed confirmation "ENABLE").
+
+    D-037: any user with an ACTIVE broker connection may arm auto-trade —
+    orders execute on the account THEY connected (verified against the
+    terminal session). Admins may arm without a connection (platform plane).
+    """
     if body.enabled and body.confirm != "ENABLE":
         raise HTTPException(
             status_code=400,
@@ -216,6 +296,14 @@ async def mt5_auto_trade_arm(
                 'typed confirmation required: {"enabled": true, "confirm": "ENABLE"}'
             ),
         )
+    if user.get("role") != "admin":
+        try:
+            _broker(request).get(user["id"])
+        except NotConnectedError as exc:
+            raise HTTPException(
+                status_code=428,
+                detail="connect your broker account before arming auto-trade",
+            ) from exc
     trader = _auto_trader(request)
     try:
         await trader.arm(body.enabled, owner=user["id"])

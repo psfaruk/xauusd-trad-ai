@@ -129,6 +129,17 @@ async def lifespan(app: FastAPI):
         config_repo=app.state.config_repo,
     )
 
+    # --- D-037: per-user broker connections over the REAL terminal (frontend
+    # "Connect broker" flow — credentials verified against the live terminal
+    # session, Fernet-encrypted at rest, per-user trade isolation).
+    from app.mt5.broker_connect import BrokerConnectionService
+
+    app.state.broker_connect = BrokerConnectionService(
+        db_engine=app.state.db_engine,
+        settings=settings,
+        demo_mode=(effective_data_source == "mock"),
+    )
+
     # --- Phase 4: per-user trading planes (agent architecture) + the admin's
     # own platform executor (armed by engine_config.auto_trade).
     from app.engine.executor import OrderExecutor, TradeRepo

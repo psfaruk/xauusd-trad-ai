@@ -104,9 +104,12 @@ def yahoo_chart(tf_sec: int, n: int, base: float = 4000.0) -> dict:
 
 
 def make_source(client: FakeClient, **kw) -> LiveDataSource:
+    # D-037: these tests exercise the D-030/D-035 composite machinery
+    # (Binance/gold-api/Yahoo fallbacks) which now lives behind MT5_ONLY=0.
     kw.setdefault("poll_seconds", 0.05)
     kw.setdefault("connect_timeout_s", 0.4)
     kw.setdefault("enable_ws", False)  # hermetic: no real venue WS in tests
+    kw.setdefault("mt5_only", False)
     return LiveDataSource(http_factory=lambda: client, **kw)
 
 
@@ -195,7 +198,7 @@ async def test_cache_refetch_on_missing_closed_bucket():
     b0 = (now // 900) * 900
     state = {"rows": binance_klines(900, 6, end_bucket=b0 - 2 * 900)}
     client.on("/api/v3/klines", lambda p: state["rows"])
-    feed = MarketFeed(http_factory=lambda: client, poll_seconds=0.05)
+    feed = MarketFeed(http_factory=lambda: client, poll_seconds=0.05, mt5_only=False)
     closed, _ = await feed.ensure_tf("M15", 3)
     assert closed[-1]["t"] == b0 - 2 * 900  # stale by one bucket
     # the just-closed bucket is missing -> refetch (after the rate cap)
@@ -265,7 +268,7 @@ async def test_tick_built_history_when_every_provider_is_down():
     client = FakeClient()
     client.fail.add("binance")
     client.on("gold-api", lambda p: {"price": 4400.0})
-    feed = MarketFeed(http_factory=lambda: client, poll_seconds=0.05)
+    feed = MarketFeed(http_factory=lambda: client, poll_seconds=0.05, mt5_only=False)
     # quotes alive via gold-api (feeds the live tick)
     assert await feed.poll_once() is True
     # seed the tick-built M1 series as if a few minutes already streamed
@@ -301,8 +304,12 @@ async def test_connect_and_is_connected():
     info = await src.connect({"server": "LiveMarket"})
     assert info["server"].startswith("LiveMarket • binance")
     assert await src.is_connected() is True
-    # stale data (> 90s) -> disconnected so the heartbeat can heal it
+    # D-037: gold going stale alone no longer disconnects the platform —
+    # the BTCUSD pair (24/7 in MT5-only mode) keeps it alive. ALL feeds
+    # stale (> 90s) -> disconnected so the heartbeat can heal it
     src.market.last_data_monotonic -= 999.0
+    for f in src.market.feeds.values():
+        f.last_data_monotonic -= 999.0
     assert await src.is_connected() is False
 
 
@@ -490,6 +497,7 @@ async def test_binance_mirror_failover_451():
         http_factory=lambda: client,
         poll_seconds=0.05,
         binance_bases=["https://api.binance.com", "https://data-api.binance.vision"],
+        mt5_only=False,
     )
     assert await feed.poll_once() is True
     assert feed.provider == "binance"

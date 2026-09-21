@@ -11,7 +11,7 @@ export interface DotMenuActions {
   onOpenMarketData: () => void;   // Analysis: external reference data tab
   onOpenLogs: () => void;         // Analysis: platform log viewer
   onOpenSettings: () => void;     // Settings: engine config (admin)
-  onOpenPlatformMt5: () => void;  // Settings: platform MT5 connect (admin)
+  onOpenPlatformMt5: () => void;  // Trading: connect YOUR broker account (D-037, all users)
 }
 
 interface DotMenuProps {
@@ -52,6 +52,7 @@ export default function DotMenu({ actions, isAdmin }: DotMenuProps) {
     {
       title: "Trading",
       items: [
+        { label: "Connect Broker", hint: "your Exness MT5 account · per-user", onClick: actions.onOpenPlatformMt5 },
         { label: "MT5 Account (live)", hint: "real Exness balance · positions · orders", onClick: actions.onOpenMt5Account },
         { label: "My Trading Account", hint: "connect your MT5 / Exness account", onClick: actions.onOpenTrading },
         { label: "Trade Panel", hint: "manual orders & open positions", onClick: actions.onOpenTradePanel },
@@ -71,7 +72,6 @@ export default function DotMenu({ actions, isAdmin }: DotMenuProps) {
       items: isAdmin
         ? [
             { label: "Engine Settings", hint: "strategy & risk config", onClick: actions.onOpenSettings },
-            { label: "Platform MT5", hint: "admin data-source connection", onClick: actions.onOpenPlatformMt5 },
           ]
         : [
             { label: "Engine Settings", hint: "admin only", onClick: actions.onOpenSettings },
@@ -109,7 +109,7 @@ export default function DotMenu({ actions, isAdmin }: DotMenuProps) {
       {open && (
         <nav
           role="menu"
-          className="absolute right-0 z-50 mt-2 w-72 overflow-hidden rounded-xl border border-zinc-700 bg-zinc-900/95 py-1.5 shadow-2xl backdrop-blur"
+          className="absolute right-0 z-50 mt-2 max-w-[calc(100vw-2rem)] w-72 overflow-hidden rounded-xl border border-zinc-700 bg-zinc-900/95 py-1.5 shadow-2xl backdrop-blur"
         >
           {groups.map((g) => (
             <div key={g.title} className="mb-1 last:mb-0">

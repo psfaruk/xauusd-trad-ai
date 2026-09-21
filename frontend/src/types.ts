@@ -94,6 +94,8 @@ export interface SymbolFeedStatus {
   provider: string;
   detail: string;
   mt5: boolean;
+  /** D-037: open | closed | unavailable (weekend gold = "closed"). */
+  market?: "open" | "closed" | "unavailable" | "unknown";
   last_price: number | null;
   spread: number | null;
   last_tick_age_s: number | null;
@@ -110,11 +112,33 @@ export interface Mt5FeedVenueStatus {
   err: string | null;
 }
 
+/** D-037: the USER's own broker connection (per-user, real terminal). */
+export interface BrokerConnection {
+  status: "connected" | "disconnected" | "reconnecting";
+  login?: string;
+  server?: string;
+  connected_at?: number;
+  account?: {
+    login: number | string | null;
+    name?: string | null;
+    server?: string | null;
+    broker?: string | null;
+    currency?: string | null;
+    balance?: number | null;
+    equity?: number | null;
+    margin_free?: number | null;
+    profit?: number | null;
+    leverage?: number | null;
+  } | null;
+}
+
 export interface Mt5Status {
   status: "connected" | "disconnected" | "reconnecting";
   symbol: string | null;
   /** D-035: every chartable symbol (XAUUSD + BTCUSD). */
   symbols?: string[];
+  /** D-037: the requesting user's broker connection. */
+  broker?: BrokerConnection;
   account: {
     balance: number | null;
     equity: number | null;

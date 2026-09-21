@@ -114,7 +114,7 @@ export default function TopBar({
   }, [lastPrice]);
 
   return (
-    <header className="flex flex-wrap items-center gap-3 border-b border-zinc-800 bg-zinc-900/60 px-4 py-3">
+    <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-zinc-800 bg-zinc-900/60 px-3 py-2.5 sm:px-4 sm:py-3">
       <div className="flex items-center gap-2">
         <span className="inline-block h-2.5 w-2.5 rounded-full bg-gold shadow-[0_0_8px_#d4af37]" />
         <span className="text-sm font-semibold tracking-wide text-zinc-100">
@@ -200,7 +200,7 @@ export default function TopBar({
         </span>
       )}
 
-      <span className={`rounded-full border px-2 py-0.5 text-[11px] ${healthPill}`}>
+      <span className={`hidden rounded-full border px-2 py-0.5 text-[11px] sm:inline-flex ${healthPill}`}>
         api {backend}
         {source && <span className="ml-1 opacity-70">{source}</span>}
       </span>

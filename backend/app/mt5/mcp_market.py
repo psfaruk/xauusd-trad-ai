@@ -34,7 +34,8 @@ from typing import Any
 
 logger = logging.getLogger("xauusd.mcpmarket")
 
-POLL_S = 1.0                 # tick poll cadence per symbol
+#: tick poll cadence per symbol (D-037: 4/s — MT5-like liveness)
+POLL_S = float(os.environ.get("MT5_TICK_POLL_S", "0.25"))
 FRESH_S = 15.0               # MT5 authority window since last broker tick
 BARS_CACHE_TTL_S = 20.0      # chart-history cache per (symbol, tf)
 BARS_MIN_REFETCH_S = 3.0     # forced-refetch rate cap
@@ -117,10 +118,32 @@ class McpMarketFeed:
             self._tasks.append(asyncio.create_task(
                 self._poll_loop(sym), name=f"mcp-market-{sym}"
             ))
+        # D-037: an abruptly-killed terminal can lose Market Watch entries
+        # (state not flushed) — re-ensure our symbols periodically so the
+        # feed self-heals after ANY terminal restart.
+        self._tasks.append(asyncio.create_task(
+            self._ensure_symbols_loop(), name="mcp-market-ensure"
+        ))
         logger.info(
             "MT5 market feed started — symbols %s (broker %s)",
             self._watch, self.symbol_map,
         )
+
+    async def _ensure_symbols_loop(self) -> None:
+        """Re-run discovery (idempotent Market Watch re-add) every 60s."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=60.0)
+            except TimeoutError:
+                pass
+            if self._stop.is_set():
+                return
+            try:
+                await self._discover_symbols()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — loop never dies
+                logger.debug("MT5 symbol re-ensure failed: %s", exc)
 
     async def stop(self) -> None:
         self._stop.set()
@@ -138,7 +161,12 @@ class McpMarketFeed:
         return bool(self._tasks) and not self._stop.is_set()
 
     async def _discover_symbols(self) -> None:
-        """Map platform -> broker symbols from Market Watch (best prefix match)."""
+        """Map platform -> broker symbols from Market Watch (best prefix match).
+
+        D-037: a FRESH terminal ships a default Market Watch that may not
+        include our broker symbols — ensure they are added (idempotent) so
+        their ticks flow; otherwise polls return 0 rows forever.
+        """
         self.symbol_map = dict(DEFAULT_MAP)
         try:
             rows = await asyncio.to_thread(self._client.symbols)
@@ -154,6 +182,19 @@ class McpMarketFeed:
             elif prefix:
                 # prefer the shortest (e.g. XAUUSDm over XAUUSDmicro)
                 self.symbol_map[plat] = min(prefix, key=len)
+            if self.symbol_map[plat] not in names:
+                try:
+                    await asyncio.to_thread(
+                        self._client._call,  # noqa: SLF001 — own client
+                        "add_marketwatch_symbol",
+                        {"symbol": self.symbol_map[plat]},
+                    )
+                    logger.info("MT5 Market Watch: added %s", self.symbol_map[plat])
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    logger.warning(
+                        "MT5 Market Watch add %s failed: %s",
+                        self.symbol_map[plat], exc,
+                    )
 
     # --------------------------------------------------------------- polling
 
@@ -243,6 +284,23 @@ class McpMarketFeed:
         """True while the broker is actively ticking this symbol (market open)."""
         last = self._last_monotonic.get(plat, 0.0)
         return last > 0 and time_mod.monotonic() - last < self._fresh_s
+
+    def market_state(self, plat: str) -> str:
+        """D-037: open | closed | unavailable for one platform symbol.
+
+        open  — broker ticks arriving right now (BTCUSDm 24/7, gold during
+                forex sessions)
+        closed — the symbol ticked before but went idle (gold Sat/Sun):
+                the terminal still serves its real chart history
+        unavailable — the terminal bridge itself is unreachable
+        """
+        if self.fresh(plat):
+            return "open"
+        if self._last_ts.get(plat):
+            return "closed"
+        if self._err.get(plat):
+            return "unavailable"
+        return "unknown"
 
     def tps(self, plat: str, window_s: float = 5.0) -> float | None:
         times = self._event_times.get(plat)

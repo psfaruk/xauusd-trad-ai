@@ -14,12 +14,21 @@ import type { Candle, Signal } from "../types";
  * updates. The parent feeds:
  *  - `candles`  -> full backfill (setData) on TF switch / reconnect heal
  *  - `liveBar`  -> the latest forming bar, updated on every bar event
+ *  - `liveTick` -> the freshest broker quote (bid/ask) — D-037
+ *  - `market`   -> open | closed | unavailable — status chip (D-037)
  *  - `activeSignal` -> entry/SL/TP price lines + a marker at the signal bar
+ *
+ * D-037 60fps smoothness: broker ticks arrive several times per second; the
+ * last candle ANIMATES toward the newest price with a requestAnimationFrame
+ * loop (exponential easing rendered at display refresh rate) — the chart
+ * moves like the MetaTrader 5 terminal instead of stepping.
  */
 
 interface ChartProps {
   candles: Candle[];
   liveBar: Candle | null;
+  liveTick?: { bid: number; ask: number } | null;
+  market?: "open" | "closed" | "unavailable" | "unknown";
   activeSignal: Signal | null;
   tf: string;
   /** D-035: called when the live update path detects a desync — the parent
@@ -30,6 +39,9 @@ interface ChartProps {
 const UP = "#26a69a";
 const DOWN = "#ef5350";
 const GOLD = "#d4af37";
+/** D-037: easing factor per 60fps frame toward the newest broker price. */
+const EASE = 0.22;
+const EPSILON = 1e-9;
 
 /** D-035 chart hardening: strictly-ascending, deduped, finite-only bars.
  * Bad frames (out-of-order / duplicate / NaN) are dropped instead of ever
@@ -51,14 +63,44 @@ function sanitizeCandles(rows: Candle[]): Candle[] {
   return [...clean.values()].sort((a, b) => a.t - b.t);
 }
 
-export default function Chart({ candles, liveBar, activeSignal, tf, onDesync }: ChartProps) {
+interface AnimState {
+  /** what is on screen right now (eased) */
+  cur: Candle | null;
+  /** the newest authoritative bar/price we are easing toward */
+  tgt: Candle | null;
+}
+
+export default function Chart({
+  candles, liveBar, liveTick, market, activeSignal, tf, onDesync,
+}: ChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const priceLinesRef = useRef<ReturnType<ISeriesApi<"Candlestick">["createPriceLine"]>[]>([]);
   const lastDataRef = useRef<Candle[]>([]);
-  const lastLiveRef = useRef<Candle | null>(null);
+  const animRef = useRef<AnimState>({ cur: null, tgt: null });
+  const rafRef = useRef<number | null>(null);
+
+  // ------------------------------------------------------------------ utils
+  const pushBar = (bar: Candle, volume = true) => {
+    const series = seriesRef.current;
+    if (!series) return;
+    series.update({
+      time: bar.t as UTCTimestamp,
+      open: bar.o,
+      high: bar.h,
+      low: bar.l,
+      close: bar.c,
+    });
+    if (volume && volumeRef.current) {
+      volumeRef.current.update({
+        time: bar.t as UTCTimestamp,
+        value: bar.v,
+        color: bar.c >= bar.o ? "#1f5f57" : "#6b3232",
+      });
+    }
+  };
 
   // create once
   useEffect(() => {
@@ -97,10 +139,43 @@ export default function Chart({ candles, liveBar, activeSignal, tf, onDesync }: 
       priceFormat: { type: "volume" },
     });
     chart.priceScale("").applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
+
+    // D-037: 60fps easing loop — every frame moves the rendered candle
+    // toward the newest target price; idles when settled.
+    const step = () => {
+      const { cur, tgt } = animRef.current;
+      if (cur && tgt && tgt.t === cur.t) {
+        const dc = tgt.c - cur.c;
+        if (Math.abs(dc) > EPSILON || cur.h < tgt.h || cur.l > tgt.l) {
+          const next = { ...cur };
+          next.c = Math.abs(dc) < 1e-7 ? tgt.c : cur.c + dc * EASE;
+          next.h = Math.max(cur.h, tgt.h, next.c);
+          next.l = Math.min(cur.l, tgt.l, next.c);
+          animRef.current.cur = next;
+          try {
+            pushBar(next);
+          } catch {
+            /* handled by the liveBar effect's self-heal */
+          }
+        } else {
+          animRef.current.cur = { ...tgt }; // settled — snap exact
+          try {
+            pushBar(animRef.current.cur);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      rafRef.current = requestAnimationFrame(step);
+    };
+    rafRef.current = requestAnimationFrame(step);
+
     chartRef.current = chart;
     seriesRef.current = series;
     volumeRef.current = volume;
     return () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -115,9 +190,9 @@ export default function Chart({ candles, liveBar, activeSignal, tf, onDesync }: 
     const volume = volumeRef.current;
     if (!series || !volume || candles === lastDataRef.current) return;
     lastDataRef.current = candles;
-    lastLiveRef.current = null;
     const clean = sanitizeCandles(candles); // D-035: never feed bad bars
     if (clean.length === 0) return;
+    animRef.current = { cur: null, tgt: null };
     try {
       series.setData(
         clean.map((c) => ({
@@ -142,11 +217,9 @@ export default function Chart({ candles, liveBar, activeSignal, tf, onDesync }: 
     }
   }, [candles]);
 
-  // live forming bar — series.update() with the SAME-or-newer timestamp
+  // live forming bar -> ANIMATION TARGET (never a hard jump — D-037)
   useEffect(() => {
-    const series = seriesRef.current;
-    const volume = volumeRef.current;
-    if (!series || !volume || !liveBar || liveBar === lastLiveRef.current) return;
+    if (!liveBar) return;
     if (lastDataRef.current.length === 0) return;
     if (
       !Number.isFinite(liveBar.t) || !Number.isFinite(liveBar.o) ||
@@ -155,31 +228,44 @@ export default function Chart({ candles, liveBar, activeSignal, tf, onDesync }: 
     ) {
       return; // D-035: drop malformed frames
     }
-    const lastKnown = lastLiveRef.current ?? lastDataRef.current[lastDataRef.current.length - 1];
+    const lastKnown =
+      animRef.current.tgt ?? animRef.current.cur ??
+      lastDataRef.current[lastDataRef.current.length - 1];
     if (liveBar.t < lastKnown.t) return; // stale frame after a TF switch
-    lastLiveRef.current = liveBar;
-    try {
-      series.update({
-        time: liveBar.t as UTCTimestamp,
-        open: liveBar.o,
-        high: liveBar.h,
-        low: liveBar.l,
-        close: liveBar.c,
-      });
-      volume.update({
-        time: liveBar.t as UTCTimestamp,
-        value: liveBar.v,
-        color: liveBar.c >= liveBar.o ? "#1f5f57" : "#6b3232",
-      });
-    } catch (err) {
-      // D-035 self-heal: a rejected update means the series drifted from the
-      // live stream (e.g. a bucket raced past) — ask the parent for a fresh
-      // backfill instead of leaving a broken chart.
-      console.warn("chart update rejected — requesting resync", err);
-      lastLiveRef.current = null;
-      onDesync?.();
+    if (
+      animRef.current.cur == null ||
+      animRef.current.cur.t !== liveBar.t ||
+      animRef.current.tgt == null ||
+      animRef.current.tgt.t !== liveBar.t
+    ) {
+      // new bucket / first live bar: seed the animation from the bar itself
+      animRef.current.cur = { ...liveBar };
+      try {
+        pushBar(liveBar);
+      } catch (err) {
+        console.warn("chart update rejected — requesting resync", err);
+        animRef.current = { cur: null, tgt: null };
+        onDesync?.();
+      }
     }
+    animRef.current.tgt = { ...liveBar };
   }, [liveBar, onDesync]);
+
+  // freshest broker quote -> retarget the animation between bar frames
+  // (every real tick nudges the candle — the MT5-terminal feel, D-037)
+  useEffect(() => {
+    if (!liveTick || !Number.isFinite(liveTick.bid) || !Number.isFinite(liveTick.ask)) return;
+    const mid = (liveTick.bid + liveTick.ask) / 2;
+    const tgt = animRef.current.tgt;
+    if (tgt == null) return;
+    if (mid <= 0) return;
+    animRef.current.tgt = {
+      ...tgt,
+      c: mid,
+      h: Math.max(tgt.h, mid),
+      l: Math.min(tgt.l, mid),
+    };
+  }, [liveTick]);
 
   // active signal -> entry/SL/TP price lines
   useEffect(() => {
@@ -204,13 +290,37 @@ export default function Chart({ candles, liveBar, activeSignal, tf, onDesync }: 
     ];
   }, [activeSignal]);
 
+  const chip =
+    market === "open" ? (
+      <span className="flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-semibold tracking-wide text-emerald-300 backdrop-blur">
+        <span className="relative flex h-1.5 w-1.5">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+          <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+        </span>
+        LIVE · MT5
+      </span>
+    ) : market === "closed" ? (
+      <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[10px] font-semibold tracking-wide text-amber-300 backdrop-blur">
+        MARKET CLOSED
+      </span>
+    ) : market === "unavailable" ? (
+      <span className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] font-semibold tracking-wide text-red-300 backdrop-blur">
+        FEED OFFLINE
+      </span>
+    ) : null;
+
   return (
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" aria-label={`${tf} candlestick chart`} />
+      {chip && <div className="absolute left-3 top-3 z-10">{chip}</div>}
       {candles.length === 0 && (
         <div className="pointer-events-none absolute inset-0 grid place-items-center">
           <p className="rounded-lg border border-zinc-800 bg-zinc-900/80 px-4 py-2 text-xs text-zinc-400">
-            waiting for live market data… (real feed — no demo data)
+            {market === "closed"
+              ? "market closed — showing real broker history from MetaTrader 5"
+              : market === "unavailable"
+                ? "MetaTrader 5 terminal unreachable — no demo data, retrying…"
+                : "waiting for live market data… (real feed — no demo data)"}
           </p>
         </div>
       )}

@@ -75,28 +75,66 @@ class TestMt5Routes:
     def test_status_requires_auth(self, client):
         assert client.get("/api/mt5/status").status_code == 401
 
-    def test_connect_requires_admin(self, client):
+    def test_trading_routes_require_broker_connection_428(self, client):
+        """D-037: without a broker connection the trading routes answer
+        428 (connect required) — honest, never another user's account."""
+        r = client.get("/api/mt5/account", headers=GOOD)
+        assert r.status_code == 428
+        r = client.get("/api/mt5/positions", headers=GOOD)
+        assert r.status_code == 428
+        r = client.get("/api/mt5/history", headers=GOOD)
+        assert r.status_code == 428
+        r = client.post(
+            "/api/mt5/order", headers=GOOD,
+            json={"symbol": "XAUUSDm", "side": "buy", "volume": 0.01},
+        )
+        assert r.status_code == 428
+
+    def test_auto_trade_arm_requires_connection_428(self, client):
+        """D-037: non-admin without a broker connection cannot arm."""
+        r = client.post(
+            "/api/mt5/auto-trade", headers=GOOD,
+            json={"enabled": True, "confirm": "ENABLE"},
+        )
+        assert r.status_code == 428
+
+    def test_connect_any_user_d037(self, client):
+        """D-037: any authenticated user connects THEIR OWN broker account
+        (mock demo plane accepts entered credentials and binds the user)."""
         r = client.post(
             "/api/mt5/connect", headers=GOOD,
-            json={"server": "s", "login": "1", "password": "x"},
+            json={"server": "Exness-MT5Trial", "login": "123", "password": "x"},
         )
-        assert r.status_code == 403
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "connected"
+        assert body["login"] == "123"
+        # per-user status carries the broker block
+        r = client.get("/api/mt5/status", headers=GOOD)
+        assert r.status_code == 200
+        assert r.json()["broker"]["status"] == "connected"
+        assert r.json()["broker"]["login"] == "123"
+        # a DIFFERENT user is NOT connected (per-user isolation)
+        r = client.get("/api/mt5/status", headers=ADMIN_H)
+        assert r.json()["broker"]["status"] == "disconnected"
 
     def test_disconnect_connect_cycle_admin(self, client):
         r = client.post("/api/mt5/disconnect", headers=ADMIN_H)
         assert r.status_code == 200
         assert r.json()["status"] == "disconnected"
-        # candles now 409
+        # D-037: the platform market plane keeps running for everyone else
         r = client.get("/api/candles", headers=GOOD, params={"tf": "M15"})
-        assert r.status_code == 409
-        # reconnect (mock accepts anything)
+        assert r.status_code == 200
+        # reconnect (mock accepts anything; platform already streaming so
+        # the response carries the broker block + engine flag, no re-discovery)
         r = client.post(
             "/api/mt5/connect", headers=ADMIN_H,
             json={"server": "Exness-MT5Trial", "login": "123", "password": "pw"},
         )
         assert r.status_code == 200
         assert r.json()["status"] == "connected"
-        assert r.json()["symbol"] == "XAUUSDm"
+        assert r.json()["login"] == "123"
+        assert r.json()["engine_running"] is True
 
 
 class TestCandlesRoute:
@@ -245,14 +283,16 @@ class TestWebSocket:
             ws.send_text(json.dumps({"type": "ping"}))
             msg = json.loads(ws.receive_text())
             assert msg["type"] == "heartbeat"
-            # trigger a status broadcast via admin disconnect
+            # trigger a status broadcast via admin disconnect (D-037: the
+            # platform stays connected; the broker block goes disconnected)
             client.post("/api/mt5/disconnect", headers=ADMIN_H)
             deadline = time.time() + 10
             got_status = False
             while time.time() < deadline:
                 msg = json.loads(ws.receive_text())
                 if msg["type"] == "mt5_status":
-                    assert msg["status"] == "disconnected"
+                    assert msg["status"] == "connected"
+                    assert msg["broker"]["status"] == "disconnected"
                     got_status = True
                     break
             assert got_status

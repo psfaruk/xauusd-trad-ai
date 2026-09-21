@@ -446,14 +446,14 @@ async def test_routes_auto_trade() -> None:
     with pytest.raises(HTTPException) as ei:
         await routes_mt5.mt5_auto_trade_arm(
             routes_mt5.AutoTradeLiveBody(enabled=True), make_req(app),
-            user={"id": "admin-1"},
+            user={"id": "admin-1", "role": "admin"},
         )
     assert ei.value.status_code == 400
 
     # arm with confirm -> 200
     res = await routes_mt5.mt5_auto_trade_arm(
         routes_mt5.AutoTradeLiveBody(enabled=True, confirm="ENABLE"),
-        make_req(app), user={"id": "admin-1"},
+        make_req(app), user={"id": "admin-1", "role": "admin"},
     )
     assert res["armed"] is True
     assert trader.armed
@@ -464,14 +464,14 @@ async def test_routes_auto_trade() -> None:
     with pytest.raises(HTTPException) as ei2:
         await routes_mt5.mt5_auto_trade_arm(
             routes_mt5.AutoTradeLiveBody(enabled=True, confirm="ENABLE"),
-            make_req(app2), user={"id": "admin-1"},
+            make_req(app2), user={"id": "admin-1", "role": "admin"},
         )
     assert ei2.value.status_code == 409
 
     # disarm always works
     res2 = await routes_mt5.mt5_auto_trade_arm(
         routes_mt5.AutoTradeLiveBody(enabled=False), make_req(app),
-        user={"id": "admin-1"},
+        user={"id": "admin-1", "role": "admin"},
     )
     assert res2["armed"] is False
     assert not trader.armed

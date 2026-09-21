@@ -1,8 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import {
-  getMt5Account, getMt5AutoTrade, getMt5History, getMt5Positions, getMt5Symbols,
-  postMt5AutoTrade, postMt5Close, postMt5Order,
-} from "../lib/api";
+import { ApiError, getMt5Account, getMt5AutoTrade, getMt5History, getMt5Positions, getMt5Symbols, postMt5AutoTrade, postMt5Close, postMt5Order } from "../lib/api";
 import type {
   Mt5Account, Mt5AutoTradeStatus, Mt5HistoryPosition, Mt5OpenPosition, Mt5Symbol,
   WsMt5AutoMsg,
@@ -18,6 +15,8 @@ interface Mt5AccountPanelProps {
   autoEvents?: WsMt5AutoMsg[];
   /** D-036: only admins may arm/disarm the REAL auto-executor. */
   isAdmin?: boolean;
+  /** D-037: open the per-user broker-connect dialog (428 CTA). */
+  onConnect?: () => void;
 }
 
 type Tab = "positions" | "history" | "order" | "auto";
@@ -31,9 +30,10 @@ type Tab = "positions" | "history" | "order" | "auto";
  * D-036 "AI AUTO" tab: AI signal -> auto-order on the REAL account —
  * arm/disarm (typed confirm), risk summary and the live execution feed.
  */
-export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol, autoEvents = [], isAdmin = false }: Mt5AccountPanelProps) {
+export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol, autoEvents = [], isAdmin = false, onConnect }: Mt5AccountPanelProps) {
   const [tab, setTab] = useState<Tab>("positions");
   const [account, setAccount] = useState<Mt5Account | null>(null);
+  const [needsConnect, setNeedsConnect] = useState(false);
   const [positions, setPositions] = useState<Mt5OpenPosition[] | null>(null);
   const [history, setHistory] = useState<Mt5HistoryPosition[] | null>(null);
   const [symbols, setSymbols] = useState<Mt5Symbol[]>([]);
@@ -65,7 +65,10 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol, a
       ]);
       setAccount(acct);
       setPositions(pos.positions);
-    } catch {
+      setNeedsConnect(false);
+    } catch (e) {
+      // D-037: 428 = this user has no broker connection yet — show the CTA
+      setNeedsConnect(e instanceof ApiError && e.status === 428);
       setAccount(null);
       setPositions([]);
     }
@@ -187,10 +190,14 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol, a
         onClick={(e) => e.stopPropagation()}
       >
         {/* header */}
-        <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 px-4 py-3 sm:px-5">
           <div className="flex items-center gap-3">
             <h2 className="text-base font-semibold text-zinc-100">MT5 Account</h2>
-            {account ? (
+            {needsConnect ? (
+              <span className="rounded-full bg-gold/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-gold">
+                connect your broker
+              </span>
+            ) : account ? (
               <span
                 className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${
                   connected
@@ -207,18 +214,6 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol, a
             )}
           </div>
           <div className="flex items-center gap-2">
-            <div className="flex rounded-md border border-zinc-700 p-0.5 text-xs">
-              {(["positions", "history", "order", "auto"] as Tab[]).map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  onClick={() => setTab(t)}
-                  className={`rounded px-3 py-1 ${tab === t ? "bg-gold/15 text-gold" : "text-zinc-400 hover:text-zinc-200"}`}
-                >
-                  {t === "auto" ? "AI AUTO" : t}
-                </button>
-              ))}
-            </div>
             {auto?.armed && (
               <span className="rounded-full bg-red-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-red-300">
                 ● ai auto armed
@@ -228,7 +223,43 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol, a
           </div>
         </div>
 
-        {/* account summary */}
+        {/* tabs */}
+        <div className="overflow-x-auto border-b border-zinc-800 px-4 sm:px-5">
+          <div className="flex w-max gap-1 py-2 text-xs">
+            {(["positions", "history", "order", "auto"] as Tab[]).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setTab(t)}
+                className={`rounded border px-3 py-1 ${tab === t ? "border-gold/40 bg-gold/15 text-gold" : "border-zinc-700 text-zinc-400 hover:text-zinc-200"}`}
+              >
+                {t === "auto" ? "AI AUTO" : t}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* D-037: no broker connection yet — honest CTA instead of fake data */}
+        {needsConnect && (
+          <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 py-10 text-center">
+            <p className="max-w-sm text-sm leading-relaxed text-zinc-400">
+              Connect your own MetaTrader 5 broker account to see your balance,
+              positions and trade history here. Orders and AI auto-trade run on
+              <b className="text-zinc-200"> your account only</b> — nobody else
+              can see them.
+            </p>
+            <button
+              type="button"
+              onClick={() => onConnect?.()}
+              className="rounded-md border border-gold/50 bg-gold/15 px-4 py-2 text-sm font-semibold text-gold hover:bg-gold/25"
+            >
+              Connect broker account
+            </button>
+          </div>
+        )}
+
+        {/* account summary (hidden until the user connects a broker, D-037) */}
+        {!needsConnect && (
         <div className="grid grid-cols-2 gap-3 border-b border-zinc-800 px-5 py-4 sm:grid-cols-4">
           <div>
             <p className="text-[10px] uppercase tracking-wider text-zinc-500">Balance</p>
@@ -270,8 +301,10 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol, a
             )}
           </div>
         </div>
+        )}
 
         {/* body */}
+        {!needsConnect && (
         <div className="flex-1 overflow-y-auto p-5">
           {tab === "positions" && (
             <div>
@@ -688,6 +721,7 @@ export default function Mt5AccountPanel({ open, onClose, token, defaultSymbol, a
             </div>
           )}
         </div>
+        )}
 
         {error && <p className="border-t border-zinc-800 px-5 py-2 text-xs text-red-400">{error}</p>}
         {notice && <p className="border-t border-zinc-800 px-5 py-2 text-xs text-emerald-400">{notice}</p>}

@@ -314,3 +314,82 @@ duplicate relay idempotently skipped → expiry closed @ 81067.15 → disarm
 (-$0.10 spread cost, real broker behavior). Browser e2e: AI AUTO tab,
 ENABLE→ARM flow, red ARMED badge + footer chip, WS event feed showing the
 ARMED event in real time, zero console errors.
+
+---
+
+## D-037 — Per-user broker connections, MT5-only candles, 60fps chart, mobile UI
+
+**Context (user directives, Bengali):** (1) "অ্যাপ এর ক্যান্ডেল ডেটা শুধু মাত্র
+meta 5 থেকে আসবে, এটা ফিক্স" — candle/quote data comes ONLY from MetaTrader 5.
+(2) "জখন যে লোক তার exness তথ্য দিয়ে একাউন্ট করবে, সেই ট্রেড শুধু তার
+একাউন্টে দেখা যাবে" — every user connects THEIR OWN Exness account; trades
+are visible only inside that user's session. (3) Candles must move like the
+MT5 terminal (60fps, no stepping/freezing) and the site must be mobile +
+desktop friendly. (4) The broker connection must survive restarts
+("deploy করার পর connect হচ্ছে না").
+
+**Decision:**
+1. **`BrokerConnectionService`** (`app/mt5/broker_connect.py`): per-user
+   broker connections over the REAL terminal. A user "connects" by entering
+   (server, login, password); the service verifies the entered login+server
+   against the LIVE terminal session and binds the user to it (password
+   Fernet-encrypted at rest in `mt5_connections`). Accounts not provisioned
+   on the terminal host get an honest 422; terminal down → 503; demo plane
+   (DATA_SOURCE=mock) records without a terminal. All `/api/mt5/*` trading
+   routes (account/positions/history/order/close, auto-trade arm for
+   non-admins) are gated on the REQUESTING user's active connection →
+   **users never see anyone else's trades** (428 "connect your broker
+   account first" otherwise).
+2. **MT5_ONLY market data** (`live_source.py`): the crypto-composite
+   fallback is disabled by default (`MT5_ONLY=1`; `=0` restores D-035
+   behavior for hosts without a terminal). Broker feed only; when a symbol
+   is closed the state is reported honestly (`market: open|closed|
+   unavailable` per symbol in feed status) and the terminal still serves
+   its real chart HISTORY — nothing is ever synthesized. Weekend-robust
+   connect: the platform is "connected" while ANY symbol ticks or the
+   terminal serves bars.
+3. **Stack rebuild + self-healing (the "doesn't connect after deploy"
+   fix):** the whole `/home/z/mt5stack` was reconstructed from scratch
+   (wine 10.0 from the gmag11/metatrader5_vnc image layers, MT5 build 6205
+   via download.mql5.com — metaquotes.net is DNS-blocked here, terminal
+   logged in through the GUI flow against ExnessSC-MT5Trial6). Key
+   resilience pieces: the account session is stored (`accounts.dat`) so
+   watchdog terminal restarts auto-relogin in ~15s (verified); a 60s
+   `_ensure_symbols_loop` re-adds Market Watch entries an abrupt kill may
+   lose (gold self-healed after a pkill test); MCP key in
+   `assistant.ini` + `mcp_key.txt` (outside the repo).
+4. **60fps chart** (`Chart.tsx`): a requestAnimationFrame easing loop
+   (exponential, ~0.22/frame) animates the last candle toward the newest
+   broker price — every real tick retargets the animation between bar
+   frames (MetaTrader-terminal feel); bar_open seeds a new bucket, settled
+   frames snap exact; volume + candle stay consistent; malformed frames
+   still dropped + onDesync self-heal (D-035 hardening kept).
+5. **Frontend per-user UX:** ⋮ → **Connect Broker** (all users) opens the
+   rewritten dialog (per-user, encrypted-at-rest note, live connection
+   card); the dashboard footer shows a `BROKER <login>@<server>` chip (or a
+   gold "connect broker" CTA); the MT5 Account panel shows an honest
+   "Connect broker account" CTA on 428 instead of fake data, and its
+   header/tabs are mobile-friendly (wrapping tabs, scrollable); TopBar api
+   pill hides on small screens; chart box responsive
+   (48vh mobile → calc(100vh−220px) xl).
+
+**Verification:** 234 backend tests green (10 new: demo bind, terminal
+verify, 422 mismatch incl. wrong server, 503 terminal down / no session,
+per-user isolation + disconnect, reconnecting-state snapshot retention;
+428 gates for account/positions/history/order/auto-arm; MT5_ONLY
+crypto-events-never-move-quote + weekend-stays-broker-only), ruff/tsc/vite
+clean. LIVE e2e on the rebuilt stack: terminal connected
+(Exness-MT5Trial6 · 414350770, build 6205, mcp_trade_allowed) with BOTH
+symbols streaming from the real broker (Monday open: XAUUSD ~4354 @
+0.1–0.5s, BTCUSD ~81918); REST e2e — 428 → 422 wrong account → 200 real
+connect → per-user status snapshot → user B sees NOTHING (isolation) →
+per-user disconnect (platform keeps running). Browser e2e: LIVE · MT5 ·
+broker feed badge with ⚡ t/s, BROKER 414350770@Exness-MT5Trial6 footer
+chip, MT5 panel ● live + 8-entry history, second user → "Connect broker
+account" CTA → dialog opens; mobile 375px: zero horizontal overflow,
+chart 343×390, header wraps, menu works; terminal pkill → watchdog
+restart + AUTO-LOGIN verified in 15s; gold Market Watch self-heal via the
+ensure loop. Note: the Exness TRIAL account balance was reset to 0.00 by
+the broker (trial servers wipe periodically) — the connection, orders
+routing and history all work; the user may need to top-up/recreate the
+demo account for live trading.

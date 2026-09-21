@@ -151,9 +151,28 @@ def _core(mcp: FakeMcp | None, **kw):
     return SymbolFeedCore(spec=GOLD_SPEC, enable_ws=False, mt5=mcp, **kw)
 
 
-async def test_mt5_fresh_crypto_events_never_move_quote():
+async def test_d037_mt5_only_crypto_events_never_move_quote():
+    """D-037 (default): with MT5_ONLY the broker feed is the single authority
+    — crypto composite events are ignored even while the broker is idle."""
     mcp = FakeMcp(fresh_keys=("XAUUSD",))
-    core = _core(mcp)
+    core = _core(mcp)  # mt5_only defaults to True (D-037)
+    mcp.fresh_keys.clear()  # weekend / broker idle
+    core._on_ws_event(_Ev(bid=4300.0, ask=4301.0))
+    assert core.tick is None  # composite ignored entirely
+
+    # a REAL broker tick takes over once the market reopens
+    core.on_mt5_tick(4378.10, 4378.40, time_mod.time())
+    assert core.provider == "mt5"
+    assert core.tick.bid == 4378.10
+    # and crypto events still cannot move it
+    core._on_ws_event(_Ev(bid=1.0, ask=2.0))
+    assert core.tick.bid == 4378.10
+
+
+async def test_mt5_fresh_crypto_events_never_move_quote():
+    """D-035 composite semantics — exercised explicitly with mt5_only=False."""
+    mcp = FakeMcp(fresh_keys=("XAUUSD",))
+    core = _core(mcp, mt5_only=False)
     mcp.fresh_keys.clear()
     core._on_ws_event(_Ev(bid=4300.0, ask=4301.0))
     assert core.tick is not None and core.provider == "aggregate"
@@ -173,9 +192,10 @@ async def test_mt5_fresh_crypto_events_never_move_quote():
 
 
 async def test_weekend_fallback_crypto_composite_resumes():
-    """MT5 goes stale (weekend) -> the crypto composite becomes the quote."""
+    """D-035 composite mode (mt5_only=False): MT5 goes stale (weekend) ->
+    the crypto composite becomes the quote."""
     mcp = FakeMcp(fresh_keys=("XAUUSD",))
-    core = _core(mcp)
+    core = _core(mcp, mt5_only=False)
     core.on_mt5_tick(4378.10, 4378.40, time_mod.time())
     assert core.provider == "mt5"
 
@@ -183,6 +203,18 @@ async def test_weekend_fallback_crypto_composite_resumes():
     core._on_ws_event(_Ev(bid=4368.0, ask=4369.0))
     assert core.provider == "aggregate"
     assert core.tick.bid == 4368.0  # composite took over — chart keeps moving
+
+
+async def test_d037_weekend_stays_broker_only():
+    """D-037 default: MT5 goes stale (weekend) -> NO composite takeover; the
+    last real broker price stays and the state is reported honestly."""
+    mcp = FakeMcp(fresh_keys=("XAUUSD",))
+    core = _core(mcp)  # MT5_ONLY default
+    core.on_mt5_tick(4378.10, 4378.40, time_mod.time())
+    mcp.fresh_keys.clear()  # weekend
+    core._on_ws_event(_Ev(bid=4368.0, ask=4369.0))
+    assert core.tick is not None and core.tick.bid == 4378.10  # broker price
+    assert core.provider == "mt5"
 
 
 async def test_ensure_tf_prefers_mt5_bars_when_fresh():

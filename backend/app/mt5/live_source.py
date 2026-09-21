@@ -1,36 +1,29 @@
-"""Real-time market data — MT5 TERMINAL FIRST, crypto composite 24/7 (D-035).
+"""Real-time market data — MT5 TERMINAL ONLY (D-037).
 
-The user's directive (D-035): market data must come from the FOREX market
-THROUGH MetaTrader 5 — real broker prices — with the weekend-closed logic
-handled gracefully. Provider priority per platform symbol:
+The user's FIXED directive (D-037, Bengali): "অ্যাপ এর ক্যান্ডেল ডেটা শুধু মাত্র
+meta 5 থেকে আসবে, এটা ফিক্স" — candle/quote data comes ONLY from the real
+MetaTrader 5 terminal (real broker prices through Exness). The former
+crypto-composite fallback (D-035) is disabled by default:
 
-1. MT5 TERMINAL (authority while its broker ticks are fresh) — the real
-   Exness feed polled from the terminal's built-in MCP server (D-034):
-   `get_chart_ticks_history` every second -> real bid/ask ticks;
-   `get_chart_history` -> AUTHORITATIVE M1..D1 candles incl. the forming bar.
-   XAUUSD -> XAUUSDm (real forex gold), BTCUSD -> BTCUSDm (24/7).
-2. CRYPTO COMPOSITE (automatic fallback while MT5 is not fresh — forex
-   closed on weekends, terminal down):
-   - GOLD (XAUUSD): the D-033 five-venue key-less WS aggregate (Binance
-     PAXG+USDC, Bybit XAUT, OKX PAXG+XAUT, Kraken PAXG, Coinbase PAXG)
-     + Binance PAXG/USDT REST + gold-api.com quote + Yahoo GC=F history.
-   - BTC (BTCUSD, new pair D-035): Binance BTC/USDT WS + REST + Yahoo
-     BTC-USD history.
-   When MT5 resumes (Monday open / terminal restart) it silently becomes
-   the authority again — the switch is surfaced in feed status so the UI
-   badge always tells the truth.
-3. Tick-built candles — M1+ bars aggregated live from whatever quote
-   provider still answers (charts fill in over time).
+- MT5_ONLY=1 (default): XAUUSDm + BTCUSDm broker feed only. When a symbol
+  is closed (gold on weekends) the feed reports `market: "closed"` and
+  serves the terminal's chart HISTORY (real broker bars, no synthesis).
+  BTCUSDm is 24/7 so the platform stays fully alive every day of the week.
+- MT5_ONLY=0: the D-035 behavior (crypto composite when the broker feed
+  is idle) is available for hosts without a terminal.
 
-NEVER demo: there is NO mock fallback (D-033, user directive) — when every
-provider is unreachable the platform shows "no feed" and keeps retrying; it
-never displays synthetic prices.
+Every price the chart shows is a REAL market price from MetaTrader 5 —
+nothing is ever synthesized. When the terminal is unreachable the platform
+shows "no feed" and keeps retrying (NEVER demo, D-033).
 
-Basis note (transparency): while the crypto composite is active, quotes are
-PAXG/BTC based and can differ from a specific broker's feed by a fraction of
-a percent; while MT5 is active they are the broker's own prices. The active
-provider is surfaced everywhere (health, /api/mt5/status, WS mt5_status,
-TopBar LIVE badge) so users always know what they are looking at.
+Market-state honesty (D-037): each symbol reports one of
+  open   — the broker is actively streaming it (e.g. BTCUSDm 24/7, gold
+           during forex hours)
+  closed — the symbol ticked before but is idle now (gold Sat/Sun):
+           the terminal still serves its chart HISTORY (real broker bars)
+  unavailable — the terminal bridge itself is down
+so weekends never break the chart: BTCUSD stays live, XAUUSD shows its
+last real broker bars with a "market closed" chip.
 
 Paper trading: the platform plane and per-user demo planes run paper
 accounts priced off THIS feed — real prices, simulated fills.
@@ -40,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time as time_mod
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -89,6 +83,13 @@ YAHOO_BTC = {
 GOLD_API_SPREAD = 0.35  # synthetic XAUUSD spread for the quote fallback ($)
 STALE_DATA_S = 90.0     # is_connected -> False past this quote age
 CACHE_TTL_S = 15.0      # TF kline cache freshness
+
+#: D-037 — candles/quotes come ONLY from the MetaTrader 5 terminal
+#: (user's fixed directive). Set MT5_ONLY=0 to restore the D-035
+#: crypto-composite fallback on hosts without a terminal.
+MT5_ONLY = os.environ.get("MT5_ONLY", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
 MIN_REFETCH_S = 5.0     # forced-refetch rate cap (session gaps must not hammer)
 M1_TICK_KEEP = 4320     # 3 days of tick-built M1 bars kept in memory
 WS_REST_REFRESH_S = 30.0  # WS healthy: REST only refreshes klines this often
@@ -234,8 +235,10 @@ class SymbolFeedCore:
         enable_ws: bool = True,
         ws_venues: Sequence[str] | None = None,
         mt5: Any = None,  # McpMarketFeed | None
+        mt5_only: bool = MT5_ONLY,  # D-037: broker feed only, no composite
     ) -> None:
         self.spec = spec
+        self._mt5_only = bool(mt5_only)
         self._http_factory = http_factory or _default_http_client
         self.poll_seconds = float(poll_seconds)
         # Mirror chain with a sticky "currently working" index (D-032)
@@ -293,13 +296,11 @@ class SymbolFeedCore:
         self._wake_listeners()
 
     def _on_ws_event(self, ev: Any) -> None:
-        """One REAL crypto market event -> tick + forming-bar update.
+        """One crypto market event (composite mode only, D-035).
 
-        D-035: while the MT5 broker feed is fresh, crypto events only keep
-        the venue-health stats warm — they never move the quote or candles
-        (different price basis than the broker feed).
+        D-037 MT5_ONLY: never used — the broker feed is the single authority.
         """
-        if self._mt5_fresh():
+        if self._mt5_only or self._mt5_fresh():
             return
         now = datetime.fromtimestamp(ev.ts, tz=UTC)
         self.tick = Tick(bid=ev.bid, ask=ev.ask, time=now)
@@ -339,7 +340,7 @@ class SymbolFeedCore:
         self._task = asyncio.create_task(
             self._poll_loop(), name=f"live-feed-{self.spec.key}"
         )
-        if self._enable_ws and self._resolve_venues():
+        if self._enable_ws and not self._mt5_only and self._resolve_venues():
             self._agg = self._make_aggregator()
             await self._agg.start()
             logger.info(
@@ -454,12 +455,28 @@ class SymbolFeedCore:
         raise last_exc
 
     async def poll_once(self) -> bool:
-        """One provider cycle. True when the feed has data (MT5/WS/REST).
+        """One provider cycle. True when the feed has data.
 
-        D-035: fresh MT5 broker ticks short-circuit the REST quote chain —
-        candles come from chart history on demand (ensure_tf). NEVER falls
-        back to demo data: failure is reported, not faked.
+        D-037 MT5_ONLY: the broker feed drives everything; when it is idle
+        (market closed) the state is reported honestly — never substituted.
         """
+        if self._mt5_only:
+            if self._mt5_fresh():
+                return True
+            if self.tick is not None:
+                # real broker price known, market currently idle (closed)
+                self.provider = "mt5"
+                self.provider_detail = (
+                    f"MetaTrader 5 · {self.spec.key} market closed "
+                    "(weekend/session) — broker history still served"
+                )
+                return True
+            self.provider = "degraded"
+            self.provider_detail = (
+                "MetaTrader 5 terminal not streaming this symbol yet "
+                "(closed or unavailable) — no fallback (MT5-only, D-037)"
+            )
+            return False
         if self._mt5_fresh():
             return True
         ws = self._ws_healthy()
@@ -580,8 +597,10 @@ class SymbolFeedCore:
             self._tf_refetch_ts[tf] = now
             fetched: list[dict] | None = None
             mt5_authoritative = False
-            # 1) MT5 terminal chart history (real forex/broker candles, D-035)
-            if self._mt5_fresh():
+            # 1) MT5 terminal chart history (real forex/broker candles, D-035;
+            #    D-037: also while the market is CLOSED — the terminal still
+            #    serves its chart history, so weekends keep real broker bars)
+            if self._mt5 is not None and (self._mt5_fresh() or self._mt5_only):
                 try:
                     rows, _ = await self._mt5.bars(self.spec.key, tf, min_count)
                     if rows:
@@ -590,14 +609,14 @@ class SymbolFeedCore:
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("mt5 bars fetch failed (%s %s): %s",
                                  self.spec.key, tf, exc)
-            # 2) Binance klines
-            if fetched is None:
+            # 2) Binance klines (composite mode only — D-037)
+            if fetched is None and not self._mt5_only:
                 try:
                     fetched = await self._fetch_binance_tf(tf, min_count)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("binance tf fetch failed (%s): %s", tf, exc)
-            # 3) Yahoo history fallback
-            if fetched is None and self.spec.yahoo_specs:
+            # 3) Yahoo history fallback (composite mode only — D-037)
+            if fetched is None and not self._mt5_only and self.spec.yahoo_specs:
                 try:
                     fetched = await self._fetch_yahoo_tf(tf, min_count)
                 except Exception as exc:  # noqa: BLE001
@@ -769,6 +788,7 @@ class MarketFeed:
         enable_ws: bool = True,
         ws_venues: Sequence[str] | None = None,
         mcp_market: Any = None,  # McpMarketFeed | None (D-035)
+        mt5_only: bool = MT5_ONLY,  # D-037: broker feed only, no composite
     ) -> None:
         # D-035 — the REAL broker overlay (None when the terminal is absent,
         # e.g. Railway: crypto composite only, zero behavior change).
@@ -802,6 +822,7 @@ class MarketFeed:
                 enable_ws=enable_ws,
                 ws_venues=ws_venues if spec.key == "XAUUSD" else None,
                 mt5=self.mcp,
+                mt5_only=mt5_only,
             )
             for spec in (GOLD_SPEC, btc_spec)
         }
@@ -937,7 +958,7 @@ class MarketFeed:
         return round(agg.tps(), 1) if agg is not None else None
 
     def symbol_status(self, key: str) -> dict:
-        """Per-symbol transparency block (D-035)."""
+        """Per-symbol transparency block (D-035 + D-037 market state)."""
         f = self.feeds[key]
         t = f.tick
         mt5_on = f._mt5_fresh()  # noqa: SLF001
@@ -945,6 +966,7 @@ class MarketFeed:
             "provider": f.provider,
             "detail": f.provider_detail,
             "mt5": mt5_on,
+            "market": self._market_state(key),
             "last_price": round((t.bid + t.ask) / 2, 2) if t else None,
             "spread": round(t.ask - t.bid, 2) if t else None,
             "last_tick_age_s": (
@@ -957,6 +979,21 @@ class MarketFeed:
             st["tps"] = round(f._agg.tps(), 1)  # noqa: SLF001
             st["venues"] = f._agg.stats()  # noqa: SLF001
         return st
+
+    def _market_state(self, key: str) -> str:
+        """D-037: open | closed | unavailable for one platform symbol."""
+        state_fn = getattr(self.mcp, "market_state", None) if self.mcp else None
+        if state_fn is not None:
+            try:
+                return state_fn(key)
+            except Exception:  # noqa: BLE001 — status must never raise
+                pass
+        f = self.feeds.get(key)
+        if f is None:
+            return "unavailable"
+        if f.last_data_monotonic > 0 and f.data_age_s < STALE_DATA_S:
+            return "open"
+        return "closed" if f.tick is not None else "unavailable"
 
 
 # =========================================================================
@@ -988,6 +1025,7 @@ class LiveDataSource(DataSource):
         enable_ws: bool = True,
         ws_venues: Sequence[str] | None = None,
         mcp_market: Any = None,
+        mt5_only: bool = MT5_ONLY,  # D-037
     ) -> None:
         self.market = market or MarketFeed(
             http_factory=http_factory,
@@ -997,6 +1035,7 @@ class LiveDataSource(DataSource):
             enable_ws=enable_ws,
             ws_venues=ws_venues,
             mcp_market=mcp_market,
+            mt5_only=mt5_only,
         )
         self._owns_market = market is None
         self._connect_timeout_s = float(connect_timeout_s)
@@ -1024,11 +1063,43 @@ class LiveDataSource(DataSource):
         while self.market.tick is None and loop.time() < deadline:
             await asyncio.sleep(0.2)
         if self.market.tick is None and not await self.market.poll_once():
+            # D-037 weekend-robust connect: gold may simply be CLOSED — the
+            # platform is still "connected" while ANY symbol ticks (BTCUSDm
+            # is 24/7) or the terminal serves its chart history.
+            others = [k for k, f in self.market.feeds.items() if f.tick is not None]
+            if others:
+                self._connected = True
+                logger.info(
+                    "live market connected via %s (gold feed idle — market "
+                    "closed; MT5-only D-037)", others,
+                )
+                return {
+                    "login": "REALTIME",
+                    "server": "MetaTrader 5 (gold closed — BTCUSD 24/7 live)",
+                    "balance": self._account.balance,
+                    "equity": self._account.equity,
+                    "currency": self._account.currency,
+                    "leverage": self._account.leverage,
+                }
+            if await self._mt5_bars_alive():
+                self._connected = True
+                logger.info(
+                    "live market connected — terminal serves chart history "
+                    "(market closed, MT5-only D-037)"
+                )
+                return {
+                    "login": "REALTIME",
+                    "server": "MetaTrader 5 (market closed — history live)",
+                    "balance": self._account.balance,
+                    "equity": self._account.equity,
+                    "currency": self._account.currency,
+                    "leverage": self._account.leverage,
+                }
             if self._owns_market:
                 await self.market.stop()
             raise DataSourceError(
-                "no live market provider reachable (MT5 terminal + 5-venue WS "
-                "+ binance + gold-api) — no demo fallback (D-033); retrying"
+                "MetaTrader 5 terminal not reachable — no market data, no "
+                "demo fallback (MT5-only, D-037); retrying"
             )
         self._connected = True
         logger.info(
@@ -1051,11 +1122,27 @@ class LiveDataSource(DataSource):
             await self.market.stop()
 
     async def is_connected(self) -> bool:
-        return (
-            self._connected
-            and self.market.running
-            and self.market.data_age_s < STALE_DATA_S
-        )
+        if not (self._connected and self.market.running):
+            return False
+        if self.market.data_age_s < STALE_DATA_S:
+            return True
+        # D-037: gold closed (weekend) — still connected while any platform
+        # symbol is fresh (BTCUSDm 24/7) or the terminal serves history
+        for f in self.market.feeds.values():
+            if f.last_data_monotonic > 0 and f.data_age_s < STALE_DATA_S:
+                return True
+        return await self._mt5_bars_alive()
+
+    async def _mt5_bars_alive(self) -> bool:
+        """Does the terminal still answer chart history? (closed-market OK)"""
+        mcp = getattr(self.market, "mcp", None)
+        if mcp is None:
+            return False
+        try:
+            rows, _ = await mcp.bars("XAUUSD", "M1", 5)
+            return bool(rows)
+        except Exception:  # noqa: BLE001
+            return False
 
     async def quick_check(self) -> bool:
         """One provider cycle — boot-time live-vs-mock decision (D-030)."""

@@ -16,12 +16,11 @@ import {
   getCandles, getMt5Status, getSignals, getStats, getHealth, getMe,
   getTradingStatus, getTradingPositions, getMt5Account, getMt5Positions,
   getMt5AutoTrade,
-} from "../lib/api";
-import { WSClient } from "../lib/ws";
+} from "../lib/api";import { WSClient } from "../lib/ws";
 import type {
-  Candle, Mt5Account, Mt5OpenPosition, Mt5Status, Signal, StatsResponse,
-  Timeframe, TradingPosition, TradingStatus, WsMessage, WsMt5AutoMsg,
-  WsMt5StatusMsg,
+  BrokerConnection, Candle, Mt5Account, Mt5OpenPosition, Mt5Status, Signal,
+  StatsResponse, Timeframe, TradingPosition, TradingStatus, WsMessage,
+  WsMt5AutoMsg, WsMt5StatusMsg,
 } from "../types";
 
 /**
@@ -72,6 +71,9 @@ export default function Dashboard() {
   const [mt5AutoEvents, setMt5AutoEvents] = useState<WsMt5AutoMsg[]>([]);
 
   const connectedSymbol = mt5?.symbol ?? null;
+  /* D-037: the USER's own broker connection (per-user, from /api/mt5/status). */
+  const broker: BrokerConnection | null = mt5?.broker ?? null;
+  const brokerConnected = broker?.status === "connected";
   const symbols = useMemo(() => {
     const list = mt5?.symbols?.length ? mt5.symbols : [connectedSymbol ?? "XAUUSD"];
     return list.filter((s, i) => list.indexOf(s) === i);
@@ -246,31 +248,34 @@ export default function Dashboard() {
   // D-034/D-035: the REAL MT5 account (balance/equity/positions) — 10s poll,
   // hidden honestly when the terminal bridge is offline.
   // D-036: the AI auto-trade arm state rides the same poll.
-  useEffect(() => {
+  // D-037: the poll also refreshes the USER's broker connection state (the
+  // WS mt5_status frames are platform-wide and carry no per-user block).
+  const refreshMt5Account = useCallback(() => {
     if (!token) return;
-    let alive = true;
-    const poll = () => {
-      getMt5Account(token)
-        .then((a) => {
-          if (!alive) return;
-          if (a.connected) setMt5Acct(a);
-          else setMt5Acct(null);
-        })
-        .catch(() => alive && setMt5Acct(null));
-      getMt5Positions(token)
-        .then((r) => alive && setMt5Pos(r.positions))
-        .catch(() => alive && setMt5Pos([]));
-      getMt5AutoTrade(token)
-        .then((s) => alive && setMt5AutoArmed(s.armed))
-        .catch(() => alive && setMt5AutoArmed(false));
-    };
-    poll();
-    const timer = window.setInterval(poll, 10_000);
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
-    };
+    getMt5Account(token)
+      .then((a) => {
+        if (a.connected) setMt5Acct(a);
+        else setMt5Acct(null);
+      })
+      .catch(() => setMt5Acct(null));
+    getMt5Positions(token)
+      .then((r) => setMt5Pos(r.positions))
+      .catch(() => setMt5Pos([]));
+    getMt5AutoTrade(token)
+      .then((s) => setMt5AutoArmed(s.armed))
+      .catch(() => setMt5AutoArmed(false));
+    getMt5Status(token)
+      .then((st) =>
+        setMt5((prev) => (prev ? { ...prev, broker: st.broker } : st))
+      )
+      .catch(() => undefined);
   }, [token]);
+
+  useEffect(() => {
+    refreshMt5Account();
+    const timer = window.setInterval(refreshMt5Account, 10_000);
+    return () => window.clearInterval(timer);
+  }, [refreshMt5Account]);
 
   // gap healing: on reconnect refetch candles + status (Phase 2 AC)
   useEffect(() => {
@@ -377,10 +382,12 @@ export default function Dashboard() {
             </div>
           </div>
 
-          <div className="h-[52vh] min-h-[380px] overflow-hidden rounded-xl border border-zinc-800 bg-[#0c0e14] xl:h-[calc(100vh-220px)]">
+          <div className="h-[48vh] min-h-[320px] overflow-hidden rounded-xl border border-zinc-800 bg-[#0c0e14] sm:h-[52vh] sm:min-h-[380px] xl:h-[calc(100vh-220px)]">
             <Chart
               candles={candlesQuery.data?.candles ?? []}
               liveBar={liveBar}
+              liveTick={lastPrice}
+              market={mt5?.feed?.symbols?.[symbol]?.market}
               activeSignal={activeSignal}
               tf={tf}
               onDesync={onChartDesync}
@@ -430,8 +437,29 @@ export default function Dashboard() {
             </span>
           </span>
 
-          {/* D-034/D-035: the REAL MT5 account — balance/equity/positions from
-           * the MetaTrader 5 terminal, visible right here after connect. */}
+          {/* D-037: per-user broker connection — CTA when not connected */}
+          {!brokerConnected ? (
+            <button
+              type="button"
+              onClick={() => setConnectOpen(true)}
+              className="flex items-center gap-1.5 rounded border border-gold/40 bg-gold/10 px-2 py-0.5 text-[11px] font-medium text-gold hover:bg-gold/20"
+              title="Connect your own Exness MetaTrader 5 account — balance, positions, orders and AI auto-trade run on YOUR account only"
+            >
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-gold" />
+              connect broker
+            </button>
+          ) : (
+            <span className="flex items-center gap-1.5">
+              <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-400">
+                broker
+              </span>
+              <span className="text-zinc-400">
+                <span className="font-semibold text-zinc-200">{broker?.login ?? "—"}</span>
+                <span className="mx-1 text-zinc-600">@</span>
+                {broker?.server ?? "—"}
+              </span>
+            </span>
+          )}
           {mt5AutoArmed && (
             <button
               type="button"
@@ -557,16 +585,16 @@ export default function Dashboard() {
         open={connectOpen}
         onClose={() => setConnectOpen(false)}
         token={token ?? ""}
-        isAdmin={isAdmin}
-        status={mt5}
-        dataSource={dataSource}
+        broker={broker}
         onConnected={(st) => {
           setMt5(st);
           void queryClient.invalidateQueries({ queryKey: ["candles"] });
+          refreshMt5Account();
         }}
         onDisconnected={(st) => {
           setMt5(st);
           setLiveBar(null);
+          refreshMt5Account();
         }}
       />
 
@@ -606,6 +634,10 @@ export default function Dashboard() {
         defaultSymbol={symbol}
         autoEvents={mt5AutoEvents}
         isAdmin={isAdmin}
+        onConnect={() => {
+          setMt5AccountOpen(false);
+          setConnectOpen(true);
+        }}
       />
 
       <LogViewer
