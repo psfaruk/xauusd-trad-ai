@@ -98,7 +98,7 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
 
--- Seed the single engine_config row with D-042 M1 ICT/MTF defaults.
+-- Seed the single engine_config row with D-042 M1 ICT/MTF defaults (D-043: min_confluence 3).
 insert into engine_config (id, config, auto_trade)
 values (1, '{
   "timeframe": "M1", "trend_tf": "H1",
@@ -116,7 +116,7 @@ values (1, '{
   "news_blackout_min": 30, "max_spread_points": 35,
   "risk_mode": "percent", "risk_percent": 0.5, "fixed_lot": 0.01,
   "max_positions": 3, "daily_max_loss_pct": 3.0, "magic": 234000,
-  "smc_enabled": true, "bias_tfs": ["H4"], "min_confluence": 4,
+  "smc_enabled": true, "bias_tfs": ["H4"], "min_confluence": 3,
   "max_zone_atr": 0.9, "vol_z_min": 0.8, "max_sl_atr": 3.5
 }'::jsonb, false)
 on conflict (id) do nothing;

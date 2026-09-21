@@ -627,10 +627,10 @@ class SymbolFeedCore:
                         # Broker candles REPLACE the cache — different price
                         # basis than the composite (never mix the two series);
                         # the terminal carries years of history itself.
-                        self._tf_cache[tf] = fetched[-max(min_count, 600):]
+                        self._tf_cache[tf] = fetched[-max(min_count, 1500):]
                     else:
                         self._tf_cache[tf] = _merge_rows(closed, fetched)[
-                            -max(min_count, 600):
+                            -max(min_count, 1500):
                         ]
                 self._tf_cache_ts[tf] = now
             else:
@@ -639,7 +639,7 @@ class SymbolFeedCore:
                 tick_built = self._tick_built_closed(tf)
                 if tick_built:
                     self._tf_cache[tf] = _merge_rows(closed, tick_built)[
-                        -max(min_count, 600):
+                        -max(min_count, 1500):
                     ]
                 self._tf_cache_ts[tf] = now  # rate-cap while degraded
         closed = self._tf_cache.get(tf, [])

@@ -121,8 +121,10 @@ class EngineConfig(BaseModel):
         description="extra HTF frames whose STRUCTURE must bias the trade",
     )
     min_confluence: int = Field(
-        4, ge=0, le=6,
-        description="how many of the 6 ICT gating factors must confirm",
+        3, ge=0, le=6,
+        description="how many of the 6 ICT gating factors must confirm "
+        "(D-043: 4 -> 3 — user directive for more signals; backtest grid "
+        "shows ~2x frequency at near-equal net expectancy on this spread)",
     )
     max_zone_atr: float = Field(
         0.9, gt=0,
@@ -222,7 +224,7 @@ _LEGACY_STRATEGY_DEFAULTS = {
     # D-042 ICT block
     "smc_enabled": True,
     "bias_tfs": ["H4"],
-    "min_confluence": 4,
+    "min_confluence": 3,
     "max_zone_atr": 0.9,
     "vol_z_min": 0.8,
     "max_sl_atr": 3.5,

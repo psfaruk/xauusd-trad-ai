@@ -170,25 +170,31 @@ def obv(df: pd.DataFrame) -> pd.Series:
 
 
 def vwap(df: pd.DataFrame, period: int = 0) -> float:
-    """Rolling VWAP of the last `period` bars (0 = whole frame).
+    """Rolling VWAP of the last `period` bars (0 = session-anchored).
 
-    Anchored per UTC day when period == 0 (session VWAP, the
-    TradingView default): the accumulation resets on the first bar of
-    each UTC day.
+    Anchored per UTC day when period == 0 (session VWAP, the TradingView
+    default): the accumulation covers the bars of the LAST UTC day only.
+
+    D-043 FIX: the old session branch recursed as `vwap(df[mask], period=0)`
+    — the SAME call, forever (RecursionError on every /api/analysis request
+    — the "analysis not running" report). Now the day-window is computed
+    inline and shared with the rolling branch.
     """
     if len(df) == 0:
         return 0.0
     if period > 0:
         window = df.iloc[-period:]
-        tp = (window["h"] + window["l"] + window["c"]) / 3.0
-        vol = window["v"].astype(float)
-        total = float(vol.sum())
-        return float((tp * vol).sum() / total) if total > 0 else float(df["c"].iloc[-1])
-    day = df["time_utc"].iloc[-1].date() if "time_utc" in df else None
-    if day is None:
-        return vwap(df, period=len(df))
-    mask = df["time_utc"].apply(lambda t: t.date() == day)
-    return vwap(df[mask], period=0) if mask.any() else float(df["c"].iloc[-1])
+    elif "time_utc" in df:
+        day = df["time_utc"].iloc[-1].date()
+        window = df[[t.date() == day for t in df["time_utc"]]]
+        if window.empty:  # defensive — the last bar's day is always present
+            window = df.iloc[-1:]
+    else:
+        window = df
+    tp = (window["h"] + window["l"] + window["c"]) / 3.0
+    vol = window["v"].astype(float)
+    total = float(vol.sum())
+    return float((tp * vol).sum() / total) if total > 0 else float(df["c"].iloc[-1])
 
 
 def volume_zscore(df: pd.DataFrame, lookback: int = 60) -> float:
@@ -227,11 +233,22 @@ def swings(df: pd.DataFrame, left: int = 2, right: int = 2) -> list[dict]:
         lo_ok = all(low[k] <= low[k - j] for j in range(1, left + 1)) and all(
             low[k] <= low[k + j] for j in range(1, right + 1)
         )
-        # a bar can be both (outside bar) — high first keeps it simple
+        # D-043 FIX — dedupe ADJACENT equal prints: two neighbouring bars
+        # with the exact same high (or low) both qualify as fractals, which
+        # used to emit duplicate swing points. detect_structure then
+        # labelled the duplicate pair "LH"/"LL" (equal price never counts
+        # as a higher print) — flipping real bullish structure to bearish.
+        # Equal prints SEPARATED in time stay (they are the BSL/SSL pools).
         if hi_ok:
-            out.append({"t": times.iloc[k - left], "price": float(h[k]),
-                        "kind": "high", "i": k})
+            dup = out and out[-1]["kind"] == "high" and out[-1]["i"] >= k - 1 \
+                and out[-1]["price"] == float(h[k])
+            if not dup:
+                out.append({"t": times.iloc[k - left], "price": float(h[k]),
+                            "kind": "high", "i": k})
         if lo_ok:
-            out.append({"t": times.iloc[k - left], "price": float(low[k]),
-                        "kind": "low", "i": k})
+            dup = out and out[-1]["kind"] == "low" and out[-1]["i"] >= k - 1 \
+                and out[-1]["price"] == float(low[k])
+            if not dup:
+                out.append({"t": times.iloc[k - left], "price": float(low[k]),
+                            "kind": "low", "i": k})
     return out

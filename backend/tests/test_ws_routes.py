@@ -182,7 +182,7 @@ class TestConfigRoutes:
         assert body["config"]["magic"] == 234000
         # D-042 ICT block is served to the frontend
         assert body["config"]["smc_enabled"] is True
-        assert body["config"]["min_confluence"] == 4
+        assert body["config"]["min_confluence"] == 3  # D-043
         assert body["config"]["bias_tfs"] == ["H4"]
         assert body["config"]["max_positions"] == 3
 

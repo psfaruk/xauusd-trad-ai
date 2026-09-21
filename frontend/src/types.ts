@@ -654,4 +654,75 @@ export interface AnalysisResponse {
   per_tf: Record<string, AnalysisSnapshot>;
   mtf: { bias: string; score: number; notes: string[] };
   errors: string[];
+  /** D-043 — professional auto-drawings (hlines/trendlines/fib/notes/setup) */
+  drawings?: ChartDrawing[];
 }
+
+/* ------------------------------------------------- D-043: chart drawings */
+
+export type DrawingTone = "bull" | "bear" | "gold" | "violet" | "neutral";
+
+/** Horizontal level a trader would mark (PDH/PDL/POC/BSL/SSL…). */
+export interface HLineDrawing {
+  kind: "hline";
+  price: number;
+  label: string;
+  tone: DrawingTone;
+  style: "solid" | "dash";
+}
+
+/** Trendline through the last two swing points, projected forward. */
+export interface TrendlineDrawing {
+  kind: "trendline";
+  t1: string;
+  p1: number;
+  t2: string;
+  p2: number;
+  label: string;
+  tone: DrawingTone;
+  broken: boolean;
+}
+
+/** Fibonacci retracement of the active leg + OTE (0.62–0.79) band. */
+export interface FibDrawing {
+  kind: "fib";
+  t0: string;
+  p0: number;
+  t1: string;
+  p1: number;
+  dir: "up" | "down";
+  levels: { ratio: number; price: number }[];
+  ote: [number, number] | null;
+  tone: DrawingTone;
+}
+
+/** Small text annotation anchored at (time, price). */
+export interface NoteDrawing {
+  kind: "note";
+  t: string;
+  price: number;
+  text: string;
+  tone: DrawingTone;
+}
+
+/** The entry-setup box — drawn while the setup FORMS, before entry. */
+export interface SetupDrawing {
+  kind: "setup";
+  dir: "BUY" | "SELL";
+  zone: [number, number];
+  entry: number;
+  sl: number;
+  tp: number;
+  rr: number;
+  t0: string;
+  status: "forming" | "triggered";
+  factors: string[];
+  note: string;
+}
+
+export type ChartDrawing =
+  | HLineDrawing
+  | TrendlineDrawing
+  | FibDrawing
+  | NoteDrawing
+  | SetupDrawing;

@@ -79,7 +79,8 @@ def mtf_bias(snapshots: dict[str, dict]) -> dict:
         notes.append(f"{tf}: {trend}")
     if not votes:
         return {"bias": "unknown", "score": 0.0, "notes": notes}
-    score = sum(votes) / sum(abs(v) for v in votes) if votes else 0.0
+    denom = max(sum(abs(v) for v in votes), 1e-9)  # D-043: all-balanced guard
+    score = sum(votes) / denom
     bias = "bullish" if score > 0.2 else ("bearish" if score < -0.2 else "mixed")
     return {"bias": bias, "score": round(score, 2), "notes": notes}
 

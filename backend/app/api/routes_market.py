@@ -33,7 +33,13 @@ async def analysis(
     service = getattr(request.app.state, "analysis", None)
     if service is None:
         raise HTTPException(status_code=503, detail="analysis service unavailable")
-    return await service.get(mgr.source, symbol)
+    # D-043 — recent signals let the drawings engine mark a forming setup
+    # as TRIGGERED (entry already taken) instead of drawing it again.
+    try:
+        recent = await request.app.state.signals.list(limit=25)
+    except Exception:  # noqa: BLE001 — drawings must never fail on repo errors
+        recent = []
+    return await service.get(mgr.source, symbol, recent_signals=recent)
 
 
 @router.get("/candles")
@@ -41,7 +47,7 @@ async def candles(
     request: Request,
     user: CurrentUser,
     tf: str = Query(default="M15", max_length=4),
-    limit: int = Query(default=500, ge=10, le=1500),
+    limit: int = Query(default=500, ge=10, le=3000),
     symbol: str | None = Query(default=None, max_length=16),
 ) -> dict:
     try:

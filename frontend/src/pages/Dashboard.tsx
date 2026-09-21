@@ -64,11 +64,20 @@ export default function Dashboard() {
   const candlesQuery = useQuery({
     queryKey: ["candles", tf, symbol],
     enabled: !!token,
-    queryFn: () => getCandles(token!, tf, 400, symbol),
+    // D-043 — deep professional backfill (M1: last ~20h; H1: ~7 weeks).
+    // The backend raises a per-(symbol,tf) high-water mark so the engine's
+    // small refetches can never shrink this window again.
+    queryFn: () => getCandles(token!, tf, 1200, symbol),
     refetchOnWindowFocus: false,
     staleTime: 60_000,
     retry: 2,
     retryDelay: 1_500,
+    // silent top-up: while the window is still thin (cold backend cache)
+    // retry fast every 10s; once deep, refresh every 3 min
+    refetchInterval: (query) => {
+      const n = query.state.data?.candles?.length ?? 0;
+      return n > 0 && n < 300 ? 10_000 : 180_000;
+    },
   });
 
   const signalsQuery = useQuery({

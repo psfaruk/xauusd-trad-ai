@@ -111,6 +111,11 @@ class McpMarketFeed:
         # bars cache: (symbol, tf) -> (rows, fetched_monotonic)
         self._bars: dict[tuple[str, str], tuple[list[dict], float]] = {}
         self._bars_refetch: dict[tuple[str, str], float] = {}
+        # D-043 — high-water bar count per key: the chart's deep backfill
+        # (1200+ bars) must never be shrunk back by the engine's small
+        # 200-bar refetches (that was the "chart opens with a few candles"
+        # bug: every consumer shares ONE cache per (symbol, tf)).
+        self._bars_want: dict[tuple[str, str], int] = {}
         self._shift = _time_shift_s()
         self._calibrated = self._shift != 0.0
         self._tasks: list[asyncio.Task] = []
@@ -371,40 +376,56 @@ class McpMarketFeed:
 
         Rows: {t: epoch, o, h, l, c, v}. The terminal includes the forming
         bar; it is split off by comparing against the current bucket.
+
+        D-043: the requested count RAISES a per-key high-water mark, so a
+        deep chart request (1200 bars) is never served from a thin cache
+        left by the engine's 200-bar fetches — and refetches never SHRINK
+        the cached window (a partial response merges with what we have).
         """
         from app.mt5.base import validate_tf
 
         tf_min = validate_tf(tf)
         key = (plat, tf)
+        want = max(int(count), 10)
+        self._bars_want[key] = max(want, self._bars_want.get(key, 0))
+        want = self._bars_want[key]
         now_mono = time_mod.monotonic()
         cached = self._bars.get(key)
-        if cached and now_mono - cached[1] < BARS_CACHE_TTL_S:
-            return cached[0][:-1] if self._has_forming(key) else cached[0], \
-                cached[0][-1] if self._has_forming(key) else None
-        if now_mono - self._bars_refetch.get(key, 0.0) < BARS_MIN_REFETCH_S:
-            if cached:
-                forming = cached[0][-1] if self._has_forming(key) else None
-                return (cached[0][:-1] if forming else cached[0]), forming
+        cached_rows = cached[0] if cached else []
+        cached_fresh = cached is not None and now_mono - cached[1] < BARS_CACHE_TTL_S
+        if cached_fresh and len(cached_rows) >= want:
+            forming = cached_rows[-1] if self._has_forming(key) else None
+            return (cached_rows[:-1] if forming else cached_rows), forming
+        # D-043: a FRESH-but-THIN cache (engine's 200 bars) must not stop a
+        # deeper chart request — the bigger query is not a duplicate, so it
+        # bypasses the rate cap. Same-size refreshes stay capped.
+        thin_but_fresh = cached is not None and len(cached_rows) < want
+        if (not thin_but_fresh) and \
+                now_mono - self._bars_refetch.get(key, 0.0) < BARS_MIN_REFETCH_S:
+            # rate-capped: serve whatever we have (thin is better than none)
+            if cached_rows:
+                forming = cached_rows[-1] if self._has_forming(key) else None
+                return (cached_rows[:-1] if forming else cached_rows), forming
             return [], None
         self._bars_refetch[key] = now_mono
 
         broker = self.symbol_map.get(plat) or DEFAULT_MAP.get(plat)
         if not broker:
             return [], None
-        span_s = max(count, 30) * tf_min * 60 + tf_min * 60 * 2
+        span_s = max(want, 30) * tf_min * 60 + tf_min * 60 * 2
         frm = datetime.fromtimestamp(time_mod.time() - span_s, tz=UTC)
         to = datetime.fromtimestamp(time_mod.time() + 120.0, tz=UTC)
         try:
             raw = await asyncio.to_thread(
                 self._client.bars, broker, PERIODS[tf],
                 frm.strftime("%Y-%m-%dT%H:%M:%SZ"), to.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                min(count + 10, 5000),
+                min(want + 10, 5000),
             )
         except Exception as exc:  # noqa: BLE001 — cache (if any) stays valid
             logger.debug("MT5 bars fetch failed (%s %s): %s", plat, tf, exc)
-            if cached:
-                forming = cached[0][-1] if self._has_forming(key) else None
-                return (cached[0][:-1] if forming else cached[0]), forming
+            if cached_rows:
+                forming = cached_rows[-1] if self._has_forming(key) else None
+                return (cached_rows[:-1] if forming else cached_rows), forming
             return [], None
 
         bucket_now = int(time_mod.time() // (tf_min * 60))
@@ -426,9 +447,18 @@ class McpMarketFeed:
                 forming = row  # current (still forming) bar
             else:
                 rows.append(row)
-        # dedupe + keep the requested tail
+        # dedupe + keep the requested tail; D-043 never-shrink — a partial
+        # response (bridge hiccup) merges with the previous window instead
+        # of replacing it with a thinner one. The cached FORMING bar is
+        # never merged as closed (current bucket is owned by the new raw).
+        bucket_start = bucket_now * tf_min * 60
         dedup = {r["t"]: r for r in rows}
-        rows = [dedup[k] for k in sorted(dedup)][-max(count, 10):]
+        if cached_rows and len(dedup) < len(cached_rows):
+            for r in cached_rows:
+                if r["t"] >= bucket_start:
+                    continue
+                dedup.setdefault(r["t"], r)
+        rows = [dedup[k] for k in sorted(dedup)][-max(want, 10):]
         self._bars[key] = (rows + ([forming] if forming else []), now_mono)
         return rows, forming
 
