@@ -79,6 +79,9 @@ terminal_alive() {
 }
 
 display_ok() {
+  # D-040 fix: xdotool is user-space (xsroot) — it needs its LD_LIBRARY_PATH,
+  # otherwise this probe ALWAYS failed -> endless Xvfb spawns + no openbox.
+  LD_LIBRARY_PATH="$MT5STACK/xsroot/usr/lib/x86_64-linux-gnu" \
   DISPLAY=:99 timeout 2 "$MT5STACK/xsroot/usr/bin/xdotool" getdisplaygeometry >/dev/null 2>&1
 }
 

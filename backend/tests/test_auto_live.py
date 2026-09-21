@@ -36,15 +36,22 @@ class FakeTerminal:
         *,
         available: bool = True,
         trade_allowed: bool = True,
+        experts_trade_allowed: bool | None = None,
         equity: float = 500.0,
         open_positions: list | None = None,
         retcode: int = 10009,
+        reject_order: str | None = None,
     ) -> None:
         self.available_flag = available
         self.trade_allowed = trade_allowed
+        # D-040: the terminal reports BOTH gates (MCP + AutoTrading)
+        self.experts_trade_allowed = (
+            trade_allowed if experts_trade_allowed is None else experts_trade_allowed
+        )
         self.equity = equity
         self.open_positions = open_positions or []
         self.retcode = retcode
+        self.reject_order = reject_order
         self.orders: list[dict] = []
         self.closes: list[int] = []
 
@@ -69,6 +76,7 @@ class FakeTerminal:
             "terminal": {
                 "server_connected": True,
                 "mcp_trade_allowed": self.trade_allowed,
+                "experts_trade_allowed": self.experts_trade_allowed,
                 "build": 6204,
             },
         }
@@ -95,6 +103,8 @@ class FakeTerminal:
             {"symbol": symbol, "side": side, "volume": volume,
              "sl": sl, "tp": tp, "comment": comment}
         )
+        if self.reject_order:
+            raise MCPError(self.reject_order)
         if self.retcode != 10009:
             return {"retcode": self.retcode, "retcode_details": "Market closed"}
         return {
@@ -232,6 +242,41 @@ async def test_source_close_resolves_symbol_and_tolerates_gone() -> None:
     # closing again (already gone broker-side, e.g. SL hit) is a clean ok
     res2 = await src.close_position(991000001)
     assert res2.ok
+
+
+async def test_source_trade_allowed_requires_both_terminal_gates() -> None:
+    """D-040: trade_allowed = mcp_trade_allowed AND experts_trade_allowed.
+
+    Live-verified: the native MCP refuses trade tools when the terminal's
+    AutoTrading (Ctrl+E) is off even though mcp_trade_allowed stays true.
+    """
+    src = make_source(FakeTerminal(experts_trade_allowed=False))
+    info = await src.account_info()
+    assert info is not None
+    assert info["trade_allowed"] is False
+
+    # both gates on -> trading allowed
+    src2 = make_source(FakeTerminal())
+    info2 = await src2.account_info()
+    assert info2 is not None
+    assert info2["trade_allowed"] is True
+
+
+async def test_source_place_order_maps_permission_refusal() -> None:
+    """D-040: 'trading is not permitted' becomes the actionable fix hint."""
+    client = FakeTerminal(
+        reject_order="Tool 'trade_send_market_order' trading is not permitted"
+    )
+    src = make_source(client)
+    from app.mt5.base import Order
+
+    res = await src.place_order(
+        Order(symbol="XAUUSD", side="BUY", volume=0.01, comment="xauai-01234567")
+    )
+    assert res.ok is False
+    assert res.retcode is None
+    assert "AutoTrading" in (res.comment or "")
+    assert "AI Assistant" in (res.comment or "")
 
 
 # --------------------------------------------------------------- McpAutoTrader

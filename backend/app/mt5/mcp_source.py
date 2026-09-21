@@ -32,7 +32,12 @@ from app.mt5.base import (
     Tick,
     empty_rates,
 )
-from app.mt5.mcp import MCPError, MT5TerminalClient, terminal_client
+from app.mt5.mcp import (
+    TRADING_NOT_PERMITTED_HINT,
+    MCPError,
+    MT5TerminalClient,
+    terminal_client,
+)
 from app.mt5.mcp_market import DEFAULT_MAP
 
 logger = logging.getLogger("xauusd.mcpsource")
@@ -178,7 +183,8 @@ class McpTradingSource(DataSource):
             "profit": float(acct.get("profit") or 0.0),
             "currency": acct.get("currency", "USD"),
             "leverage": acct.get("leverage"),
-            "trade_allowed": bool(term.get("mcp_trade_allowed")),
+            "trade_allowed": bool(term.get("mcp_trade_allowed"))
+            and bool(term.get("experts_trade_allowed")),
         }
 
     async def get_positions(self) -> list[Position]:
@@ -250,7 +256,13 @@ class McpTradingSource(DataSource):
             )
         except (MCPError, OSError) as exc:
             logger.warning("terminal order failed: %s", exc)
-            return OrderResult(ok=False, retcode=None, comment=f"terminal: {exc}")
+            # D-040: the terminal-side permission refusal carries the fix hint
+            comment = (
+                TRADING_NOT_PERMITTED_HINT
+                if "not permitted" in str(exc)
+                else f"terminal: {exc}"
+            )
+            return OrderResult(ok=False, retcode=None, comment=comment)
         retcode = res.get("retcode")
         ok = retcode == RET_DONE
         ticket = res.get("order") or res.get("deal")
@@ -275,7 +287,12 @@ class McpTradingSource(DataSource):
                 self._client.close_position, pos.symbol, ticket
             )
         except (MCPError, OSError) as exc:
-            return OrderResult(ok=False, retcode=None, comment=f"terminal: {exc}")
+            comment = (
+                TRADING_NOT_PERMITTED_HINT
+                if "not permitted" in str(exc)
+                else f"terminal: {exc}"
+            )
+            return OrderResult(ok=False, retcode=None, comment=comment)
         retcode = res.get("retcode")
         return OrderResult(
             ok=retcode == RET_DONE,

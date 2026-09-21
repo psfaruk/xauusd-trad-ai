@@ -27,6 +27,16 @@ DEFAULT_URL = "http://127.0.0.1:22346/mcp"
 DEFAULT_KEY_FILE = "/home/z/mt5stack/mcp_key.txt"
 _TIMEOUT = 60  # order ops can take a few seconds; info ops are fast
 
+#: D-040 — honest hint when the terminal refuses trading tools. The native
+#: MT5 MCP gates trade tools on BOTH the terminal AutoTrading button AND
+#: Tools → Options → AI Assistant → Trading ("Manual confirmation" blocks
+#: headless clients). Live-verified 2026-09-21 (d040 round-trip 10009).
+TRADING_NOT_PERMITTED_HINT = (
+    "Terminal trading not permitted — in the MetaTrader terminal enable BOTH:"
+    " the AutoTrading button (Ctrl+E) and Tools → Options → AI Assistant →"
+    " Trading = Enabled"
+)
+
 
 class MCPError(RuntimeError):
     """Raised when the terminal MCP is unreachable or refuses a call."""

@@ -95,8 +95,9 @@ class McpAutoTrader:
                 )
             if not info.get("trade_allowed"):
                 raise ArmError(
-                    "terminal does not allow automated trading"
-                    " (mcp_trade_allowed=false — check the terminal settings)"
+                    "the MetaTrader terminal does not allow automated trading"
+                    " — enable the AutoTrading button (Ctrl+E) and"
+                    " Tools → Options → AI Assistant → Trading = Enabled"
                 )
             self._owner = owner
             self._armed_at = datetime.now(tz=UTC).isoformat()
@@ -156,7 +157,9 @@ class McpAutoTrader:
         if info is None or not info.get("trade_allowed"):
             await self._skip(
                 signal_id, symbol,
-                "terminal not allowing automated trading — order NOT placed",
+                "terminal not allowing automated trading (enable AutoTrading"
+                " Ctrl+E + Options → AI Assistant → Trading = Enabled)"
+                " — order NOT placed",
             )
             return
 
@@ -208,9 +211,15 @@ class McpAutoTrader:
             note = "market closed (weekend/holiday)" if result.retcode == 10018 else (
                 result.comment or f"retcode {result.retcode}"
             )
+            blocked = "not permitted" in note
+            label = (
+                "BLOCKED by terminal trading permissions"
+                if blocked
+                else "REJECTED by broker"
+            )
             await self._emit(
                 "warning",
-                f"AI auto-order REJECTED by broker: {note} (signal {signal_id[:8]})",
+                f"AI auto-order {label}: {note} (signal {signal_id[:8]})",
                 {
                     "event": "order",
                     "ok": False,
@@ -296,7 +305,11 @@ class McpAutoTrader:
         elif not info.get("trade_allowed"):
             why = {
                 "code": "trade_not_allowed",
-                "text": "The terminal does not allow automated trading right now.",
+                "text": (
+                    "The MetaTrader terminal is blocking automated trading —"
+                    " enable the AutoTrading button (Ctrl+E) and"
+                    " Tools → Options → AI Assistant → Trading = Enabled."
+                ),
             }
         elif balance is not None and float(balance) <= 0:
             why = {

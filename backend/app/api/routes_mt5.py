@@ -35,7 +35,11 @@ from app.mt5.broker_connect import (
     BrokerUnavailableError,
     NotConnectedError,
 )
-from app.mt5.mcp import MCPError, terminal_client
+from app.mt5.mcp import (
+    TRADING_NOT_PERMITTED_HINT,
+    MCPError,
+    terminal_client,
+)
 
 router = APIRouter(prefix="/api/mt5", tags=["mt5"])
 
@@ -88,10 +92,16 @@ def _require_connection(request: Request, user: CurrentUser) -> None:
 
 
 async def _mcp_call(fn, *args, **kwargs):
-    """Run a blocking MCP call in a worker thread; map errors to 502."""
+    """Run a blocking MCP call in a worker thread; map errors honestly."""
     try:
         return await asyncio.to_thread(fn, *args, **kwargs)
     except MCPError as exc:
+        # D-040: a terminal-side trading refusal is NOT a bridge outage —
+        # say exactly what to enable instead of "bridge unavailable".
+        if "not permitted" in str(exc):
+            raise HTTPException(
+                status_code=409, detail=TRADING_NOT_PERMITTED_HINT
+            ) from exc
         raise HTTPException(
             status_code=502,
             detail=f"MT5 terminal bridge unavailable: {exc}",
