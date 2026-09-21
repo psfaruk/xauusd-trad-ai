@@ -1,35 +1,42 @@
 import { useEffect, useRef, useState } from "react";
 import { useAuth } from "../lib/auth";
+import { APP_TABS } from "./TabBar";
+import type { AppTab } from "../types";
 
-/** Functions the dot-menu can trigger (Dashboard owns the dialogs). */
+/** Functions the dot-menu can trigger (Dashboard owns the dialogs + tabs). */
 export interface DotMenuActions {
-  onOpenTrading: () => void;      // Trading: my account connect/arming
-  onOpenTradePanel: () => void;   // Trading: manual orders + positions
-  onOpenTradeHistory: () => void; // Trading: my trade history
-  onOpenMt5Account: () => void;   // Trading: REAL MT5 account panel (D-034)
-  onOpenSignals: () => void;      // Analysis: signals + performance tab
-  onOpenMarketData: () => void;   // Analysis: external reference data tab
-  onOpenLogs: () => void;         // Analysis: platform log viewer
-  onOpenSettings: () => void;     // Settings: engine config (admin)
-  onOpenPlatformMt5: () => void;  // Trading: connect YOUR broker account (D-037, all users)
+  /** D-039: navigate to an app tab (desktop navigation lives here). */
+  onNavigate: (tab: AppTab) => void;
+  onOpenConnectBroker: () => void;  // per-user Exness connection
+  onOpenPractice: () => void;       // practice (paper) account dialog
+  onOpenTradePanel: () => void;     // practice manual orders + positions
+  onOpenTradeHistory: () => void;   // practice history
+  onOpenLogs: () => void;           // platform log viewer
+  onOpenEngineSettings: () => void; // engine config (admin)
+  onOpenSignals: () => void;        // charts tab → signals
+  onOpenMarketData: () => void;     // charts tab → market data
 }
 
 interface DotMenuProps {
   actions: DotMenuActions;
   isAdmin: boolean;
+  activeTab: AppTab;
 }
 
 interface MenuItem {
   label: string;
   hint?: string;
   onClick: () => void;
+  active?: boolean;
 }
 
 /**
- * 3-dot overflow menu (user req #3) — every platform function grouped:
- * Trading / Analysis / Settings / Account. Closes on outside click or Esc.
+ * 3-dot menu (desktop navigation, user req D-039): app tabs first, then the
+ * remaining functions grouped Trading / Analysis / Settings / Account.
+ * Mobile uses the bottom TabBar instead (this menu stays reachable there
+ * too for the less-common functions).
  */
-export default function DotMenu({ actions, isAdmin }: DotMenuProps) {
+export default function DotMenu({ actions, isAdmin, activeTab }: DotMenuProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const { session, signOut } = useAuth();
@@ -48,43 +55,49 @@ export default function DotMenu({ actions, isAdmin }: DotMenuProps) {
     };
   }, [open]);
 
+  const go = (tab: AppTab) => () => {
+    setOpen(false);
+    actions.onNavigate(tab);
+  };
+
   const groups: { title: string; items: MenuItem[] }[] = [
+    {
+      title: "Go to",
+      items: APP_TABS.map((t) => ({
+        label: t.label,
+        hint: t.id === "ai" ? "arm AI · positions · orders · history" : undefined,
+        onClick: go(t.id),
+        active: activeTab === t.id,
+      })),
+    },
     {
       title: "Trading",
       items: [
-        { label: "Connect Broker", hint: "your Exness MT5 account · per-user", onClick: actions.onOpenPlatformMt5 },
-        { label: "MT5 Account (live)", hint: "real Exness balance · positions · orders", onClick: actions.onOpenMt5Account },
-        { label: "Practice Trading (paper)", hint: "simulated trades on live prices · no real money", onClick: actions.onOpenTrading },
-        { label: "Trade Panel", hint: "manual orders & open positions", onClick: actions.onOpenTradePanel },
-        { label: "Trade History", hint: "my executed trades", onClick: actions.onOpenTradeHistory },
+        { label: "Connect Broker", hint: "your Exness MT5 account · per-user", onClick: () => { setOpen(false); actions.onOpenConnectBroker(); } },
+        { label: "Manual Order", hint: "real order · AI Trading tab", onClick: go("ai") },
+        { label: "Practice Trading (paper)", hint: "simulated trades on live prices · no real money", onClick: () => { setOpen(false); actions.onOpenPractice(); } },
+        { label: "Practice Panel", hint: "paper orders & positions", onClick: () => { setOpen(false); actions.onOpenTradePanel(); } },
+        { label: "Practice History", hint: "my paper trades", onClick: () => { setOpen(false); actions.onOpenTradeHistory(); } },
       ],
     },
     {
       title: "Analysis",
       items: [
-        { label: "Signals & Performance", hint: "AI signal list + stats", onClick: actions.onOpenSignals },
-        { label: "Market Data", hint: "live data & external references", onClick: actions.onOpenMarketData },
-        { label: "Platform Logs", hint: "engine activity + CSV export", onClick: actions.onOpenLogs },
+        { label: "Signals & Performance", hint: "AI signal list + stats", onClick: () => { setOpen(false); actions.onOpenSignals(); } },
+        { label: "Market Data", hint: "live data & external references", onClick: () => { setOpen(false); actions.onOpenMarketData(); } },
+        { label: "Platform Logs", hint: "engine activity + CSV export", onClick: () => { setOpen(false); actions.onOpenLogs(); } },
       ],
     },
     {
       title: "Settings",
       items: isAdmin
-        ? [
-            { label: "Engine Settings", hint: "strategy & risk config", onClick: actions.onOpenSettings },
-          ]
-        : [
-            { label: "Engine Settings", hint: "admin only", onClick: actions.onOpenSettings },
-          ],
+        ? [{ label: "Engine Settings", hint: "strategy & risk config", onClick: () => { setOpen(false); actions.onOpenEngineSettings(); } }]
+        : [{ label: "Engine Settings", hint: "admin only", onClick: () => setOpen(false) }],
     },
     {
       title: "Account",
       items: [
-        {
-          label: "Signed in",
-          hint: session?.user?.email ?? undefined,
-          onClick: () => setOpen(false),
-        },
+        { label: "Signed in", hint: session?.user?.email ?? undefined, onClick: () => setOpen(false) },
         { label: "Sign out", onClick: () => void signOut() },
       ],
     },
@@ -109,7 +122,7 @@ export default function DotMenu({ actions, isAdmin }: DotMenuProps) {
       {open && (
         <nav
           role="menu"
-          className="absolute right-0 z-50 mt-2 max-w-[calc(100vw-2rem)] w-72 overflow-hidden rounded-xl border border-zinc-700 bg-zinc-900/95 py-1.5 shadow-2xl backdrop-blur"
+          className="absolute right-0 z-50 mt-2 max-h-[80vh] w-72 overflow-y-auto rounded-xl border border-zinc-700 bg-zinc-900/95 py-1.5 shadow-2xl backdrop-blur"
         >
           {groups.map((g) => (
             <div key={g.title} className="mb-1 last:mb-0">
@@ -121,13 +134,14 @@ export default function DotMenu({ actions, isAdmin }: DotMenuProps) {
                   key={item.label}
                   type="button"
                   role="menuitem"
-                  onClick={() => {
-                    setOpen(false);
-                    item.onClick();
-                  }}
-                  className="flex w-full flex-col items-start px-4 py-1.5 text-left hover:bg-zinc-800"
+                  onClick={item.onClick}
+                  className={`flex w-full flex-col items-start px-4 py-1.5 text-left hover:bg-zinc-800 ${
+                    item.active ? "bg-zinc-800/60" : ""
+                  }`}
                 >
-                  <span className="text-sm text-zinc-200">{item.label}</span>
+                  <span className={`text-sm ${item.active ? "text-gold" : "text-zinc-200"}`}>
+                    {item.label}
+                  </span>
                   {item.hint && (
                     <span className="text-[11px] text-zinc-500">{item.hint}</span>
                   )}

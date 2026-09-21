@@ -29,10 +29,13 @@ from app.mt5.base import TIMEFRAME_MINUTES, DataSource, Tick
 
 logger = logging.getLogger("xauusd.market")
 
-# D-033 — real-time broadcast budgets (the candle itself absorbs EVERY tick;
-# these only cap how often frames hit each browser client):
-TICK_SEND_MIN_S = 0.10   # ≤10 tick frames/s per client (latest quote wins)
-BAR_SEND_MIN_S = 0.25    # ≤4 bar_update frames/s per TF (bar_open/close always go)
+# D-033/D-039 — real-time broadcast budgets (the candle itself absorbs EVERY
+# tick; these only cap how often frames hit each browser client). D-039 raised
+# the frame rate for an instant, MT5-terminal feel: tick frames at up to 20/s
+# and forming-bar frames at up to 10/s — beyond visual perception thresholds,
+# while `n`+`tps` still disclose the full-resolution event rate.
+TICK_SEND_MIN_S = 0.05   # ≤20 tick frames/s per client (latest quote wins)
+BAR_SEND_MIN_S = 0.10    # ≤10 bar_update frames/s per TF (bar_open/close always go)
 TPS_WINDOW_S = 5.0       # trailing window for the real events/sec metric
 
 
@@ -125,7 +128,7 @@ class MarketStream:
         self._ticks_since_send += 1
         mid = (tick.bid + tick.ask) / 2  # D-035: bars track the mid, not just bid
 
-        # tick frames — throttled, latest-quote-wins, with the REAL rate.
+        # tick frames — high-rate (20/s cap), latest-quote-wins, REAL rate.
         if now_mono - self._last_tick_sent >= TICK_SEND_MIN_S:
             self._last_tick_sent = now_mono
             payload = {

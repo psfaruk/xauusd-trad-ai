@@ -515,9 +515,14 @@ export interface Mt5AutoTradeStatus {
     trade_allowed: boolean;
     server: string | null;
     login: string | null;
+    balance: number | null;
     equity: number | null;
     currency: string | null;
   };
+  /** D-039: per-symbol broker market state (weekend/holiday logic). */
+  markets?: Record<string, { open: boolean; detail: string }>;
+  /** D-039: honest one-line diagnosis — why the AI is (not) trading. */
+  why?: { code: string; text: string } | null;
   risk: {
     risk_mode: string;
     risk_percent: number;
@@ -529,3 +534,6 @@ export interface Mt5AutoTradeStatus {
   };
   last_skip_reason: string | null;
 }
+
+/** D-039: app-level navigation tabs (mobile bottom bar / desktop ⋮ menu). */
+export type AppTab = "home" | "charts" | "ai" | "settings";

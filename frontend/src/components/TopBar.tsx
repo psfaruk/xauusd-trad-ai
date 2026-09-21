@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { getHealth } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import DotMenu, { type DotMenuActions } from "./DotMenu";
-import type { Mt5Status } from "../types";
+import type { AppTab, Mt5Status } from "../types";
 
 type BackendState = "checking" | "up" | "down";
 type DataSourceName = "mock" | "mt5" | "live" | "";
@@ -10,15 +10,17 @@ type DataSourceName = "mock" | "mt5" | "live" | "";
 interface TopBarProps {
   mt5: Mt5Status | null;
   dataSource: DataSourceName;
-  tradingConnected: boolean;
   menuActions: DotMenuActions;
   isAdmin: boolean;
-  onOpenTrade: () => void;
+  /** D-039: navigate to a tab (the AI Trading quick button). */
+  onOpenAi: () => void;
   lastPrice: { bid: number; ask: number } | null;
   lastTickAt: number | null;
   tps: number | null;
   /** D-035: the charted instrument (XAUUSD | BTCUSD). */
   symbol?: string;
+  /** D-039: active app tab (menu highlight). */
+  activeTab: AppTab;
 }
 
 /**
@@ -27,7 +29,7 @@ interface TopBarProps {
  * 3-dot menu with every grouped function.
  */
 export default function TopBar({
-  mt5, dataSource, tradingConnected, menuActions, isAdmin, onOpenTrade, lastPrice, lastTickAt, tps, symbol,
+  mt5, dataSource, menuActions, isAdmin, onOpenAi, lastPrice, lastTickAt, tps, symbol, activeTab,
 }: TopBarProps) {
   const { session } = useAuth();
   const email = session?.user?.email ?? null;
@@ -208,16 +210,16 @@ export default function TopBar({
       <div className="ml-auto flex items-center gap-2">
         <button
           type="button"
-          onClick={onOpenTrade}
-          className={`rounded-md border px-2.5 py-1 text-xs font-medium ${
-            tradingConnected
-              ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25"
+          onClick={onOpenAi}
+          className={`rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${
+            activeTab === "ai"
+              ? "border-gold/60 bg-gold/25 text-gold"
               : "border-gold/50 bg-gold/15 text-gold hover:bg-gold/25"
           }`}
         >
-          {tradingConnected ? "my trades ●" : "start trading"}
+          AI Trading
         </button>
-        <DotMenu actions={menuActions} isAdmin={isAdmin} />
+        <DotMenu actions={menuActions} isAdmin={isAdmin} activeTab={activeTab} />
       </div>
     </header>
   );

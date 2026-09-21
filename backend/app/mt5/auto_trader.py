@@ -268,6 +268,60 @@ class McpAutoTrader:
     async def status(self) -> dict:
         info = await self._source.account_info()
         cfg = self._cfg
+        balance = info.get("balance") if info else None
+
+        # D-039: per-symbol broker market state (forex weekend/holiday logic)
+        markets: dict[str, dict] = {}
+        if self._market_state is not None:
+            for sym in ("XAUUSD", "BTCUSD"):
+                try:
+                    open_, detail = self._market_state(sym)
+                except Exception:  # noqa: BLE001
+                    open_, detail = True, "market state unknown"
+                markets[sym] = {"open": bool(open_), "detail": detail}
+
+        # D-039: one-line honest diagnosis — WHY is the AI not trading right
+        # now? Surfaced in the AI Trading tab so the answer is never a guess.
+        why: dict[str, str] | None = None
+        if not self.armed:
+            why = {
+                "code": "not_armed",
+                "text": "AI auto-trade is OFF — arm it in the AI Trading tab (type ENABLE).",
+            }
+        elif info is None:
+            why = {
+                "code": "terminal_down",
+                "text": "MT5 terminal bridge unreachable — retrying automatically.",
+            }
+        elif not info.get("trade_allowed"):
+            why = {
+                "code": "trade_not_allowed",
+                "text": "The terminal does not allow automated trading right now.",
+            }
+        elif balance is not None and float(balance) <= 0:
+            why = {
+                "code": "no_balance",
+                "text": (
+                    "Broker balance is 0.00 — top up your Exness account "
+                    "before AI orders can execute."
+                ),
+            }
+        elif markets.get("XAUUSD", {}).get("open") is False and markets.get(
+            "BTCUSD", {}
+        ).get("open") is False:
+            why = {
+                "code": "market_closed",
+                "text": (
+                    "Broker markets are closed (weekend/holiday) — signals"
+                    " stay, orders resume at open."
+                ),
+            }
+        else:
+            why = {
+                "code": "ready",
+                "text": "Armed and ready — every AI signal places a real order.",
+            }
+
         return {
             "armed": self.armed,
             "armed_at": self._armed_at,
@@ -277,9 +331,12 @@ class McpAutoTrader:
                 "trade_allowed": bool(info and info.get("trade_allowed")),
                 "server": info.get("server") if info else None,
                 "login": info.get("login") if info else None,
+                "balance": balance,
                 "equity": info.get("equity") if info else None,
                 "currency": info.get("currency") if info else None,
             },
+            "markets": markets,
+            "why": why,
             "risk": {
                 "risk_mode": cfg.risk_mode,
                 "risk_percent": cfg.risk_percent,

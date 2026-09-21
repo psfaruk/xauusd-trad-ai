@@ -247,6 +247,48 @@ async def test_arm_requires_terminal_and_permission() -> None:
         await trader2.arm(True, owner="admin-1")
 
 
+async def test_status_why_diagnosis() -> None:
+    """D-039: status() surfaces the honest WHY (arm/balance/market) + markets."""
+    # disarmed -> not_armed
+    trader, _, _ = make_trader(FakeTerminal())
+    st = await trader.status()
+    assert st["why"]["code"] == "not_armed"
+    assert st["terminal"]["balance"] == 500.0
+
+    # armed + healthy + markets open -> ready
+    trader2, _, _ = make_trader(
+        FakeTerminal(), market_state=lambda plat: (True, "broker ticking")
+    )
+    await trader2.arm(True, owner="admin-1")
+    st2 = await trader2.status()
+    assert st2["why"]["code"] == "ready"
+    assert st2["markets"]["XAUUSD"]["open"] is True
+    assert st2["markets"]["BTCUSD"]["open"] is True
+
+    # armed but zero balance -> no_balance (Exness trial reset case)
+    trader3, _, _ = make_trader(FakeTerminal(equity=0.0))
+    await trader3.arm(True, owner="admin-1")
+    st3 = await trader3.status()
+    assert st3["why"]["code"] == "no_balance"
+
+    # armed, balance ok, all markets closed -> market_closed
+    trader4, _, _ = make_trader(
+        FakeTerminal(), market_state=lambda plat: (False, "weekend")
+    )
+    await trader4.arm(True, owner="admin-1")
+    st4 = await trader4.status()
+    assert st4["why"]["code"] == "market_closed"
+
+    # terminal goes down AFTER arming -> terminal_down
+    client5 = FakeTerminal()
+    trader5, _, _ = make_trader(client5)
+    await trader5.arm(True, owner="admin-1")
+    client5.available_flag = False
+    st5 = await trader5.status()
+    assert st5["why"]["code"] == "terminal_down"
+    assert st5["terminal"]["available"] is False
+
+
 async def test_disarmed_trader_ignores_signals() -> None:
     client = FakeTerminal()
     trader, hub, _ = make_trader(client)
