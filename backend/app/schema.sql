@@ -98,7 +98,7 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
 
--- Seed the single engine_config row with D-041 M1 MTF defaults.
+-- Seed the single engine_config row with D-042 M1 ICT/MTF defaults.
 insert into engine_config (id, config, auto_trade)
 values (1, '{
   "timeframe": "M1", "trend_tf": "H1",
@@ -107,14 +107,16 @@ values (1, '{
   "rsi_period": 14, "rsi_buy_min": 40, "rsi_buy_max": 65,
   "rsi_sell_min": 35, "rsi_sell_max": 60,
   "atr_period": 14, "min_atr": 0.15,
-  "sfp_lookback": 20, "sfp_wick_atr_ratio": 0.45,
-  "sl_buffer_atr": 0.2, "rr": 0.9, "expiry_bars": 14, "cooldown_bars": 8,
+  "sfp_lookback": 20, "sfp_wick_atr_ratio": 0.35,
+  "sl_buffer_atr": 0.2, "rr": 1.1, "expiry_bars": 20, "cooldown_bars": 4,
   "pullback_enabled": true,
-  "pullback_min_range_atr": 0.35, "pullback_wick_ratio": 0.55,
-  "min_sl_atr": 1.8,
+  "pullback_min_range_atr": 0.35, "pullback_wick_ratio": 0.45,
+  "min_sl_atr": 1.5, "max_spread_to_risk": 0.5,
   "sessions": [{"name": "london", "utc": [7, 16]}, {"name": "newyork", "utc": [13, 20]}],
   "news_blackout_min": 30, "max_spread_points": 35,
   "risk_mode": "percent", "risk_percent": 0.5, "fixed_lot": 0.01,
-  "max_positions": 1, "daily_max_loss_pct": 3.0, "magic": 234000
+  "max_positions": 3, "daily_max_loss_pct": 3.0, "magic": 234000,
+  "smc_enabled": true, "bias_tfs": ["H4"], "min_confluence": 4,
+  "max_zone_atr": 0.9, "vol_z_min": 0.8, "max_sl_atr": 3.5
 }'::jsonb, false)
 on conflict (id) do nothing;

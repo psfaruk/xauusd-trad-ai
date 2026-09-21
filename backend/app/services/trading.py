@@ -629,7 +629,7 @@ class UserTradingManager:
             await self._platform_executor.apply_config(cfg)
         if self._live_auto is not None:
             try:
-                self._live_auto.apply_config(cfg)
+                await self._live_auto.apply_config(cfg)
             except Exception:  # noqa: BLE001
                 logger.exception("live auto-trader config apply failed")
         for plane in self._planes.values():

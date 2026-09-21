@@ -138,56 +138,72 @@ def resample_ohlc(base: pd.DataFrame, dst_min: int, src_min: int = 1) -> pd.Data
 
 
 class _SimTracker:
-    """Bar-based §8.4 simulation (SL-first pessimism)."""
+    """Bar-based §8.4 simulation (SL-first pessimism, D-042 multi-entry).
+
+    Holds up to cfg.max_positions concurrent open signals — mirrors the
+    live engine's concurrent-signal budget exactly.
+    """
 
     def __init__(self, cfg: EngineConfig) -> None:
         self.cfg = cfg
-        self.open_sig: BacktestSignal | None = None
-        self.bars_held = 0
+        self.open_sigs: list[BacktestSignal] = []
+        self._held: dict[int, int] = {}  # id(sig) -> bars held
 
-    def step(self, bar: pd.Series) -> BacktestSignal | None:
-        """Advance one M15 bar; return the signal if it closed this bar."""
-        sig = self.open_sig
-        if sig is None:
-            return None
-        self.bars_held += 1
+    @property
+    def full(self) -> bool:
+        return len(self.open_sigs) >= max(1, self.cfg.max_positions)
+
+    def add(self, sig: BacktestSignal) -> None:
+        self.open_sigs.append(sig)
+        self._held[id(sig)] = 0
+
+    def step(self, bar: pd.Series) -> list[BacktestSignal]:
+        """Advance one base-TF bar; return signals that closed this bar."""
+        if not self.open_sigs:
+            return []
+        closed: list[BacktestSignal] = []
+        for sig in list(self.open_sigs):
+            self._held[id(sig)] += 1
+            if self._step_one(sig, bar):
+                self.open_sigs.remove(sig)
+                self._held.pop(id(sig), None)
+                closed.append(sig)
+        return closed
+
+    def _step_one(self, sig: BacktestSignal, bar: pd.Series) -> bool:
+        """True when the signal resolved on this bar (SL-first pessimism)."""
         high, low, close = float(bar["h"]), float(bar["l"]), float(bar["c"])
         if sig.direction == "BUY":
-            if low <= sig.sl and high >= sig.tp:
-                sig.status, sig.result_r = "lost", -1.0  # pessimistic
-            elif low <= sig.sl:
+            if low <= sig.sl:
                 sig.status, sig.result_r = "lost", -1.0
             elif high >= sig.tp:
                 sig.status = "won"
                 sig.result_r = round(
                     (sig.tp - sig.entry) / (sig.entry - sig.sl), 4
                 )
-            elif self.bars_held >= self.cfg.expiry_bars:
+            elif self._held[id(sig)] >= self.cfg.expiry_bars:
                 sig.status = "expired"
                 sig.result_r = round((close - sig.entry) / (sig.entry - sig.sl), 4)
             else:
-                return None
+                return False
         else:
-            if high >= sig.sl and low <= sig.tp:
-                sig.status, sig.result_r = "lost", -1.0
-            elif high >= sig.sl:
+            if high >= sig.sl:
                 sig.status, sig.result_r = "lost", -1.0
             elif low <= sig.tp:
                 sig.status = "won"
                 sig.result_r = round(
                     (sig.entry - sig.tp) / (sig.sl - sig.entry), 4
                 )
-            elif self.bars_held >= self.cfg.expiry_bars:
+            elif self._held[id(sig)] >= self.cfg.expiry_bars:
                 sig.status = "expired"
                 sig.result_r = round((sig.entry - close) / (sig.sl - sig.entry), 4)
             else:
-                return None
+                return False
         bar_time = bar["time_utc"]
         sig.exit_ts = (
             bar_time.to_pydatetime() if hasattr(bar_time, "to_pydatetime") else bar_time
         )
-        self.open_sig = None
-        return sig
+        return True
 
 
 def run_backtest(
@@ -205,11 +221,14 @@ def run_backtest(
     cfg = cfg or EngineConfig()
     tf_min = TIMEFRAME_MINUTES[cfg.timeframe]
 
-    # Pre-resample every higher TF once (trend + confirms) + their bar-close
-    # timestamp arrays (searchsorted-based asof slicing — O(log n) per bar).
+    # Pre-resample every higher TF once (trend + confirms + D-042 bias TFs)
+    # + their bar-close timestamp arrays (searchsorted asof slicing).
     htf_frames: dict[str, pd.DataFrame] = {}
     htf_close_ts: dict[str, Any] = {}
-    for tf in dict.fromkeys([cfg.trend_tf, *cfg.confirm_tfs]):
+    fetch_tfs = [cfg.trend_tf, *cfg.confirm_tfs]
+    if cfg.smc_enabled:
+        fetch_tfs += [tf for tf in cfg.bias_tfs if tf not in fetch_tfs]
+    for tf in dict.fromkeys(fetch_tfs):
         dst_min = TIMEFRAME_MINUTES[tf]
         if dst_min % tf_min != 0:
             raise ValueError(f"confirm tf {tf} must be a multiple of {cfg.timeframe}")
@@ -247,12 +266,11 @@ def run_backtest(
         close_np = np.datetime64(bar_close_time.tz_localize(None)) if bar_close_time.tzinfo \
             else np.datetime64(bar_close_time)
 
-        # no evaluation while a simulated position is open (max_positions=1)
-        # but the tracker steps on EVERY closed bar
-        closed_sig = sim.step(bar)
-        _ = closed_sig  # tracked in-place (already in result.signals)
+        # multi-entry (D-042): evaluate while the concurrent budget has room;
+        # the tracker steps every closed bar
+        sim.step(bar)
 
-        if sim.open_sig is not None or i < cooldown_until:
+        if sim.full or i < cooldown_until:
             continue
 
         htf = {}
@@ -276,8 +294,7 @@ def run_backtest(
             trigger=p.get("trigger", "sfp"),
         )
         result.signals.append(sig)
-        sim.open_sig = sig
-        sim.bars_held = 0
+        sim.add(sig)
         cooldown_until = i + cfg.cooldown_bars + 1
 
     # D-041 — honest spread cost: a BUY fills at the ask and exits at the bid,

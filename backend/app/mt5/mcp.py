@@ -209,6 +209,14 @@ class MT5TerminalClient:
         except MCPError:
             return False
 
+    def clone(self) -> MT5TerminalClient:
+        """D-042 — a fresh client (own MCP session, same endpoint/key).
+
+        The tick-poller runs one clone per worker so slow bridge round
+        trips pipeline instead of serializing behind the single lock.
+        """
+        return MT5TerminalClient(url=self.url, key=self._key)
+
     def account(self) -> dict[str, Any]:
         return self._call("get_trading_account_info")  # type: ignore[return-value]
 

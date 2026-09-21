@@ -305,6 +305,7 @@ export default function Dashboard() {
               onDesync={onDesync}
               focusSignalId={focusSignalId}
               onFocusSignalConsumed={() => setFocusSignalId(null)}
+              token={token ?? ""}
             />
           )}
           {activeTab === "ai" && (

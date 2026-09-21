@@ -74,7 +74,8 @@ async def test_kill_switch_max_positions() -> None:
         Position(1, "XAUUSDm", "BUY", 0.1, 2650.0, None, None, 0.0, datetime.now(UTC))
     ]
     verdict = await evaluate_kill_switches(
-        DEFAULT_CONFIG, mock, "XAUUSDm", 0.01,
+        DEFAULT_CONFIG.model_copy(update={"max_positions": 1}),
+        mock, "XAUUSDm", 0.01,
         spread_points=10.0, positions=positions,
     )
     assert not verdict.allowed
@@ -179,7 +180,8 @@ async def test_executor_respects_max_positions() -> None:
     await mock.connect({"login": "1", "password": "x", "server": "s"})
     mock.set_starting_balance(10_000.0)
     repo = TradeRepo(None)
-    ex = OrderExecutor(mock, DEFAULT_CONFIG, repo, hub=_Hub())
+    cfg = DEFAULT_CONFIG.model_copy(update={"max_positions": 1})
+    ex = OrderExecutor(mock, cfg, repo, hub=_Hub())
     ex.arm(True)
     assert (await ex.execute_signal(_signal(sid="a"), "XAUUSDm", 0.01)).ok
     # one position open now (max_positions=1) -> second signal skipped

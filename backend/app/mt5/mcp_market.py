@@ -34,8 +34,13 @@ from typing import Any
 
 logger = logging.getLogger("xauusd.mcpmarket")
 
-#: tick poll cadence per symbol (D-037: 4/s — MT5-like liveness)
-POLL_S = float(os.environ.get("MT5_TICK_POLL_S", "0.25"))
+#: tick poll cadence per symbol. D-042: 0.08s + N pipelined workers —
+#: the poll loop is single-flight per worker (sleep only the REMAINDER
+#: of the cycle), so real tick throughput ≈ workers / bridge-RTT instead
+#: of the old 1/(RTT + 0.25s) ≈ 2 tps that left candles 3-5s behind.
+POLL_S = float(os.environ.get("MT5_TICK_POLL_S", "0.08"))
+#: parallel in-flight tick polls (each with its own MCP session)
+WORKERS = max(1, int(os.environ.get("MT5_TICK_WORKERS", "3")))
 FRESH_S = 15.0               # MT5 authority window since last broker tick
 BARS_CACHE_TTL_S = 20.0      # chart-history cache per (symbol, tf)
 BARS_MIN_REFETCH_S = 3.0     # forced-refetch rate cap
@@ -85,6 +90,7 @@ class McpMarketFeed:
         poll_s: float = POLL_S,
         fresh_s: float = FRESH_S,
         on_tick: Callable[[str, float, float, float], None] | None = None,
+        workers: int | None = None,
     ) -> None:
         self._client = client
         self._watch = list(watch or ["XAUUSD", "BTCUSD"])
@@ -92,6 +98,10 @@ class McpMarketFeed:
         self._fresh_s = float(fresh_s)
         self._on_tick = on_tick
         self.symbol_map: dict[str, str] = {}
+        self._workers = max(1, int(workers if workers is not None else WORKERS))
+        # D-042 — one dedicated client per poll worker (own MCP session;
+        # falls back to the shared client for duck-typed test fakes).
+        self._tick_clients: list[Any] = [self._make_worker_client() for _ in range(self._workers)]
         # per platform-symbol poller state
         self._last_ts: dict[str, float] = {}
         self._last_monotonic: dict[str, float] = {}
@@ -115,9 +125,10 @@ class McpMarketFeed:
         await self._discover_symbols()
         for sym in self._watch:
             self._event_times.setdefault(sym, deque(maxlen=512))
-            self._tasks.append(asyncio.create_task(
-                self._poll_loop(sym), name=f"mcp-market-{sym}"
-            ))
+            for wid in range(self._workers):
+                self._tasks.append(asyncio.create_task(
+                    self._poll_worker(sym, wid), name=f"mcp-market-{sym}-{wid}"
+                ))
         # D-037: an abruptly-killed terminal can lose Market Watch entries
         # (state not flushed) — re-ensure our symbols periodically so the
         # feed self-heals after ANY terminal restart.
@@ -125,8 +136,8 @@ class McpMarketFeed:
             self._ensure_symbols_loop(), name="mcp-market-ensure"
         ))
         logger.info(
-            "MT5 market feed started — symbols %s (broker %s)",
-            self._watch, self.symbol_map,
+            "MT5 market feed started — symbols %s (broker %s, %d poll workers @ %.2fs)",
+            self._watch, self.symbol_map, self._workers, self._poll_s,
         )
 
     async def _ensure_symbols_loop(self) -> None:
@@ -198,11 +209,26 @@ class McpMarketFeed:
 
     # --------------------------------------------------------------- polling
 
-    async def _poll_loop(self, plat: str) -> None:
+    def _make_worker_client(self) -> Any:
+        """Dedicated client for a poll worker (clone when supported)."""
+        clone = getattr(self._client, "clone", None)
+        if callable(clone):
+            try:
+                return clone()
+            except Exception:  # noqa: BLE001 — fall back to the shared client
+                return self._client
+        return self._client
+
+    async def _poll_worker(self, plat: str, wid: int) -> None:
+        """Single-flight tick poller — re-polls the instant the previous
+        call returns (sleep only the cycle remainder), so workers/
+        throughput is limited only by the bridge RTT."""
+        client = self._tick_clients[min(wid, len(self._tick_clients) - 1)]
         backoff = self._poll_s
         while not self._stop.is_set():
+            t0 = time_mod.monotonic()
             try:
-                got = await self._poll_ticks(plat)
+                got = await self._poll_ticks(plat, client)
                 backoff = self._poll_s
                 if got and not self._calibrated:
                     self._calibrate(plat)
@@ -211,13 +237,26 @@ class McpMarketFeed:
             except Exception as exc:  # noqa: BLE001 — poller never dies
                 self._err[plat] = f"{type(exc).__name__}: {exc}"[:160]
                 backoff = min(backoff * 2.0, 10.0)
+            elapsed = time_mod.monotonic() - t0
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=max(0.0, backoff - elapsed)
+                )
             except TimeoutError:
                 pass
 
-    async def _poll_ticks(self, plat: str) -> int:
-        """Fetch new broker ticks for one platform symbol; emit callbacks."""
+    async def _poll_loop(self, plat: str) -> int:
+        """Compatibility wrapper (single worker, shared client)."""
+        return await self._poll_worker(plat, 0)
+
+    async def _poll_ticks(self, plat: str, client: Any | None = None) -> int:
+        """Fetch new broker ticks for one platform symbol; emit callbacks.
+
+        Concurrent workers are safe: every row is deduped against the
+        shared `_last_ts` high-water mark (event-loop serialized), so an
+        older response arriving late simply drops its already-seen rows.
+        """
+        client = client or self._client
         broker = self.symbol_map.get(plat) or DEFAULT_MAP.get(plat)
         if not broker:
             return 0
@@ -228,7 +267,7 @@ class McpMarketFeed:
         frm = datetime.fromtimestamp(frm_s - 1.0, tz=UTC)
         to = datetime.fromtimestamp(now_epoch + 120.0, tz=UTC)
         rows = await asyncio.to_thread(
-            self._client.ticks, broker,
+            client.ticks, broker,
             frm.strftime("%Y-%m-%dT%H:%M:%SZ"), to.strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         now_mono = time_mod.monotonic()

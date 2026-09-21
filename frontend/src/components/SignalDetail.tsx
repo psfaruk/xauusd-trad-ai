@@ -40,6 +40,17 @@ function prettyCheck(name: string): string {
     news: "News Filter",
     spread: "Spread Cap",
     spread_risk: "Spread vs Risk",
+    // D-042 ICT/SMC confluence factors
+    structure_m1: "M1 Market Structure",
+    htf_structure: "HTF Structure Bias",
+    ob_retest: "Order-Block Retest",
+    fvg_fill: "Fair Value Gap",
+    liquidity_sweep: "Liquidity Sweep",
+    zone: "Supply/Demand Zone",
+    volume: "Institutional Volume",
+    killzone: "ICT Kill Zone",
+    whale_bias: "Whale Bias",
+    confluence: "ICT Confluence",
   };
   return map[name] ?? name;
 }
@@ -104,6 +115,7 @@ export function SignalRow({
 
 export function SignalDetail({ signal }: { signal: Signal }) {
   const checks = signal.trace?.checks ?? [];
+  const factors = signal.trace?.confluence_factors ?? [];
   const trigger = signal.trace?.trigger ?? "sfp";
   const buy = signal.direction === "BUY";
   return (
@@ -166,6 +178,43 @@ export function SignalDetail({ signal }: { signal: Signal }) {
           />
         </div>
       </div>
+
+      {/* D-042 — the ICT/SMC confluence factors (zones, structure, whales) */}
+      {factors.length > 0 && (
+        <div className="min-w-0">
+          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+            ICT / Smart-Money confluence
+          </p>
+          <ul className="flex min-w-0 flex-col gap-1.5">
+            {factors.map((f, i) => (
+              <li
+                key={i}
+                className={`flex min-w-0 items-start gap-2.5 rounded-lg border px-3 py-2 ${
+                  f.ok
+                    ? "border-violet-500/20 bg-violet-500/5"
+                    : "border-zinc-800 bg-zinc-900/40"
+                }`}
+              >
+                <span
+                  className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded text-[10px] font-bold ${
+                    f.ok ? "bg-violet-500/20 text-violet-300" : "bg-zinc-700/40 text-zinc-500"
+                  }`}
+                >
+                  {f.ok ? "✓" : "–"}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-xs font-semibold text-zinc-200">
+                    {prettyCheck(f.name)}
+                  </span>
+                  <span className="block break-words font-mono text-[10px] leading-relaxed text-zinc-500">
+                    {f.detail}
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* the analysis checklist */}
       <div className="min-w-0">

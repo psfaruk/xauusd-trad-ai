@@ -113,6 +113,10 @@ async def lifespan(app: FastAPI):
         app.state.news = NullNewsService()
     app.state.config_repo = ConfigRepo()
     app.state.signals = SignalRepo(app.state.db_engine)
+    # D-042 — ICT/SMC analysis snapshots for the chart overlays + strip
+    from app.services.analysis import AnalysisService
+
+    app.state.analysis = AnalysisService()
     resolution = await resolve_data_source(
         settings, http_factory=lambda: _get_http(app)
     )

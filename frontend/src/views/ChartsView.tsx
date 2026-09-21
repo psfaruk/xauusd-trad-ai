@@ -6,8 +6,10 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useTick } from "../state/feed";
+import { getAnalysis } from "../lib/api";
 import {
   TIMEFRAMES,
+  type AnalysisResponse,
   type Candle,
   type Mt5Status,
   type Signal,
@@ -32,6 +34,7 @@ interface Props {
   onDesync: () => void;
   focusSignalId: string | null;
   onFocusSignalConsumed: () => void;
+  token: string;
 }
 
 export default function ChartsView({
@@ -48,9 +51,30 @@ export default function ChartsView({
   onDesync,
   focusSignalId,
   onFocusSignalConsumed,
+  token,
 }: Props) {
   const tick = useTick(symbol);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
+
+  // D-042 — poll the ICT/SMC analysis snapshot (backend caches ~20s;
+  // the analysis itself only changes on bar close)
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      getAnalysis(token, symbol)
+        .then((res) => alive && setAnalysis(res))
+        .catch(() => {
+          /* analysis stays on the last snapshot during blips */
+        });
+    };
+    load();
+    const iv = window.setInterval(load, 20_000);
+    return () => {
+      alive = false;
+      window.clearInterval(iv);
+    };
+  }, [token, symbol]);
 
   const symbolSignals = useMemo(
     () => signals.filter((s) => s.symbol === symbol),
@@ -164,9 +188,13 @@ export default function ChartsView({
             market={market}
             wsConnected={wsState === "open"}
             onDesync={onDesync}
+            analysis={analysis}
           />
         </ErrorBoundary>
       </div>
+
+      {/* D-042 — live ICT/SMC analysis strip */}
+      <LiveAnalysisStrip analysis={analysis} tf={tf} />
 
       {/* signal analysis panel */}
       <Card>
@@ -211,6 +239,134 @@ export default function ChartsView({
           Signal times are UTC · entry {selected.entry.toFixed(2)} · taken {fmtTime(selected.ts)}
         </p>
       )}
+    </div>
+  );
+}
+
+/* ------------------------------------------- D-042 live analysis strip */
+
+function trendBadge(trend: string | undefined): { tone: "green" | "red" | "zinc"; label: string } {
+  if (trend === "bullish") return { tone: "green", label: "BULL" };
+  if (trend === "bearish") return { tone: "red", label: "BEAR" };
+  return { tone: "zinc", label: "FLAT" };
+}
+
+function LiveAnalysisStrip({
+  analysis,
+  tf,
+}: {
+  analysis: AnalysisResponse | null;
+  tf: Timeframe;
+}) {
+  const snap = analysis?.per_tf?.[tf] ?? null;
+  const mtf = analysis?.mtf;
+  return (
+    <Card>
+      <SectionTitle
+        title="Live ICT Analysis"
+        right={
+          mtf ? (
+            <Badge tone={mtf.bias === "bullish" ? "green" : mtf.bias === "bearish" ? "red" : "zinc"}>
+              MTF {mtf.bias} · {mtf.score > 0 ? "+" : ""}{mtf.score}
+            </Badge>
+          ) : undefined
+        }
+      />
+      {!snap || !snap.ok ? (
+        <EmptyState
+          title="Analysis warming up"
+          hint="Market structure, order blocks, liquidity pools and whale activity stream here on every bar close."
+        />
+      ) : (
+        <div className="flex min-w-0 flex-col gap-2.5">
+          {/* per-TF structure row */}
+          <div className="flex min-w-0 gap-1.5 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {Object.entries(analysis?.per_tf ?? {})
+              .filter(([, s]) => s?.ok)
+              .map(([tfKey, s]) => {
+                const b = trendBadge(s.structure?.trend);
+                return (
+                  <span
+                    key={tfKey}
+                    className={`flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1.5 ${
+                      tfKey === tf ? "border-gold/40 bg-gold/5" : "border-zinc-800 bg-zinc-900/50"
+                    }`}
+                  >
+                    <span className="font-mono text-[10px] font-bold text-zinc-400">{tfKey}</span>
+                    <Badge tone={b.tone}>{b.label}</Badge>
+                    {s.structure?.last_event && (
+                      <span className="text-[9px] text-zinc-500">
+                        {s.structure.last_event.kind}{" "}
+                        {s.structure.last_event.dir === "up" ? "↑" : "↓"}
+                      </span>
+                    )}
+                  </span>
+                );
+              })}
+          </div>
+
+          {/* key numbers */}
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <StripStat label="RSI" value={snap.indicators.rsi.toFixed(0)} />
+            <StripStat
+              label="ADX"
+              value={snap.indicators.adx.adx.toFixed(0)}
+              hint={snap.indicators.adx.adx > 25 ? "trending" : "ranging"}
+            />
+            <StripStat label="ATR" value={snap.atr.toFixed(2)} />
+            <StripStat
+              label="VWAP"
+              value={snap.indicators.vwap.toFixed(2)}
+              hint={snap.indicators.vwap_rel}
+            />
+          </div>
+
+          {/* whale / manipulation context */}
+          <div className="flex min-w-0 flex-col gap-1.5">
+            {snap.whales?.last ? (
+              <p className="rounded-lg border border-violet-500/20 bg-violet-500/5 px-3 py-2 text-[11px] leading-relaxed text-zinc-300">
+                <span className="font-semibold text-violet-300">Whale watch:</span>{" "}
+                {snap.whales.last.note} · {fmtTime(snap.whales.last.t)} (vol z{snap.whales.last.vol_z})
+                {snap.whales.bias !== "neutral" && (
+                  <span className="ml-1 font-semibold text-zinc-400">
+                    — recent flow: {snap.whales.buy_events} buy vs {snap.whales.sell_events} sell events
+                  </span>
+                )}
+              </p>
+            ) : (
+              <p className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-[11px] text-zinc-500">
+                No unusual institutional volume in the last window — whale events
+                (bank entries, stop hunts, absorption) appear here the moment
+                volume spikes.
+              </p>
+            )}
+            {snap.premium_discount?.state && (
+              <p className="text-[10px] text-zinc-500">
+                Dealing range {snap.premium_discount.range_lo?.toFixed(2)}–{snap.premium_discount.range_hi?.toFixed(2)} · price in{" "}
+                <span className="font-semibold text-zinc-400">{snap.premium_discount.state}</span>
+                {snap.volume_profile?.poc != null && (
+                  <> · POC {snap.volume_profile.poc.toFixed(2)}</>
+                )}
+                {snap.liquidity?.levels?.length ? (
+                  <> · {snap.liquidity.levels.length} liquidity pools mapped</>
+                ) : null}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function StripStat({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <div className="min-w-0 rounded-lg border border-zinc-800/80 bg-zinc-900/40 px-2.5 py-1.5">
+      <p className="text-[9px] font-semibold uppercase tracking-wider text-zinc-500">{label}</p>
+      <p className="truncate font-mono text-xs font-semibold text-zinc-200 tabular-nums">
+        {value}
+        {hint && <span className="ml-1 text-[9px] font-normal text-zinc-500">{hint}</span>}
+      </p>
     </div>
   );
 }

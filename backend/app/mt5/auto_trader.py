@@ -134,10 +134,10 @@ class McpAutoTrader:
         )
         return True
 
-    def apply_config(self, cfg: EngineConfig) -> None:
+    async def apply_config(self, cfg: EngineConfig) -> None:
         """PUT /api/config reaches the live executor (risk params stay live)."""
         self._cfg = cfg
-        self._executor.apply_config(cfg)
+        await self._executor.apply_config(cfg)
 
     # -------------------------------------------------------------- signal in
 

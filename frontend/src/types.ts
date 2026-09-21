@@ -51,12 +51,21 @@ export interface TraceCheck {
   value: string;
 }
 
+/** D-042 — one ICT/SMC confluence factor the engine verified. */
+export interface ConfluenceFactor {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
 export interface SignalTrace {
   direction: SignalDirection | null;
   checks: TraceCheck[];
   params: Record<string, unknown>;
   /** D-041 — which pattern fired: "sfp" (liquidity sweep) | "pullback". */
   trigger?: "sfp" | "pullback" | string;
+  /** D-042 — ICT/SMC confluence factors (structure, OB, FVG, liquidity…). */
+  confluence_factors?: ConfluenceFactor[];
 }
 
 export interface Signal {
@@ -211,6 +220,13 @@ export interface EngineConfig {
   min_sl_atr?: number;
   /** D-041 — skip when spread exceeds this fraction of the SL distance. */
   max_spread_to_risk?: number;
+  /** D-042 — ICT/SMC block. */
+  smc_enabled?: boolean;
+  bias_tfs?: string[];
+  min_confluence?: number;
+  max_zone_atr?: number;
+  vol_z_min?: number;
+  max_sl_atr?: number;
   rr: number;
   expiry_bars: number;
   cooldown_bars: number;
@@ -551,3 +567,91 @@ export interface Mt5AutoTradeStatus {
 
 /** D-039: app-level navigation tabs (mobile bottom bar / desktop ⋮ menu). */
 export type AppTab = "home" | "charts" | "ai" | "settings";
+
+/* ------------------------------------------------ D-042: ICT/SMC analysis */
+
+/** One institutional zone on the chart (supply/demand, OB, FVG). */
+export interface SmcZone {
+  side: "bullish" | "bearish" | "demand" | "supply";
+  t: string;
+  hi: number;
+  lo: number;
+  /** extra context (OB impulse multiple, FVG gap, mitigated state…) */
+  impulse?: number;
+  gap?: number;
+  filled?: boolean;
+  mitigated?: boolean;
+}
+
+export interface LiquidityLevel {
+  kind: "BSL" | "SSL";
+  price: number;
+  t: string;
+  hits: number;
+  tag?: string;
+}
+
+export interface WhaleEvent {
+  t: string;
+  side: "buy" | "sell";
+  kind: "momentum" | "sweep" | "absorption";
+  vol_z: number;
+  price: number;
+  note: string;
+}
+
+export interface StructureInfo {
+  trend: "bullish" | "bearish" | "balanced";
+  swings: { t: string; price: number; kind: "high" | "low"; label: string }[];
+  events: { t: string; level: number; kind: "BOS" | "CHoCH"; dir: "up" | "down" }[];
+  last_event: { t: string; level: number; kind: "BOS" | "CHoCH"; dir: "up" | "down" } | null;
+}
+
+/** Per-timeframe analysis snapshot from GET /api/analysis. */
+export interface AnalysisSnapshot {
+  ok: boolean;
+  bars: number;
+  last: number;
+  atr: number;
+  structure: StructureInfo;
+  order_blocks: SmcZone[];
+  fvgs: SmcZone[];
+  liquidity: { levels: LiquidityLevel[]; sweeps: { kind: string; price: number; t: string }[] };
+  zones: SmcZone[];
+  premium_discount: {
+    state: string;
+    range_hi: number | null;
+    range_lo: number | null;
+    eq: number | null;
+    ote: { hi: number; lo: number } | null;
+  };
+  whales: {
+    events: WhaleEvent[];
+    buy_events: number;
+    sell_events: number;
+    bias: "buy" | "sell" | "neutral";
+    last: WhaleEvent | null;
+  };
+  indicators: {
+    rsi: number;
+    macd: { macd: number; signal: number; hist: number; hist_prev: number };
+    stoch: { k: number; d: number };
+    adx: { adx: number; plus_di: number; minus_di: number };
+    bollinger: { upper: number; mid: number; lower: number; width: number; pct_b: number };
+    vwap: number;
+    vwap_rel: string;
+    cci: number;
+    momentum: number;
+    vol_z: number;
+  };
+  volume_profile: { poc: number | null; vah: number | null; val: number | null };
+  delta: number;
+}
+
+export interface AnalysisResponse {
+  symbol: string;
+  updated_at: number;
+  per_tf: Record<string, AnalysisSnapshot>;
+  mtf: { bias: string; score: number; notes: string[] };
+  errors: string[];
+}

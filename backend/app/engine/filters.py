@@ -14,13 +14,16 @@ from app.engine.config import EngineConfig
 from app.engine.indicators import atr, ema, rsi
 from app.engine.trace import Trace
 
-# Confidence weights (SPEC §8.2, D-041 rebalance) — pass-score contributions.
-W_TREND = 0.25
-W_MTF = 0.20
-W_TRIGGER = 0.25
-W_RSI = 0.15
+# Confidence weights (SPEC §8.2, D-041 rebalance, D-042 ICT block) —
+# pass-score contributions. The ICT confluence block carries the largest
+# single share (user directive: SMC/ICT-driven analysis).
+W_TREND = 0.20
+W_MTF = 0.15
+W_TRIGGER = 0.20
+W_RSI = 0.10
 W_SESSION = 0.05
-W_ATR = 0.10
+W_ATR = 0.05
+W_CONFLUENCE = 0.25
 
 
 def check_mtf(

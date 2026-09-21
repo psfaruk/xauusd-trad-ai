@@ -1,21 +1,14 @@
 /**
- * PriceChart (D-041) — candlestick chart reworked around the feed store.
+ * PriceChart (D-041/D-042) — candlestick chart around the feed store.
  *
- * Hardening (user reports: "chart breaks / app crashes on pair or timeframe
- * change"):
- *  - The WS connection is NEVER torn down on a symbol/TF switch (the parent
- *    just re-subscribes); this component handles the switch by clearing the
- *    series and showing a loading overlay until the new candles arrive.
- *  - All incoming candles/bars are sanitized (finite, ascending, deduped) —
- *    malformed frames never reach lightweight-charts.
- *  - Live updates go through an imperative subscription (no React state at
- *    20fps); a rAF loop eases the last candle toward the freshest quote
- *    (the MT5-terminal feel, D-037).
- *  - Recent signals draw arrow markers; the selected signal draws
- *    entry/SL/TP price lines.
+ * D-042 adds the ICT/SMC overlay layer: supply/demand + order-block +
+ * FVG zones drawn on a canvas synced to the chart's coordinate system,
+ * liquidity-pool lines (BSL/SSL/PDH/PDL), whale/institutional event
+ * markers and per-layer toggle chips. The engine's ~15Hz display fill
+ * keeps the last candle moving between broker ticks.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   createChart,
   ColorType,
@@ -27,7 +20,9 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { feed } from "../state/feed";
-import type { Candle, Signal, Timeframe } from "../types";
+import type {
+  AnalysisResponse, Candle, Signal, SmcZone, Timeframe,
+} from "../types";
 
 const UP = "#26a69a";
 const DOWN = "#ef5350";
@@ -35,10 +30,24 @@ const GOLD = "#d4af37";
 const EASE = 0.22;
 const EPSILON = 1e-9;
 
+/** D-042 overlay layer colors. */
+const ZONE_STYLE: Record<string, { fill: string; border: string; label: string }> = {
+  supply: { fill: "rgba(239,83,80,0.10)", border: "rgba(239,83,80,0.55)", label: "SUPPLY" },
+  demand: { fill: "rgba(38,166,154,0.10)", border: "rgba(38,166,154,0.55)", label: "DEMAND" },
+  bullish: { fill: "rgba(59,130,246,0.10)", border: "rgba(59,130,246,0.55)", label: "OB+" },
+  bearish: { fill: "rgba(217,119,6,0.10)", border: "rgba(217,119,6,0.55)", label: "OB−" },
+  fvg_bull: { fill: "rgba(139,92,246,0.10)", border: "rgba(139,92,246,0.5)", label: "FVG" },
+  fvg_bear: { fill: "rgba(236,72,153,0.08)", border: "rgba(236,72,153,0.45)", label: "FVG" },
+};
+
 export interface ChartTfChange {
   symbol: string;
   tf: Timeframe;
 }
+
+const TF_SECONDS: Record<string, number> = {
+  M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400,
+};
 
 interface PriceChartProps {
   symbol: string;
@@ -50,6 +59,8 @@ interface PriceChartProps {
   market?: "open" | "closed" | "unavailable" | "unknown";
   wsConnected: boolean;
   onDesync?: () => void;
+  /** D-042 — ICT/SMC analysis (zones/OB/FVG/liquidity/whales). */
+  analysis?: AnalysisResponse | null;
 }
 
 /** strictly-ascending, deduped, finite-only bars (D-035 hardening). */
@@ -84,8 +95,10 @@ export default function PriceChart({
   market,
   wsConnected,
   onDesync,
+  analysis,
 }: PriceChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
@@ -94,6 +107,16 @@ export default function PriceChart({
   const rafRef = useRef<number | null>(null);
   const dataKeyRef = useRef(""); // last (symbol|tf|candleCount) applied
   const [ready, setReady] = useState(false);
+  // D-042 overlay layer toggles
+  const [layers, setLayers] = useState({
+    zones: true,
+    ob: true,
+    fvg: false,
+    liq: true,
+    whales: true,
+  });
+  const layersRef = useRef(layers);
+  layersRef.current = layers;
 
   /* ------------------------------------------------------ create once */
   useEffect(() => {
@@ -302,6 +325,7 @@ export default function PriceChart({
   }, [symbol, tf, onDesync]);
 
   /* ------------------------------------------------ signal chart markers */
+  const whalesForChart = analysis?.per_tf?.[tf]?.whales?.events ?? [];
   useEffect(() => {
     const series = seriesRef.current;
     if (!series || !ready) return;
@@ -316,14 +340,172 @@ export default function PriceChart({
           shape: s.direction === "BUY" ? "arrowUp" : "arrowDown",
           text: `${s.direction} ${Math.round(s.confidence * 100)}%`,
         } as SeriesMarker<Time>;
-      })
-      .sort((a, b) => (a.time as number) - (b.time as number));
+      });
+    // D-042 — whale/institutional events (momentum entries, stop hunts,
+    // absorption) — snapped onto actual candle times of this TF
+    if (layersRef.current.whales && candles.length) {
+      const tfSec = TF_SECONDS[tf] ?? 60;
+      for (const ev of whalesForChart.slice(-12)) {
+        const wt = Math.floor(new Date(ev.t).getTime() / 1000);
+        const bar = candles.find((c) => c.t <= wt && wt < c.t + tfSec);
+        if (!bar) continue;
+        markers.push({
+          time: bar.t as UTCTimestamp,
+          position: ev.side === "buy" ? "belowBar" : "aboveBar",
+          color:
+            ev.kind === "momentum" ? "#8b5cf6"
+              : ev.kind === "sweep" ? "#f59e0b"
+                : "#3b82f6",
+          shape:
+            ev.kind === "momentum"
+              ? ev.side === "buy" ? "arrowUp" : "arrowDown"
+              : "circle",
+          text: ev.kind === "momentum"
+            ? `WHALE ${ev.side.toUpperCase()}`
+            : `${ev.kind === "sweep" ? "STOP HUNT" : "ABSORPTION"} z${ev.vol_z}`,
+        });
+      }
+    }
+    markers.sort((a, b) => (a.time as number) - (b.time as number));
     try {
       series.setMarkers(markers);
     } catch {
       /* markers need ascending times — sanitized above */
     }
-  }, [signals, ready]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signals, ready, analysis, tf, candles.length]);
+
+  /* ------------------------------------- D-042 ICT/SMC zone overlay canvas */
+  const snap = analysis?.per_tf?.[tf] ?? null;
+  const drawOverlay = useCallback(() => {
+    const canvas = overlayRef.current;
+    const chart = chartRef.current;
+    const series = seriesRef.current;
+    if (!canvas || !chart || !series) return;
+    const L = layersRef.current;
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    if (w === 0 || h === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    if (!snap || !snap.ok) return;
+
+    const ts = chart.timeScale();
+    const axisW = 8 + (chart.priceScale("right").width() || 56);
+    const rightEdge = Math.max(60, w - axisW);
+    const xOf = (iso: string): number | null => {
+      const t = Math.floor(new Date(iso).getTime() / 1000) as UTCTimestamp;
+      const c = ts.timeToCoordinate(t);
+      return c == null ? null : c;
+    };
+    const yOf = (p: number): number | null => {
+      const c = series.priceToCoordinate(p);
+      return c == null ? null : c;
+    };
+
+    const drawZone = (
+      z: SmcZone,
+      style: { fill: string; border: string; label: string },
+      tag?: string,
+    ) => {
+      const y1 = yOf(z.hi);
+      const y2 = yOf(z.lo);
+      if (y1 == null || y2 == null || y2 - y1 < 1) return;
+      const xRaw = xOf(z.t);
+      if (xRaw == null) return; // before the loaded window — skip
+      if (xRaw > rightEdge) return;
+      const x1 = Math.max(-2, xRaw);
+      ctx.fillStyle = style.fill;
+      ctx.fillRect(x1, y1, rightEdge - x1, y2 - y1);
+      ctx.strokeStyle = style.border;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([]);
+      ctx.strokeRect(x1 + 0.5, y1 + 0.5, rightEdge - x1 - 1, y2 - y1 - 1);
+      ctx.fillStyle = style.border;
+      ctx.font = "600 9px ui-sans-serif, system-ui, sans-serif";
+      ctx.fillText(tag ? `${style.label} ${tag}` : style.label, x1 + 5, y1 + 10);
+    };
+
+    if (L.zones) {
+      for (const z of snap.zones ?? []) {
+        drawZone(z, ZONE_STYLE[z.side] ?? ZONE_STYLE.demand);
+      }
+    }
+    if (L.ob) {
+      for (const ob of snap.order_blocks ?? []) {
+        drawZone(
+          ob,
+          ZONE_STYLE[ob.side] ?? ZONE_STYLE.bullish,
+          ob.mitigated ? "·tested" : "",
+        );
+      }
+    }
+    if (L.fvg) {
+      for (const g of snap.fvgs ?? []) {
+        drawZone(
+          g,
+          g.side === "bullish" ? ZONE_STYLE.fvg_bull : ZONE_STYLE.fvg_bear,
+          g.filled ? "·filled" : "",
+        );
+      }
+    }
+    if (L.liq) {
+      ctx.font = "600 9px ui-sans-serif, system-ui, sans-serif";
+      for (const lv of snap.liquidity?.levels ?? []) {
+        const y = yOf(lv.price);
+        if (y == null || y < 0 || y > h) continue;
+        const isBuy = lv.kind === "BSL";
+        ctx.strokeStyle = isBuy ? "rgba(52,211,153,0.5)" : "rgba(248,113,113,0.5)";
+        ctx.setLineDash([5, 4]);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, Math.round(y) + 0.5);
+        ctx.lineTo(rightEdge, Math.round(y) + 0.5);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = isBuy ? "rgba(52,211,153,0.85)" : "rgba(248,113,113,0.85)";
+        ctx.fillText(
+          `${lv.tag ?? lv.kind}${lv.hits > 1 ? ` ×${lv.hits}` : ""}`,
+          6,
+          y - 3,
+        );
+      }
+    }
+  }, [snap]);
+
+  // redraw on data/symbol changes + continuously while zooming/panning
+  useEffect(() => {
+    drawOverlay();
+  }, [drawOverlay, ready, candles.length, symbol, tf]);
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const cb = () => drawOverlay();
+    const rangeHandler = () => window.requestAnimationFrame(cb);
+    try {
+      chart.timeScale().subscribeVisibleLogicalRangeChange(rangeHandler);
+    } catch {
+      /* chart disposed */
+    }
+    const iv = window.setInterval(cb, 500); // price-scale (vertical zoom) sync
+    window.addEventListener("resize", cb);
+    return () => {
+      try {
+        chart.timeScale().unsubscribeVisibleLogicalRangeChange(rangeHandler);
+      } catch {
+        /* disposed */
+      }
+      window.clearInterval(iv);
+      window.removeEventListener("resize", cb);
+    };
+  }, [drawOverlay]);
 
   /* --------------------------------------------- selected signal lines */
   useEffect(() => {
@@ -351,6 +533,13 @@ export default function PriceChart({
   /* ------------------------------------------------------------ overlay */
   const dataApplied = dataKeyRef.current.endsWith("|0") ? false : candles.length > 0;
   const showLoading = candlesLoading || (!dataApplied && market !== "closed");
+  const layerChips: { key: keyof typeof layers; label: string }[] = [
+    { key: "zones", label: "S/D" },
+    { key: "ob", label: "OB" },
+    { key: "fvg", label: "FVG" },
+    { key: "liq", label: "LIQ" },
+    { key: "whales", label: "WHALES" },
+  ];
   const chip =
     market === "open" ? (
       <span className="flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-semibold tracking-wide text-emerald-300 backdrop-blur">
@@ -373,7 +562,30 @@ export default function PriceChart({
   return (
     <div className="relative h-full min-h-0 w-full overflow-hidden rounded-2xl border border-zinc-800/80 bg-[#0b0d12]">
       <div ref={containerRef} className="h-full w-full" aria-label={`${symbol} ${tf} chart`} />
+      {/* D-042 — ICT/SMC zone overlay (pointer-transparent) */}
+      <canvas
+        ref={overlayRef}
+        className="pointer-events-none absolute inset-0 h-full w-full"
+        aria-hidden
+      />
       {chip && <div className="absolute left-3 top-3 z-10">{chip}</div>}
+      {/* D-042 — overlay layer toggles */}
+      <div className="absolute right-3 top-3 z-10 flex max-w-[70%] flex-wrap justify-end gap-1">
+        {layerChips.map((l) => (
+          <button
+            key={l.key}
+            type="button"
+            onClick={() => setLayers((s) => ({ ...s, [l.key]: !s[l.key] }))}
+            className={`rounded-full border px-2 py-0.5 text-[9px] font-bold tracking-wide backdrop-blur transition-colors ${
+              layers[l.key]
+                ? "border-gold/50 bg-gold/15 text-gold"
+                : "border-zinc-700/70 bg-zinc-900/70 text-zinc-500"
+            }`}
+          >
+            {l.label}
+          </button>
+        ))}
+      </div>
       {showLoading && (
         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-zinc-950/70 backdrop-blur-sm">
           <svg className="h-7 w-7 animate-spin text-gold" viewBox="0 0 24 24" fill="none">

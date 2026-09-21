@@ -3,6 +3,7 @@ import type {
   ConfigResponse, EngineConfig, TradingStatus, TradingPosition, TradeRecord,
   OrderResult, ExternalSnapshot, LogEntry, Mt5Account, Mt5OpenPosition,
   Mt5HistoryPosition, Mt5Symbol, Mt5OrderResult, Mt5AutoTradeStatus,
+  AnalysisResponse,
 } from "../types";
 
 /**
@@ -59,6 +60,16 @@ export function getCandles(
 ): Promise<CandlesResponse> {
   const qs = symbol ? `&symbol=${encodeURIComponent(symbol)}` : "";
   return request<CandlesResponse>(`/api/candles?tf=${tf}&limit=${limit}${qs}`, {}, token);
+}
+
+/** D-042 — ICT/SMC multi-TF analysis (zones, OB, FVG, liquidity, whales). */
+export function getAnalysis(
+  token: string,
+  symbol: string
+): Promise<AnalysisResponse> {
+  return request<AnalysisResponse>(
+    `/api/analysis?symbol=${encodeURIComponent(symbol)}`, {}, token
+  );
 }
 
 export function getPositions(token: string): Promise<{ positions: Position[] }> {

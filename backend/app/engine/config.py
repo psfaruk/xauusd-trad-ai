@@ -45,13 +45,17 @@ class SessionRule(BaseModel):
 
 
 class EngineConfig(BaseModel):
-    """Strategy parameters (SPEC §8.6 defaults, D-041 M1 rework).
+    """Strategy parameters (SPEC §8.6 defaults, D-041 M1 rework, D-042 ICT).
 
-    D-041: the engine now trades the M1 timeframe with multi-timeframe
-    confirmation — H1 sets the trend, M5+M15 must agree (mtf_align), and the
+    D-041: the engine trades the M1 timeframe with multi-timeframe
+    confirmation — H1 sets the trend, M5+M15 confirm (mtf_align), and the
     trigger is a REAL M1 pattern (liquidity-sweep SFP or an EMA pullback
-    rejection candle). Old M15-only defaults are upgraded automatically by
-    ConfigRepo.load (see _LEGACY_UPGRADE).
+    rejection candle).
+    D-042: ICT/SMC confluence — after the trigger, market structure
+    (BOS/CHoCH), order blocks, fair value gaps, liquidity sweeps and
+    supply/demand zones must confirm with >= min_confluence votes;
+    SL/TP are zone-aware (app-controlled exits), and up to max_positions
+    signals/entries can run CONCURRENTLY (multi-entry directive).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -63,7 +67,7 @@ class EngineConfig(BaseModel):
         description="MTF confirmation timeframes — each must be > timeframe",
     )
     min_tf_agree: int = Field(
-        2, ge=0,
+        1, ge=0,
         description="how many confirm TFs must agree with the H1 trend (hard gate)",
     )
     ema_fast: int = Field(20, ge=1)
@@ -77,19 +81,19 @@ class EngineConfig(BaseModel):
     atr_period: int = Field(14, ge=1)
     min_atr: float = Field(0.15, ge=0)   # M1 ATR floor (D-041 — was 0.8 on M15)
     sfp_lookback: int = Field(20, ge=2)
-    sfp_wick_atr_ratio: float = Field(0.45, gt=0)
+    sfp_wick_atr_ratio: float = Field(0.35, gt=0)
     sl_buffer_atr: float = Field(0.2, ge=0)
-    rr: float = Field(0.9, gt=0)         # D-041 backtest-tuned (real 22pt spread)
-    expiry_bars: int = Field(14, ge=1)  # 14 M1 bars = 14 minutes
-    cooldown_bars: int = Field(8, ge=0)
+    rr: float = Field(1.1, gt=0)         # D-042 backtest-verified on 30d real M1
+    expiry_bars: int = Field(20, ge=1)  # 20 M1 bars = 20 minutes
+    cooldown_bars: int = Field(4, ge=0)
     # -------------------------------------------------- D-041 pullback trigger
     pullback_enabled: bool = True
     pullback_min_range_atr: float = Field(0.35, gt=0,
         description="min trigger-bar range as a fraction of ATR (doji filter)")
-    pullback_wick_ratio: float = Field(0.55, gt=0,
+    pullback_wick_ratio: float = Field(0.45, gt=0,
         description="min rejection wick as a fraction of the bar range")
     # -------------------------------------------------- D-041 risk geometry
-    min_sl_atr: float = Field(1.8, ge=0,
+    min_sl_atr: float = Field(1.5, ge=0,
         description="SL at least this many ATRs from entry (spread/noise floor)")
     max_spread_to_risk: float = Field(0.5, gt=0,
         description="skip when spread > this fraction of the SL distance")
@@ -104,9 +108,34 @@ class EngineConfig(BaseModel):
     risk_mode: str = Field("percent", pattern="^(percent|fixed)$")
     risk_percent: float = Field(0.5, gt=0, le=100)
     fixed_lot: float = Field(0.01, gt=0)
-    max_positions: int = Field(1, ge=1)
+    max_positions: int = Field(3, ge=1)
     daily_max_loss_pct: float = Field(3.0, gt=0)
     magic: int = Field(234000, ge=0)
+    # -------------------------------------------------- D-042 ICT/SMC block
+    smc_enabled: bool = Field(
+        True,
+        description="ICT/SMC confluence stage master switch",
+    )
+    bias_tfs: list[str] = Field(
+        default_factory=lambda: ["H4"],
+        description="extra HTF frames whose STRUCTURE must bias the trade",
+    )
+    min_confluence: int = Field(
+        4, ge=0, le=6,
+        description="how many of the 6 ICT gating factors must confirm",
+    )
+    max_zone_atr: float = Field(
+        0.9, gt=0,
+        description="entry-to-zone proximity tolerance in ATRs",
+    )
+    vol_z_min: float = Field(
+        0.8, ge=0,
+        description="trigger-bar volume z-score that counts as institutional",
+    )
+    max_sl_atr: float = Field(
+        3.5, gt=0,
+        description="SL at most this many ATRs from entry (risk cap)",
+    )
 
     @field_validator("timeframe", "trend_tf")
     @classmethod
@@ -127,6 +156,17 @@ class EngineConfig(BaseModel):
             seen.append(tf)
         return seen
 
+    @field_validator("bias_tfs")
+    @classmethod
+    def _bias_tfs(cls, v: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for tf in v:
+            validate_tf(tf)
+            if tf in seen:
+                raise ValueError(f"duplicate bias tf: {tf}")
+            seen.add(tf)
+        return v
+
     @model_validator(mode="after")
     def _tf_order(self) -> EngineConfig:
         from app.mt5.base import TIMEFRAME_MINUTES
@@ -139,6 +179,9 @@ class EngineConfig(BaseModel):
                 raise ValueError(f"confirm tf {tf} must be greater than timeframe")
             if TIMEFRAME_MINUTES[tf] >= TIMEFRAME_MINUTES[self.trend_tf]:
                 raise ValueError(f"confirm tf {tf} must be below trend_tf {self.trend_tf}")
+        for tf in self.bias_tfs:
+            if TIMEFRAME_MINUTES[tf] <= base:
+                raise ValueError(f"bias tf {tf} must be greater than timeframe")
         if self.min_tf_agree > len(self.confirm_tfs):
             raise ValueError("min_tf_agree can never be satisfied")
         return self
@@ -158,34 +201,42 @@ class EngineConfig(BaseModel):
         return None
 
 
-# D-041 — fields the auto-upgrade overrides when it meets a legacy M15 row
-# stored before the M1 rework (no `confirm_tfs` key). Risk/session fields the
-# user may have customized are PRESERVED; only the strategy block is moved to
+# D-042 — fields the auto-upgrade overrides when it meets a pre-D-042
+# stored config (no `min_confluence` key). Risk/session fields the user
+# may have customized are PRESERVED; only the strategy block moves to
 # the new defaults.
 _LEGACY_STRATEGY_DEFAULTS = {
     "timeframe": "M1",
     "confirm_tfs": ["M5", "M15"],
-    "min_tf_agree": 2,
+    "min_tf_agree": 1,
     "min_atr": 0.15,
-    "sfp_wick_atr_ratio": 0.45,
-    "rr": 0.9,
-    "expiry_bars": 14,
-    "cooldown_bars": 8,
+    "sfp_wick_atr_ratio": 0.35,
+    "rr": 1.1,
+    "expiry_bars": 20,
+    "cooldown_bars": 4,
     "pullback_enabled": True,
     "pullback_min_range_atr": 0.35,
-    "pullback_wick_ratio": 0.55,
-    "min_sl_atr": 1.8,
+    "pullback_wick_ratio": 0.45,
+    "min_sl_atr": 1.5,
     "max_spread_to_risk": 0.5,
+    # D-042 ICT block
+    "smc_enabled": True,
+    "bias_tfs": ["H4"],
+    "min_confluence": 4,
+    "max_zone_atr": 0.9,
+    "vol_z_min": 0.8,
+    "max_sl_atr": 3.5,
+    "max_positions": 3,
 }
 
 
 def upgrade_legacy_payload(raw: dict) -> tuple[dict, bool]:
-    """Upgrade a pre-D-041 stored config to the M1 engine (one-time).
+    """Upgrade a pre-D-042 stored config to the ICT engine (one-time).
 
-    Returns (upgraded_payload, changed). Unchanged when `confirm_tfs` is
-    already present (current schema) — nothing to do.
+    Returns (upgraded_payload, changed). Unchanged when `min_confluence`
+    is already present (current schema) — nothing to do.
     """
-    if not isinstance(raw, dict) or "confirm_tfs" in raw:
+    if not isinstance(raw, dict) or "min_confluence" in raw:
         return raw, False
     out = dict(raw)
     out.update(_LEGACY_STRATEGY_DEFAULTS)

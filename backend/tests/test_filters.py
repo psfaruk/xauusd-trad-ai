@@ -10,6 +10,7 @@ import pytest
 from app.engine.config import EngineConfig, SessionRule
 from app.engine.filters import (
     W_ATR,
+    W_CONFLUENCE,
     W_MTF,
     W_RSI,
     W_SESSION,
@@ -150,8 +151,10 @@ class TestSpread:
 
 class TestConfidenceParts:
     def test_weights_sum_to_one(self):
+        # D-042: base weights + the ICT confluence block sum to one
         assert (
             W_TREND + W_MTF + W_TRIGGER + W_RSI + W_SESSION + W_ATR
+            + W_CONFLUENCE
             == pytest.approx(1.0)
         )
 

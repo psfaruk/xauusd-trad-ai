@@ -286,26 +286,22 @@ async def mt5_auto_trade_status(request: Request, user: CurrentUser) -> dict:
 
 class AutoTradeLiveBody(BaseModel):
     enabled: bool
-    confirm: str | None = Field(default=None, max_length=16)
+    confirm: str | None = Field(default=None, max_length=16)  # legacy, ignored
 
 
 @router.post("/auto-trade")
 async def mt5_auto_trade_arm(
     body: AutoTradeLiveBody, request: Request, user: CurrentUser
 ) -> dict:
-    """Arm/disarm REAL auto-execution (typed confirmation "ENABLE").
+    """Arm/disarm REAL auto-execution (D-042: simple toggle — the typed
+    "ENABLE" confirmation was replaced by the app's switch button plus
+    the money-management setup window; a legacy `confirm` field is still
+    accepted and ignored so older clients keep working).
 
     D-037: any user with an ACTIVE broker connection may arm auto-trade —
     orders execute on the account THEY connected (verified against the
     terminal session). Admins may arm without a connection (platform plane).
     """
-    if body.enabled and body.confirm != "ENABLE":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                'typed confirmation required: {"enabled": true, "confirm": "ENABLE"}'
-            ),
-        )
     if user.get("role") != "admin":
         try:
             _broker(request).get(user["id"])

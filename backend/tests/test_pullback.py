@@ -98,8 +98,8 @@ class TestPullbackLevels:
             swing_extreme=99.9, wick_ratio=0.6, body_pos=0.8, atr=0.5,
         )
         entry, sl, tp = build_levels_pullback(sig, CFG)
-        # swing (99.9 - 0.2*0.5 = 99.8) vs floor (100 - 1.8*0.5 = 99.1)
-        assert sl == pytest.approx(99.1)
+        # swing (99.9 - 0.2*0.5 = 99.8) vs floor (100 - 1.5*0.5 = 99.25)
+        assert sl == pytest.approx(99.25)
         risk = entry - sl
         assert risk >= CFG.min_sl_atr * 0.5 - 1e-9
         assert tp == pytest.approx(entry + CFG.rr * risk)
@@ -133,14 +133,17 @@ class TestLegacyConfigUpgrade:
         assert changed is True
         assert up["timeframe"] == "M1"
         assert up["confirm_tfs"] == ["M5", "M15"]
-        assert up["rr"] == 0.9
-        assert up["min_sl_atr"] == 1.8
+        assert up["rr"] == 1.1
+        assert up["min_sl_atr"] == 1.5
+        assert up["min_confluence"] == 4          # D-042 ICT gate (tuned)
+        assert up["max_positions"] == 3           # D-042 multi-entry default
         # user-customized risk/session values survive
         assert up["risk_percent"] == 1.0
         assert up["fixed_lot"] == 0.02
         assert up["sessions"] == [{"name": "london", "utc": [7, 16]}]
         cfg = EngineConfig.model_validate(up)
-        assert cfg.timeframe == "M1" and cfg.min_tf_agree == 2
+        assert cfg.timeframe == "M1" and cfg.min_tf_agree == 1
+        assert cfg.bias_tfs == ["H4"] and cfg.smc_enabled is True
 
     def test_modern_payload_untouched(self):
         modern = EngineConfig().model_dump()

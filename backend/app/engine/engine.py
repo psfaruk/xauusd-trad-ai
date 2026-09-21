@@ -1,4 +1,4 @@
-"""SignalEngine (SPEC §8.5, D-041 M1 rework) — bar-close driven evaluation.
+"""SignalEngine (SPEC §8.5, D-041 M1 rework, D-042 ICT) — bar-close driven.
 
 The pure pipeline `evaluate()` is shared by the live engine AND the backtest
 runner so both paths apply exactly the same rules (single source of truth).
@@ -8,6 +8,13 @@ active-state, persistence and WS broadcasts.
 D-041 pipeline (base TF = M1 by default):
     H1 trend -> MTF align (M5, M15) -> trigger (SFP sweep | pullback
     rejection candle) -> RSI -> ATR -> session -> news -> spread -> levels.
+
+D-042 pipeline adds, right after the trigger:
+    ICT/SMC confluence — market structure (M1 + H4/H1/M15/M5), order-block
+    retest, FVG fill, liquidity sweep, supply/demand zone, institutional
+    volume, kill-zone timing and whale bias must yield >= min_confluence
+    votes; SL/TP become zone-aware (smart_targets) and up to max_positions
+    signals may run concurrently (multi-entry directive).
 """
 
 from __future__ import annotations
@@ -21,9 +28,16 @@ from typing import Any
 
 import pandas as pd
 
+from app.analysis.context import (
+    bonus_score,
+    build_confluence,
+    confluence_score,
+    smart_targets,
+)
 from app.engine.config import EngineConfig
 from app.engine.filters import (
     W_ATR,
+    W_CONFLUENCE,
     W_MTF,
     W_RSI,
     W_SESSION,
@@ -141,6 +155,35 @@ def evaluate(
         return Evaluation(None, trace.to_dict(), near_miss=False)
 
     # After a trigger fired, every later failure is a NEAR MISS (worth a log).
+    # D-042 — ICT/SMC confluence stage (zone/OB/structure/volume votes).
+    factors: list[dict] = []
+    if cfg.smc_enabled:
+        candidate_entry = float(base["c"].iloc[-1])
+        factors = build_confluence(
+            base, htf, trace.direction, candidate_entry, bar_close_time,
+            max_zone_atr=cfg.max_zone_atr,
+        )
+        votes = confluence_score(factors)
+        for f in factors:
+            trace.add(f["name"], f["ok"], f["detail"])
+        n_gate = len([f for f in factors if f["name"] in (
+            "structure_m1", "htf_structure", "ob_retest",
+            "fvg_fill", "liquidity_sweep", "zone",
+        )])
+        confluence_ok = votes >= cfg.min_confluence
+        if not confluence_ok:
+            trace.add(
+                "confluence", False,
+                f"{votes}/{n_gate} ICT factors confirm"
+                f" (need {cfg.min_confluence})",
+            )
+            return Evaluation(None, trace.to_dict(), near_miss=True)
+        trace.add(
+            "confluence", True,
+            f"{votes} ICT factors confirm (need {cfg.min_confluence})"
+            f" + {bonus_score(factors)} bonus",
+        )
+
     rsi_ok, rsi_value = check_rsi(base, cfg, trace)
     if not rsi_ok:
         return Evaluation(None, trace.to_dict(), near_miss=True)
@@ -167,14 +210,21 @@ def evaluate(
         return Evaluation(None, trace.to_dict(), near_miss=True)
 
     if sig_sfp is not None:
-        entry, sl, tp = build_levels(sig_sfp, cfg)
+        entry, sl_base, _ = build_levels(sig_sfp, cfg)
         trigger_quality = sfp_quality(sig_sfp, cfg)
         trigger_tag: SfpSignal | PullbackSignal = sig_sfp
     else:
         assert sig_pb is not None  # for the type checker
-        entry, sl, tp = build_levels_pullback(sig_pb, cfg)
+        entry, sl_base, _ = build_levels_pullback(sig_pb, cfg)
         trigger_quality = pullback_quality(sig_pb)
         trigger_tag = sig_pb
+
+    # D-042 — zone-aware exits: SL beyond the structural invalidation,
+    # floored/capped in ATRs; TP snapped toward opposing liquidity.
+    entry, sl, tp = smart_targets(
+        base, trigger_tag.direction, entry, sl_base, cfg.rr,
+        cfg.min_sl_atr, cfg.max_sl_atr,
+    )
 
     # D-041 — spread vs risk: entering at ask/exiting at bid costs one spread;
     # when that cost exceeds `max_spread_to_risk` of the stop distance the
@@ -193,16 +243,25 @@ def evaluate(
         return Evaluation(None, trace.to_dict(), near_miss=True)
 
     mtf_score = agreed / max(len(cfg.confirm_tfs), 1)
-    confidence = (
+    base_confidence = (
         1.0 * W_TREND
         + mtf_score * W_MTF
         + trigger_quality * W_TRIGGER
         + rsi_position(rsi_value, cfg, trigger_tag.direction) * W_RSI
         + (1.0 if session_ok else 0.0) * W_SESSION
         + atr_strength(atr_value, cfg) * W_ATR
-    )
+    ) / max(W_TREND + W_MTF + W_TRIGGER + W_RSI + W_SESSION + W_ATR, 1e-9)
+    if cfg.smc_enabled and factors:
+        gate = confluence_score(factors) / 6.0
+        bonus = bonus_score(factors) / 3.0
+        confidence = (1.0 - W_CONFLUENCE) * base_confidence + W_CONFLUENCE * (
+            0.7 * gate + 0.3 * bonus
+        )
+    else:
+        confidence = base_confidence
     trace_dict = trace.to_dict()
     trace_dict["trigger"] = trigger  # survives inside signals.trace JSON (D-041)
+    trace_dict["confluence_factors"] = factors  # D-042 — Signal Analysis panel
     payload = {
         "direction": trigger_tag.direction,
         "entry": round(entry, 2),
@@ -298,8 +357,14 @@ class SignalEngine:
         bar_open = datetime.fromtimestamp(closed_bar["t"], tz=UTC)
         bar_close_time = bar_open + timedelta(minutes=tf_min)
 
-        # Rule 7a — state: cooldown + no active signal
-        if self._in_cooldown(cfg, bar_open) or tracker.has_active():
+        # Rule 7a — state: cooldown + concurrent-signal budget (D-042
+        # multi-entry: up to cfg.max_positions tracked signals at once).
+        if self._in_cooldown(cfg, bar_open):
+            return
+        active_now = tracker.active
+        if callable(active_now):  # duck-typed fakes may expose a method
+            active_now = active_now()
+        if len(active_now) >= max(int(cfg.max_positions), 1):
             return
 
         try:
@@ -313,7 +378,10 @@ class SignalEngine:
             return
 
         htf: dict[str, pd.DataFrame] = {}
-        for higher in [cfg.trend_tf, *cfg.confirm_tfs]:
+        fetch_tfs = [cfg.trend_tf, *cfg.confirm_tfs]
+        if cfg.smc_enabled:
+            fetch_tfs += cfg.bias_tfs  # D-042 ICT structure-bias frames
+        for higher in fetch_tfs:
             frame = await self._htf_frame(source, symbol, higher, 100)
             if frame is None:
                 return  # bridge hiccup — better to skip than evaluate blind

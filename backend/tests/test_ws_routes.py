@@ -178,8 +178,13 @@ class TestConfigRoutes:
         body = r.json()
         assert body["auto_trade"] is False  # global kill switch OFF by default
         assert body["config"]["timeframe"] == "M1"
-        assert body["config"]["rr"] == 0.9
+        assert body["config"]["rr"] == 1.1
         assert body["config"]["magic"] == 234000
+        # D-042 ICT block is served to the frontend
+        assert body["config"]["smc_enabled"] is True
+        assert body["config"]["min_confluence"] == 4
+        assert body["config"]["bias_tfs"] == ["H4"]
+        assert body["config"]["max_positions"] == 3
 
     def test_put_config_valid(self, client):
         r = client.get("/api/config", headers=GOOD)

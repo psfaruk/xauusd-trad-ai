@@ -1,19 +1,22 @@
 /**
- * AiView (D-041) — the AI Trading tab: honest "why is the AI trading / not
- * trading" status, arm/disarm, the live execution event feed, the manual
- * order pad and open positions (real terminal), and the real trade history.
+ * AiView (D-041/D-042) — the AI Trading tab: the auto-trading switch with
+ * its money-management setup window (D-042 — replaced the typed "ENABLE"),
+ * honest "why is the AI trading / not trading" status, the live execution
+ * event feed, the manual order pad, open positions and trade history.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  getConfig,
   getMt5History,
   getMt5Positions,
   postMt5AutoTrade,
   postMt5Close,
   postMt5Order,
+  putConfig,
 } from "../lib/api";
 import type {
-  Mt5AutoTradeStatus, Mt5HistoryPosition, Mt5OpenPosition,
+  EngineConfig, Mt5AutoTradeStatus, Mt5HistoryPosition, Mt5OpenPosition,
   Mt5OrderResult, Signal, WsMt5AutoMsg,
 } from "../types";
 import {
@@ -31,6 +34,267 @@ interface Props {
   onArmChanged: () => void;
 }
 
+/* ------------------------------------------------------- D-042 switch */
+
+function ToggleSwitch({
+  on,
+  busy,
+  onToggle,
+  labelOn = "ON",
+  labelOff = "OFF",
+}: {
+  on: boolean;
+  busy?: boolean;
+  onToggle: (next: boolean) => void;
+  labelOn?: string;
+  labelOff?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      disabled={busy}
+      onClick={() => onToggle(!on)}
+      className={`relative flex h-9 w-[76px] shrink-0 items-center rounded-full border transition-colors disabled:opacity-50 ${
+        on ? "border-emerald-500/60 bg-emerald-500/20" : "border-zinc-700 bg-zinc-800"
+      }`}
+    >
+      <span
+        className={`absolute top-1/2 h-7 w-7 -translate-y-1/2 rounded-full shadow-lg transition-all ${
+          on ? "left-[44px] bg-emerald-400" : "left-1 bg-zinc-500"
+        } ${busy ? "animate-pulse" : ""}`}
+      />
+      <span
+        className={`select-none px-2.5 text-[10px] font-bold tracking-wide ${
+          on ? "text-emerald-300" : "text-zinc-500"
+        }`}
+        style={{ marginLeft: on ? "6px" : "40px" }}
+      >
+        {busy ? "…" : on ? labelOn : labelOff}
+      </span>
+    </button>
+  );
+}
+
+/* --------------------------------------- D-042 money-management window */
+
+interface MoneyForm {
+  risk_mode: "percent" | "fixed";
+  fixed_lot: string;
+  risk_percent: string;
+  max_positions: string;
+  daily_max_loss_pct: string;
+  rr: string;
+  min_sl_atr: string;
+  max_spread_points: string;
+}
+
+function MoneyManagementModal({
+  token,
+  balance,
+  onDone,
+  onClose,
+}: {
+  token: string;
+  balance: number | null;
+  onDone: () => void;
+  onClose: () => void;
+}) {
+  const [form, setForm] = useState<MoneyForm | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getConfig(token)
+      .then((res) => {
+        const c = res.config;
+        setForm({
+          risk_mode: (c.risk_mode as "percent" | "fixed") ?? "percent",
+          fixed_lot: String(c.fixed_lot ?? 0.01),
+          risk_percent: String(c.risk_percent ?? 0.5),
+          max_positions: String(c.max_positions ?? 3),
+          daily_max_loss_pct: String(c.daily_max_loss_pct ?? 3),
+          rr: String(c.rr ?? 1.1),
+          min_sl_atr: String(c.min_sl_atr ?? 1.3),
+          max_spread_points: String(c.max_spread_points ?? 35),
+        });
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : "config load failed"));
+  }, [token]);
+
+  const set = (k: keyof MoneyForm, v: string) =>
+    setForm((f) => (f ? { ...f, [k]: v } : f));
+
+  const saveAndArm = async () => {
+    if (!form) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const cur = await getConfig(token);
+      const merged: EngineConfig = {
+        ...cur.config,
+        risk_mode: form.risk_mode,
+        fixed_lot: Math.max(0.01, parseFloat(form.fixed_lot) || 0.01),
+        risk_percent: Math.min(100, Math.max(0.05, parseFloat(form.risk_percent) || 0.5)),
+        max_positions: Math.min(10, Math.max(1, parseInt(form.max_positions, 10) || 3)),
+        daily_max_loss_pct: Math.min(90, Math.max(0.5, parseFloat(form.daily_max_loss_pct) || 3)),
+        rr: Math.max(0.2, parseFloat(form.rr) || 1.1),
+        min_sl_atr: Math.max(0.3, parseFloat(form.min_sl_atr) || 1.3),
+        max_spread_points: Math.max(5, parseInt(form.max_spread_points, 10) || 35),
+      };
+      await putConfig(token, merged);
+      await postMt5AutoTrade(token, { enabled: true });
+      onDone();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "failed to arm");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/70 p-0 backdrop-blur-sm sm:items-center sm:p-4">
+      <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-2xl border border-zinc-700/80 bg-zinc-900 shadow-2xl sm:rounded-2xl">
+        <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b border-zinc-800 bg-zinc-900/95 px-4 py-3 backdrop-blur">
+          <div className="min-w-0">
+            <p className="text-sm font-bold text-zinc-100">Money Management</p>
+            <p className="text-[10px] text-zinc-500">
+              Protect your balance — the AI trades inside these limits
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs text-zinc-400 hover:text-zinc-200"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="flex flex-col gap-3.5 px-4 py-4">
+          {!form ? (
+            <div className="flex flex-col gap-2">
+              <div className="h-9 animate-pulse rounded-lg bg-zinc-800" />
+              <div className="h-9 animate-pulse rounded-lg bg-zinc-800" />
+              <div className="h-9 animate-pulse rounded-lg bg-zinc-800" />
+            </div>
+          ) : (
+            <>
+              {/* lot sizing mode */}
+              <Field label="Position sizing">
+                <div className="grid grid-cols-2 gap-2">
+                  {(["percent", "fixed"] as const).map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => set("risk_mode", m)}
+                      className={`rounded-lg border px-3 py-2 text-xs font-semibold transition-colors ${
+                        form.risk_mode === m
+                          ? "border-gold/60 bg-gold/15 text-gold"
+                          : "border-zinc-700 bg-zinc-900 text-zinc-400"
+                      }`}
+                    >
+                      {m === "percent" ? "% of balance" : "Fixed lot"}
+                    </button>
+                  ))}
+                </div>
+              </Field>
+
+              {form.risk_mode === "percent" ? (
+                <Field
+                  label="Risk per trade (% of balance)"
+                  hint={
+                    balance != null && balance > 0
+                      ? `≈ $${((balance * (parseFloat(form.risk_percent) || 0)) / 100).toFixed(2)} per trade at $${balance.toFixed(0)} balance`
+                      : "0.5% keeps a losing streak survivable"
+                  }
+                >
+                  <input
+                    className={inputCls}
+                    value={form.risk_percent}
+                    onChange={(e) => set("risk_percent", e.target.value)}
+                    inputMode="decimal"
+                  />
+                </Field>
+              ) : (
+                <Field label="Lot size" hint="Fixed volume for every AI order">
+                  <input
+                    className={inputCls}
+                    value={form.fixed_lot}
+                    onChange={(e) => set("fixed_lot", e.target.value)}
+                    inputMode="decimal"
+                  />
+                </Field>
+              )}
+
+              <div className="grid grid-cols-2 gap-2.5">
+                <Field label="Max open trades" hint="Multiple entries can run together">
+                  <input
+                    className={inputCls}
+                    value={form.max_positions}
+                    onChange={(e) => set("max_positions", e.target.value)}
+                    inputMode="numeric"
+                  />
+                </Field>
+                <Field label="Daily loss limit (%)">
+                  <input
+                    className={inputCls}
+                    value={form.daily_max_loss_pct}
+                    onChange={(e) => set("daily_max_loss_pct", e.target.value)}
+                    inputMode="decimal"
+                  />
+                </Field>
+                <Field label="Reward : Risk" hint="Take-profit multiple of the stop distance">
+                  <input
+                    className={inputCls}
+                    value={form.rr}
+                    onChange={(e) => set("rr", e.target.value)}
+                    inputMode="decimal"
+                  />
+                </Field>
+                <Field label="Min stop (ATR×)" hint="Wider stop = less spread noise">
+                  <input
+                    className={inputCls}
+                    value={form.min_sl_atr}
+                    onChange={(e) => set("min_sl_atr", e.target.value)}
+                    inputMode="decimal"
+                  />
+                </Field>
+              </div>
+
+              <Field label="Max spread (points)" hint="AI skips signals when the spread is wider">
+                <input
+                  className={inputCls}
+                  value={form.max_spread_points}
+                  onChange={(e) => set("max_spread_points", e.target.value)}
+                  inputMode="numeric"
+                />
+              </Field>
+
+              {error && (
+                <p className="break-words rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
+                  {error}
+                </p>
+              )}
+
+              <div className="flex flex-col gap-2 pt-1">
+                <Btn variant="success" onClick={() => void saveAndArm()} disabled={busy} className="w-full">
+                  {busy ? "Arming…" : "Save & Turn ON Auto-Trading"}
+                </Btn>
+                <p className="text-center text-[10px] leading-relaxed text-zinc-500">
+                  Real orders will be placed on your connected broker account
+                  with SL/TP attached and managed by the app.
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* --------------------------------------------------------------- arm card */
 
 function ArmCard({
@@ -42,21 +306,21 @@ function ArmCard({
   token: string;
   onArmChanged: () => void;
 }) {
-  const [confirmText, setConfirmText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [showMoney, setShowMoney] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const armed = status?.armed ?? false;
   const why = status?.why;
 
   const toggle = async (enable: boolean) => {
+    if (enable) {
+      setShowMoney(true); // D-042 — money-management window first
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
-      await postMt5AutoTrade(token, {
-        enabled: enable,
-        confirm: enable ? confirmText.trim().toUpperCase() : undefined,
-      });
-      setConfirmText("");
+      await postMt5AutoTrade(token, { enabled: false });
       onArmChanged();
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed");
@@ -86,9 +350,20 @@ function ArmCard({
         <>
           <p className="min-w-0 text-[11px] leading-relaxed text-zinc-400">
             {armed
-              ? "Engine armed. Every M1 bar close is analyzed (H1 trend, M5 + M15 confirmation, pattern trigger, RSI/ATR/session/spread checks) and confirmed signals execute as real orders automatically."
-              : why?.text ?? "Arm the engine to enable automatic execution."}
+              ? "Engine armed. Every M1 bar close is analyzed (H1/H4 structure, M5 + M15 confirmation, ICT zones & liquidity, pattern trigger) and confirmed signals execute as real orders automatically."
+              : why?.text ?? "Turn the switch on to enable automatic execution."}
           </p>
+
+          {/* the switch (D-042 — replaces typing "ENABLE") */}
+          <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-zinc-800/80 bg-zinc-900/50 px-3.5 py-3">
+            <div className="min-w-0">
+              <p className="text-xs font-semibold text-zinc-200">Auto-Trading Engine</p>
+              <p className="text-[10px] text-zinc-500">
+                {armed ? "Running — orders execute automatically" : "Off — signals only, no orders"}
+              </p>
+            </div>
+            <ToggleSwitch on={armed} busy={busy} onToggle={(next) => void toggle(next)} />
+          </div>
 
           {/* terminal health row */}
           <div className="mt-3 grid grid-cols-3 gap-2">
@@ -126,44 +401,23 @@ function ArmCard({
               last skip: {status.last_skip_reason}
             </p>
           )}
-
-          {/* arm / disarm */}
-          <div className="mt-3.5 border-t border-zinc-800/70 pt-3.5">
-            {armed ? (
-              <Btn variant="danger" onClick={() => void toggle(false)} disabled={busy} className="w-full">
-                {busy ? "Disarming…" : "Disarm auto-trading"}
-              </Btn>
-            ) : (
-              <div className="flex flex-col gap-2">
-                <Field
-                  label='Type "ENABLE" to confirm arming real orders'
-                  hint="Real orders will be placed on your connected broker account."
-                >
-                  <input
-                    className={inputCls}
-                    value={confirmText}
-                    onChange={(e) => setConfirmText(e.target.value)}
-                    placeholder="ENABLE"
-                    autoComplete="off"
-                  />
-                </Field>
-                <Btn
-                  variant="success"
-                  onClick={() => void toggle(true)}
-                  disabled={busy || confirmText.trim().toUpperCase() !== "ENABLE"}
-                  className="w-full"
-                >
-                  {busy ? "Arming…" : "Arm auto-trading"}
-                </Btn>
-              </div>
-            )}
-            {error && (
-              <p className="mt-2 break-words rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
-                {error}
-              </p>
-            )}
-          </div>
+          {error && (
+            <p className="mt-2 break-words rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
+              {error}
+            </p>
+          )}
         </>
+      )}
+      {showMoney && status && (
+        <MoneyManagementModal
+          token={token}
+          balance={status.terminal.balance ?? null}
+          onDone={() => {
+            setShowMoney(false);
+            onArmChanged();
+          }}
+          onClose={() => setShowMoney(false)}
+        />
       )}
     </Card>
   );

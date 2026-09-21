@@ -80,7 +80,7 @@ class TestEngineE2E:
 
         hub = EventHub()
         repo = SignalRepo(None)
-        engine = SignalEngine(EngineConfig(), hub, repo)
+        engine = SignalEngine(EngineConfig(smc_enabled=False), hub, repo)
         tracker = SignalTracker()
 
         fired = None
@@ -140,8 +140,10 @@ class TestEngineE2E:
         else:
             assert sig["sl"] > sig["entry"] > sig["tp"]
         risk = abs(sig["entry"] - sig["sl"])
-        cfg = EngineConfig()
-        assert abs(abs(sig["tp"] - sig["entry"]) - cfg.rr * risk) < 0.02
+        # D-042: TP = rr * risk OR snapped just in front of an opposing
+        # liquidity pool inside [0.75, 1.6]x risk — never outside that band
+        tp_dist = abs(sig["tp"] - sig["entry"])
+        assert 0.70 * risk <= tp_dist <= 1.65 * risk
         assert 0.0 < sig["confidence"] <= 1.0
         assert sig["trace"]["trigger"] in ("sfp", "pullback")
         # WS signal event broadcast
@@ -166,7 +168,7 @@ class TestEngineE2E:
 
         hub = EventHub()
         repo = SignalRepo(None)
-        engine = SignalEngine(EngineConfig(), hub, repo)
+        engine = SignalEngine(EngineConfig(smc_enabled=False), hub, repo)
         tracker = SignalTracker()
         await engine.on_bar_close("M1", closed_bar_of(m1), src, tracker, symbol)
 
@@ -188,7 +190,7 @@ class TestEngineE2E:
         m1 = await src.get_rates(symbol, "M1", 200)
         hub = EventHub()
         repo = SignalRepo(None)
-        engine = SignalEngine(EngineConfig(), hub, repo)
+        engine = SignalEngine(EngineConfig(smc_enabled=False), hub, repo)
         tracker = SignalTracker()
 
         # replay both closed bars
@@ -213,7 +215,7 @@ class TestEngineE2E:
         await src.connect({"server": "s", "login": "1", "password": "x"})
         hub = EventHub()
         repo = SignalRepo(None)
-        engine = SignalEngine(EngineConfig(), hub, repo)
+        engine = SignalEngine(EngineConfig(smc_enabled=False), hub, repo)
         tracker = SignalTracker()
         df = await src.get_rates(src.SYMBOL, "M5", 10)
         await engine.on_bar_close("M5", closed_bar_of(df), src, tracker, src.SYMBOL)
@@ -332,7 +334,7 @@ class TestEvaluatePure:
     def test_full_pass_emits_signal(self):
         m1, htf = self._frames()
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
-        ev = evaluate(m1, htf, close_time, EngineConfig(), spread_points=20)
+        ev = evaluate(m1, htf, close_time, EngineConfig(smc_enabled=False), spread_points=20)
         assert ev.signal is not None, ev.trace
         assert ev.signal["direction"] == "BUY"
         assert ev.signal["trigger"] == "sfp"
@@ -341,7 +343,7 @@ class TestEvaluatePure:
     def test_spread_blocks(self):
         m1, htf = self._frames()
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
-        ev = evaluate(m1, htf, close_time, EngineConfig(), spread_points=99)
+        ev = evaluate(m1, htf, close_time, EngineConfig(smc_enabled=False), spread_points=99)
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "spread"
 
@@ -377,11 +379,17 @@ class TestEvaluatePure:
         htf = {tf: trend_frame(m) for tf, m in (("H1", 60), ("M15", 15), ("M5", 5))}
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
         # 30 points passes the absolute cap (35) but the risk is only ~0.54
-        ev = evaluate(m1, htf, close_time, EngineConfig(), spread_points=30, point_size=0.01)
+        ev = evaluate(
+            m1, htf, close_time, EngineConfig(smc_enabled=False),
+            spread_points=30, point_size=0.01,
+        )
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "spread_risk"
         # and the SAME tape trades fine when the spread is small
-        ev_ok = evaluate(m1, htf, close_time, EngineConfig(), spread_points=10, point_size=0.01)
+        ev_ok = evaluate(
+            m1, htf, close_time, EngineConfig(smc_enabled=False),
+            spread_points=10, point_size=0.01,
+        )
         assert ev_ok.signal is not None, ev_ok.trace
 
     def test_mtf_conflict_blocks(self):
@@ -392,7 +400,7 @@ class TestEvaluatePure:
         for col in ("o", "h", "l", "c"):
             down[col] = 300.0 - down[col]
         htf_bad = {"H1": htf["H1"], "M5": down, "M15": down}
-        ev = evaluate(m1, htf_bad, close_time, EngineConfig(), spread_points=20)
+        ev = evaluate(m1, htf_bad, close_time, EngineConfig(smc_enabled=False), spread_points=20)
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "mtf_m15"
 
@@ -400,6 +408,6 @@ class TestEvaluatePure:
         # base 01:00 UTC -> the sweep closes 02:01 UTC — off-session
         m1, htf = self._frames(hour_shift=-14)
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
-        ev = evaluate(m1, htf, close_time, EngineConfig(), spread_points=20)
+        ev = evaluate(m1, htf, close_time, EngineConfig(smc_enabled=False), spread_points=20)
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "session"

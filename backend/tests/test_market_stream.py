@@ -8,6 +8,7 @@ authoritative get_rates values.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -135,3 +136,75 @@ class TestMarketStream:
         # the seeded bar's volume reflects prior activity, not a single tick
         seeded = opens[0]["candle"]
         assert seeded["v"] >= 1
+
+    # ------------------------------------------------ D-042 micro-tick fill
+
+    async def test_interp_fill_between_slow_real_ticks(self):
+        """D-042 — with a slow real feed (2/s) the stream emits display-only
+        micro-ticks between broker ticks so the candle moves at ~15Hz.
+
+        Micro frames are marked i=True with n=0 (no real events inside);
+        real frames keep n>=1. Micro mids stay anchored to the last REAL
+        quote (bounded OU) so the fill can never invent price levels.
+        """
+        src = MockDataSource(seed=21, time_scale=60.0, tick_interval=0.5)
+        await src.connect({"server": "s", "login": "1", "password": "x"})
+        hub = RecordingHub(tfs={"M1"})
+        stream = MarketStream(src, hub, src.SYMBOL, engine_tf="M1")
+        await stream.start()
+        try:
+            await _drain(2.2)
+        finally:
+            await stream.stop()
+
+        ticks = [e for e in hub.events if e["type"] == "tick"]
+        real = [e for e in ticks if not e.get("i")]
+        interp = [e for e in ticks if e.get("i")]
+        assert real, "no real ticks flowed"
+        assert interp, "expected interpolated display frames between real ticks"
+        assert all(e["n"] == 0 for e in interp)
+        assert all(e["n"] >= 1 for e in real)
+        # micro frames sit within the OU clamp of the last real mid
+        last_mid = None
+        for e in ticks:
+            mid = (e["bid"] + e["ask"]) / 2.0
+            spread = e["ask"] - e["bid"]
+            if not e.get("i"):
+                last_mid = mid
+                continue
+            assert last_mid is not None
+            clamp = max(0.3 * spread, 0.02) + 0.02  # + rounding headroom
+            assert abs(mid - last_mid) <= clamp, (
+                f"micro mid {mid} drifted {abs(mid - last_mid):.3f}"
+                f" from real {last_mid} (clamp {clamp:.3f})"
+            )
+        # bar_update frames flowed for the engine TF (display bar moving)
+        updates = [e for e in hub.events
+                   if e["type"] == "bar_update" and e.get("tf") == "M1"]
+        assert updates
+
+    async def test_interp_stops_when_feed_quiet(self, monkeypatch):
+        """D-042 — no fake action in a quiet market: once real ticks stop
+        arriving (> INTERP_MAX_GAP_S) the fill freezes too."""
+        from app.services import market as market_mod
+
+        monkeypatch.setattr(market_mod, "INTERP_MAX_GAP_S", 0.6)
+        src = MockDataSource(seed=33, time_scale=60.0, tick_interval=0.2)
+        await src.connect({"server": "s", "login": "1", "password": "x"})
+        hub = RecordingHub(tfs={"M1"})
+        stream = MarketStream(src, hub, src.SYMBOL, engine_tf="M1")
+        await stream.start()
+        try:
+            await _drain(0.8)  # real ticks flowing at ~5/s
+            # kill the REAL feed only — the interp loop must survive
+            stream._task.cancel()
+            with contextlib.suppress(BaseException):
+                await stream._task
+            await _drain(0.8)  # past the 0.6s stale window — fill settles
+            n_settled = len([e for e in hub.events if e.get("i")])
+            await _drain(0.8)  # a quiet market stays quiet
+            n_after = len([e for e in hub.events if e.get("i")])
+        finally:
+            await stream.stop()
+        assert n_after == n_settled, "micro frames kept flowing on a dead feed"
+        assert stream.interp_stats()["active"] is False

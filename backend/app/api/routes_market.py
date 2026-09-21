@@ -3,6 +3,10 @@
 GET /api/candles?tf=M15&limit=500&symbol=BTCUSD  (auth) closed-bars backfill
 GET /api/positions                                (auth) open MT5 positions
 GET /api/market/external                          (auth) external references
+GET /api/analysis?symbol=XAUUSD                   (auth) D-042 ICT/SMC
+        multi-TF snapshot: structure, order blocks, FVG, liquidity,
+        supply/demand zones, whale events + classic indicators — feeds
+        the chart overlays and the live analysis strip.
 """
 
 from __future__ import annotations
@@ -13,6 +17,23 @@ from app.auth import CurrentUser
 from app.mt5.base import validate_tf
 
 router = APIRouter(prefix="/api", tags=["market"])
+
+
+@router.get("/analysis")
+async def analysis(
+    request: Request,
+    user: CurrentUser,
+    symbol: str = Query(default="XAUUSD", max_length=16),
+) -> dict:
+    """D-042 — cached ICT/SMC analysis snapshot for one symbol."""
+    mgr = request.app.state.mt5
+    available = getattr(mgr.source, "platform_symbols", None) or []
+    if available and symbol not in available:
+        raise HTTPException(status_code=404, detail=f"unknown symbol {symbol}")
+    service = getattr(request.app.state, "analysis", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="analysis service unavailable")
+    return await service.get(mgr.source, symbol)
 
 
 @router.get("/candles")

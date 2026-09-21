@@ -67,51 +67,66 @@ class TestSimTracker:
 
     def test_sl_hit_lost(self):
         tr = _SimTracker(EngineConfig())
-        tr.open_sig = self._sig()
+        tr.add(self._sig())
         out = tr.step(self._bar(100.5, 98.9, 99.5))
-        assert out.status == "lost" and out.result_r == -1.0
+        assert out and out[0].status == "lost" and out[0].result_r == -1.0
 
     def test_tp_hit_won_2r(self):
         tr = _SimTracker(EngineConfig())
-        tr.open_sig = self._sig()
+        tr.add(self._sig())
         out = tr.step(self._bar(102.3, 100.1, 102.0))
-        assert out.status == "won"
-        assert out.result_r == pytest.approx(2.0)
+        assert out and out[0].status == "won"
+        assert out[0].result_r == pytest.approx(2.0)
 
     def test_both_touched_sl_first_pessimistic(self):
         tr = _SimTracker(EngineConfig())
-        tr.open_sig = self._sig()
+        tr.add(self._sig())
         out = tr.step(self._bar(102.5, 98.5, 101.0))  # hits both
-        assert out.status == "lost"
+        assert out and out[0].status == "lost"
 
     def test_expiry_r_math(self):
         cfg = EngineConfig(expiry_bars=3)
         tr = _SimTracker(cfg)
-        sig = self._sig()
-        tr.open_sig = sig
-        out = None
+        tr.add(self._sig())
+        out = []
         for i in range(3):
             out = tr.step(self._bar(100.4, 99.5, 100.5, t=f"2025-01-06 07:{15*(i+1):02d}"))
-        assert out.status == "expired"
-        assert out.result_r == pytest.approx(0.5)  # (100.5-100)/1.0
+        assert out and out[0].status == "expired"
+        assert out[0].result_r == pytest.approx(0.5)  # (100.5-100)/1.0
 
     def test_sell_mirror(self):
         tr = _SimTracker(EngineConfig())
-        tr.open_sig = BacktestSignal(
+        tr.add(BacktestSignal(
             ts=datetime(2025, 1, 6, 7, tzinfo=UTC), direction="SELL",
             entry=100.0, sl=101.0, tp=98.0, confidence=0.6, session="london",
-        )
+        ))
         out = tr.step(self._bar(101.2, 99.9, 100.8))  # ask-side SL
-        assert out.status == "lost"
+        assert out and out[0].status == "lost"
         tr2 = _SimTracker(EngineConfig())
-        s2 = BacktestSignal(
+        tr2.add(BacktestSignal(
             ts=datetime(2025, 1, 6, 7, tzinfo=UTC), direction="SELL",
             entry=100.0, sl=101.0, tp=98.0, confidence=0.6, session="london",
-        )
-        tr2.open_sig = s2
+        ))
         out2 = tr2.step(self._bar(99.5, 97.9, 98.2))  # TP
-        assert out2.status == "won"
-        assert out2.result_r == pytest.approx(2.0)
+        assert out2 and out2[0].status == "won"
+        assert out2[0].result_r == pytest.approx(2.0)
+
+    def test_multi_entry_budget(self):
+        """D-042 — up to max_positions concurrent signals; the tracker
+        steps them all and `full` gates new entries."""
+        cfg = EngineConfig(max_positions=2)
+        tr = _SimTracker(cfg)
+        assert not tr.full
+        tr.add(self._sig())
+        tr.add(BacktestSignal(
+            ts=datetime(2025, 1, 6, 7, tzinfo=UTC), direction="SELL",
+            entry=100.0, sl=101.0, tp=98.0, confidence=0.6, session="london",
+        ))
+        assert tr.full  # budget exhausted
+        # both close on the same bar (BUY hits SL 99, SELL hits TP 98)
+        closed = tr.step(self._bar(100.5, 97.9, 99.5))
+        assert len(closed) == 2
+        assert not tr.full
 
 
 class TestRunBacktest:
