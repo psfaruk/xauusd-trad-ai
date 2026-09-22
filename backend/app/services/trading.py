@@ -53,6 +53,19 @@ USER_SETTING_FIELDS = (
     "daily_max_loss_pct", "rr", "min_sl_atr", "max_spread_points",
 )
 
+#: D-046 — upsert of the user's settings row. NOTE: the jsonb cast MUST be
+#: written as CAST(:s AS JSONB), never as a bind name glued to a double-colon
+#: cast — SQLAlchemy's text() does not treat a ':name' immediately followed
+#: by a double-colon as a bind param, so under the asyncpg dialect the named
+#: param leaks into the SQL as a literal and Postgres rejects the statement
+#: (syntax error at the stray colon). See tests/test_d044_isolation.py.
+UPSERT_USER_SETTINGS_SQL = (
+    "insert into user_accounts (owner, settings, updated_at)"
+    " values (:o, CAST(:s AS JSONB), now())"
+    " on conflict (owner) do update set"
+    " settings = excluded.settings, updated_at = now()"
+)
+
 
 @dataclass
 class TradingPlane:
@@ -686,12 +699,7 @@ class UserTradingManager:
 
         async with self._db.begin() as conn:
             await conn.execute(
-                text(
-                    "insert into user_accounts (owner, settings, updated_at)"
-                    " values (:o, :s::jsonb, now())"
-                    " on conflict (owner) do update set"
-                    " settings = excluded.settings, updated_at = now()"
-                ),
+                text(UPSERT_USER_SETTINGS_SQL),
                 {"o": owner, "s": json.dumps(clean)},
             )
         # live-apply to the plane executor if it exists

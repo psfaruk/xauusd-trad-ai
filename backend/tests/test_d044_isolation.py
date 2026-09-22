@@ -372,3 +372,108 @@ def test_confluence_has_d044_bonus_factors() -> None:
     names = [f["name"] for f in factors]
     assert "delta_confirms" in names
     assert "flow_active" in names
+
+
+# ------------------------------------------------- D-046 settings-upsert SQL
+# Production bug 2026-09-22: PUT /api/trading/settings 500'd on Postgres with
+# "syntax error at or near ':'" — text() does NOT bind ':name' when it is
+# immediately followed by a '::' cast, so ':s::jsonb' leaked into the SQL as
+# a literal while ':o' became $1. These tests pin the correct CAST() form at
+# the dialect-compile level (no live Postgres needed to catch this class).
+
+
+def test_settings_upsert_sql_binds_all_params_under_asyncpg() -> None:
+    """asyncpg dialect: every named bind must compile to $N — no leftovers."""
+    import re
+
+    from sqlalchemy import text
+    from sqlalchemy.dialects.postgresql import asyncpg
+
+    from app.services.trading import UPSERT_USER_SETTINGS_SQL
+
+    stmt = text(UPSERT_USER_SETTINGS_SQL)
+    compiled = stmt.compile(dialect=asyncpg.dialect())
+    sql = compiled.string
+    # both params converted to positional
+    assert "$1" in sql and "$2" in sql
+    # no un-converted ':name' bind survived into the SQL (the D-046 bug)
+    leftover = re.findall(r"(?<![$\w]):[a-z_]+", sql)
+    assert leftover == [], f"unbound named params leaked into SQL: {leftover}"
+    # both bind params are declared
+    assert sorted(stmt._bindparams.keys()) == ["o", "s"]
+
+
+def test_settings_upsert_sql_compiles_for_sqlite_too() -> None:
+    """The same statement must at least PARSE with named binds on sqlite
+    (tests + local runs) — guards against dialect-specific regressions."""
+    from sqlalchemy import text
+    from sqlalchemy.dialects import sqlite
+
+    from app.services.trading import UPSERT_USER_SETTINGS_SQL
+
+    stmt = text(UPSERT_USER_SETTINGS_SQL)
+    compiled = stmt.compile(dialect=sqlite.dialect())
+    assert "CAST" in compiled.string
+    assert sorted(stmt._bindparams.keys()) == ["o", "s"]
+
+
+def test_no_adjacent_cast_bindparams_in_trading_sql() -> None:
+    """Source sweep: no ':name::cast' may ever appear in trading.py —
+    SQLAlchemy text() silently drops such binds (asyncpg leak class)."""
+    import inspect
+    import re
+
+    import app.services.trading as trading_mod
+
+    src = inspect.getsource(trading_mod)
+    hits = re.findall(r":[a-z_]+\s*::[a-z_]+", src)
+    assert hits == [], f"adjacent-cast bind params found (D-046 bug class): {hits}"
+
+
+async def test_set_user_settings_executes_upsert_and_live_applies() -> None:
+    """Full path: set_user_settings must actually EXECUTE the upsert against
+    a DB (regression: the broken SQL was never exercised — db=None in all
+    prior tests — so it shipped and 500'd only in production)."""
+    import json
+    from unittest.mock import MagicMock
+
+    from app.services.trading import UPSERT_USER_SETTINGS_SQL, UserTradingManager
+
+    executed: list[tuple[str, dict]] = []
+
+    class _Conn:
+        async def execute(self, stmt, params=None, *_a, **_k):
+            executed.append((str(stmt), params or {}))
+            return MagicMock()
+
+    class _BeginCtx:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Engine:
+        def begin(self):
+            return _BeginCtx()
+
+    class _Repo:
+        async def load(self, db=None):
+            from app.engine.config import EngineConfig
+            return EngineConfig(), False
+
+    mgr = UserTradingManager(
+        settings=MagicMock(data_source="mock"), public_source=MagicMock(),
+        hub=MagicMock(), db_engine=_Engine(), config_repo=_Repo(),
+    )
+    mgr._load_account = lambda owner: None  # type: ignore[method-assign]
+
+    clean = await mgr.set_user_settings(USER_A, {"risk_percent": 1.5, "bogus": 9})
+    # validation dropped the unknown key, kept the good one
+    assert clean == {"risk_percent": 1.5}
+    # the upsert executed exactly once with the fixed SQL + serialized payload
+    assert len(executed) == 1
+    sql, params = executed[0]
+    assert UPSERT_USER_SETTINGS_SQL in sql
+    assert params["o"] == USER_A
+    assert json.loads(params["s"]) == {"risk_percent": 1.5}
