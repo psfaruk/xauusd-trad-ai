@@ -185,14 +185,20 @@ class TestConfigRoutes:
         assert r.status_code == 200
         body = r.json()
         assert body["auto_trade"] is False  # global kill switch OFF by default
-        assert body["config"]["timeframe"] == "M5"  # D-050 — M1 -> M5
-        assert body["config"]["confirm_tfs"] == ["M15"]  # D-050 single confirm
+        assert body["config"]["timeframe"] == "M1"  # D-051 — back on M1
+        assert body["config"]["confirm_tfs"] == ["M5", "M15"]  # D-041 pair
         assert body["config"]["entry_mode"] == "poi_limit"  # D-050 POI pending
         assert body["config"]["rr"] == 1.6  # D-049 fallback TP multiple
         assert body["config"]["magic"] == 234000
         # D-042 ICT block is served to the frontend
         assert body["config"]["smc_enabled"] is True
         assert body["config"]["min_confluence"] == 3  # D-049
+        # D-051 — USD pending window + trusted votes + multi-market lists
+        assert body["config"]["pending_max_usd"] == 6.0
+        assert body["config"]["pending_target_usd"] == 4.5
+        assert body["config"]["trusted_min_votes"] == 2.0
+        assert body["config"]["signal_symbols"] == ["XAUUSD", "BTCUSD"]
+        assert body["config"]["auto_trade_symbols"] == ["XAUUSD"]
         assert body["config"]["bias_tfs"] == ["H4"]
         assert body["config"]["max_positions"] == 3
         # D-049 target block + user trade budget

@@ -33,6 +33,7 @@ from app.analysis.context import (
     build_confluence,
     confluence_score,
     smart_targets,
+    trusted_score,
 )
 from app.engine.bias import direction_bias
 from app.engine.config import EngineConfig
@@ -99,6 +100,7 @@ class Evaluation:
     signal: dict | None  # full signal payload (None when no signal)
     trace: dict
     near_miss: bool  # trend+mtf+trigger passed but a later filter failed
+    pulse: dict | None = None  # D-051 — strategy-radar frame (always present)
 
 
 def closed_asof(df: pd.DataFrame, tf: str, close_time: datetime) -> pd.DataFrame:
@@ -112,6 +114,21 @@ def closed_asof(df: pd.DataFrame, tf: str, close_time: datetime) -> pd.DataFrame
 def closed_h1_asof(h1: pd.DataFrame, close_time: datetime) -> pd.DataFrame:
     """Pre-D-041 signature kept as a thin wrapper (H1 hardcoded)."""
     return closed_asof(h1, "H1", close_time)
+
+
+def _pulse_miss(pulse: dict, trace: Trace) -> None:
+    """D-051 — stamp the near-miss reason + check states into the radar
+    frame (why no signal THIS bar: which check failed, what it said)."""
+    checks = [
+        {"name": c.name, "ok": c.passed, "value": c.value}
+        for c in trace.checks
+    ]
+    pulse["checks"] = checks
+    failed = [c for c in checks if not c["ok"]]
+    if failed:
+        pulse["near_miss"] = f"{failed[-1]['name']} — {failed[-1]['value']}"
+    elif not pulse.get("near_miss"):
+        pulse["near_miss"] = "no trigger on this bar"
 
 
 def evaluate(
@@ -132,6 +149,10 @@ def evaluate(
     M15/H1/H4 structure + momentum) instead of a single H1 EMA cross;
     triggers arbitrate by QUALITY (best setup fires, not a fixed
     priority); SL/TP are predicted from structure (smart_targets v2).
+    D-051: `pulse` carries the live per-strategy state (bias, RSI, ATR,
+    whale activity, zone map, trigger candidates, near-miss reason) —
+    the caller broadcasts it every bar close so the UI shows WHICH
+    strategy is doing WHAT within seconds of the M1 close.
     """
     trace = Trace(
         params={
@@ -145,17 +166,78 @@ def evaluate(
         }
     )
 
+    # D-051 — the strategy-radar frame: enriched as the pipeline runs;
+    # EVERY return path carries it so the UI never goes blind.
+    price_now = float(base["c"].iloc[-1]) if len(base) else None
+    pulse: dict = {
+        "tf": cfg.timeframe,
+        "ts": bar_close_time.isoformat(),
+        "price": round(price_now, 2) if price_now is not None else None,
+        "bias": None,
+        "rsi": None,
+        "atr": None,
+        "spread_points": spread_points,
+        "session": None,
+        "triggers": {"sfp": False, "zone": False, "pullback": False},
+        "whale": None,
+        "candle": None,  # D-051 — closed-bar buyer/seller dominance
+        "zones": [],
+        "fired": None,
+        "near_miss": None,
+        "checks": [],
+    }
+
     # D-049 — multi-source direction bias (replaces the single-EMA gate:
     # while gold sat under H1 EMA50 the old gate locked the engine into
     # SELL-only mode — the exact complaint that started this rework).
     trend_frame = htf.get(cfg.trend_tf)
     if trend_frame is None:
-        return Evaluation(None, trace.to_dict(), near_miss=False)
+        return Evaluation(None, trace.to_dict(), near_miss=False, pulse=pulse)
     bias_verdict, _bias_score, _notes = direction_bias(htf, cfg, trace)
+    pulse["bias"] = bias_verdict
     if bias_verdict == "NEUTRAL":
         trace.direction = None  # zone entries only — both sides live
     else:
         trace.direction = bias_verdict
+
+    # D-051 — radar context: RSI/ATR values + whale activity + zone map
+    # (computed once here; the checks below reuse the same math)
+    try:
+        from app.engine.indicators import atr as _atr
+        from app.engine.indicators import rsi as _rsi
+
+        pulse["rsi"] = round(float(_rsi(base["c"], cfg.rsi_period)), 1)
+        pulse["atr"] = round(float(_atr(base, cfg.atr_period) or 0.0), 3)
+    except Exception:  # noqa: BLE001 — radar values are best-effort
+        pass
+    try:
+        from app.analysis.orderflow import whale_summary
+
+        wh = whale_summary(base.iloc[-90:], lookback=45)
+        pulse["whale"] = {
+            "bias": wh.get("bias"),
+            "buy_events": wh.get("buy_events"),
+            "sell_events": wh.get("sell_events"),
+            "last": (wh.get("last") or {}).get("note"),
+        }
+    except Exception:  # noqa: BLE001
+        pass
+    # D-051 — the just-closed M1 candle's buyer/seller story (user
+    # directive: "প্রতি সেকেন্ডে ক্যান্ডেলস্টিকের reaction আর ক্রেতা-
+    # বিক্রেতা কে dominate করছে") — the UI re-derives the same math from
+    # the FORMING bar's ticks in between closes.
+    try:
+        from app.analysis.orderflow import candle_pulse
+
+        pulse["candle"] = candle_pulse(
+            base.iloc[-1],
+            prev_close=(
+                float(base["c"].iloc[-2]) if len(base) > 1 else None
+            ),
+            vol_window=base["v"].astype(float).iloc[-31:-1],
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
     # D-048/D-049 — trigger ARBITRATION by QUALITY (user directive:
     # "সব গুলো স্ট্রাটেজি একই সময় AGREE নাও থাকতে পারে" + "best strategy"):
@@ -169,11 +251,42 @@ def evaluate(
 
         zones = poi_zones(base, htf)
 
+    # D-051 — the zone map for the strategy radar: nearest levels with
+    # their USD distance from the current price (support/resistance the
+    # user watches; "যে মার্কেট এই পজিশন থেকে এখন ডাউনের যাবে নয়তো আপে
+    # যাবে, তখনই সিগন্যাল জেনারেট হবে")
+    if price_now is not None:
+        for z in sorted(
+            zones, key=lambda z: float(z.get("quality", 0.0)), reverse=True
+        )[:3]:
+            try:
+                pulse["zones"].append({
+                    "side": z["side"],
+                    "lo": round(float(z["lo"]), 2),
+                    "hi": round(float(z["hi"]), 2),
+                    "quality": round(float(z.get("quality", 0.0)), 2),
+                    "source": z.get("source", "?"),
+                    "dist_usd": round(
+                        min(
+                            abs(price_now - float(z["lo"])),
+                            abs(price_now - float(z["hi"])),
+                        ),
+                        2,
+                    ),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+
     sig_sfp = detect_sfp(base, cfg, trace) if trace.direction else None
     sig_zone: ZoneRetestSignal | None = None
     if cfg.zone_trigger_enabled:
         sig_zone = detect_zone_retest(base, zones, cfg, bias_verdict)
     sig_pb: PullbackSignal | None = None
+    pulse["triggers"] = {
+        "sfp": sig_sfp is not None,
+        "zone": sig_zone is not None,
+        "pullback": False,
+    }
 
     trigger: str | None = None
     trigger_quality = -1.0
@@ -192,7 +305,11 @@ def evaluate(
             trigger, trigger_quality = "pullback", pullback_quality(sig_pb)
 
     if trigger is None:
-        return Evaluation(None, trace.to_dict(), near_miss=False)
+        _pulse_miss(pulse, trace)  # near_miss -> "no trigger on this bar"
+        return Evaluation(None, trace.to_dict(), near_miss=False, pulse=pulse)
+    pulse["trigger"] = trigger
+    if trigger in pulse["triggers"]:
+        pulse["triggers"][trigger] = True
     if trigger == "zone":
         assert sig_zone is not None
         trace.direction = sig_zone.direction  # signal direction wins downstream
@@ -228,7 +345,7 @@ def evaluate(
                     + " (fallback — MTF failed for the primary setup)",
                 )
             else:
-                return Evaluation(None, trace.to_dict(), near_miss=False)
+                return Evaluation(None, trace.to_dict(), near_miss=False, pulse=pulse)
     else:
         # informational posture vs the SIGNAL direction — never gates
         agreed = check_mtf(htf, trace.direction, cfg, trace)
@@ -241,8 +358,14 @@ def evaluate(
         factors = build_confluence(
             base, htf, trace.direction, candidate_entry, bar_close_time,
             max_zone_atr=cfg.max_zone_atr,
+            whale_pulse_bars=cfg.whale_pulse_bars,  # D-051 real-time window
         )
         votes = confluence_score(factors)
+        trusted = trusted_score(factors)  # D-051 — the trusted core's vote
+        pulse["factors"] = [
+            {"name": f["name"], "ok": f["ok"], "detail": f["detail"]}
+            for f in factors
+        ]
         for f in factors:
             trace.add(f["name"], f["ok"], f["detail"])
         n_gate = len([f for f in factors if f["name"] in (
@@ -256,7 +379,14 @@ def evaluate(
                 "quality-gated, count does not block)",
             )
         else:
-            confluence_ok = votes >= cfg.min_confluence
+            # D-051 — TRUSTED-VOTE GATE (user directive: "যদি কয়েকটি
+            # স্ট্যাটাজি মিলে ভোট দেয়, বিশ্বাসযোগ্য কয়েকটি স্ট্রাটেজি হতে
+            # হবে"): the full panel OR the trusted core (whale pulse counts
+            # double) — a few trusted strategies agreeing IS a signal.
+            confluence_ok = (
+                votes >= cfg.min_confluence
+                or trusted >= cfg.trusted_min_votes
+            )
             if not confluence_ok:
                 if sig_zone is not None:
                     # D-049 — same fallback as the MTF gate: a valid zone
@@ -272,15 +402,23 @@ def evaluate(
                 else:
                     trace.add(
                         "confluence", False,
-                        f"{votes}/{n_gate} ICT factors confirm"
-                        f" (need {cfg.min_confluence})",
+                        f"{votes}/{n_gate} ICT factors confirm, trusted "
+                        f"{trusted:.0f} (need {cfg.min_confluence} or "
+                        f"trusted {cfg.trusted_min_votes:.0f})",
                     )
-                    return Evaluation(None, trace.to_dict(), near_miss=True)
+                    return Evaluation(
+                        None, trace.to_dict(), near_miss=True, pulse=pulse
+                    )
             else:
+                how = (
+                    f"trusted core {trusted:.0f} votes"
+                    if trusted >= cfg.trusted_min_votes
+                    and votes < cfg.min_confluence
+                    else f"{votes} ICT factors"
+                )
                 trace.add(
                     "confluence", True,
-                    f"{votes} ICT factors confirm (need {cfg.min_confluence})"
-                    f" + {bonus_score(factors)} bonus",
+                    f"{how} confirm + {bonus_score(factors)} bonus",
                 )
 
     if trigger == "zone":
@@ -288,19 +426,24 @@ def evaluate(
     else:
         rsi_ok, rsi_value = check_rsi(base, cfg, trace)
     if not rsi_ok:
-        return Evaluation(None, trace.to_dict(), near_miss=True)
+        _pulse_miss(pulse, trace)
+        return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
     atr_ok, atr_value = check_atr(base, cfg, trace)
     if not atr_ok:
-        return Evaluation(None, trace.to_dict(), near_miss=True)
+        _pulse_miss(pulse, trace)
+        return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
     session_ok, session_name = check_session(bar_close_time, cfg, trace)
+    pulse["session"] = session_name
     if not session_ok:
-        return Evaluation(None, trace.to_dict(), near_miss=True)
+        _pulse_miss(pulse, trace)
+        return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
 
     # Rule 6 — news (pre-computed by the caller; backtests skip it)
     news = news or NewsState()
     trace.add("news", not news.blocked, news.value)
     if news.blocked:
-        return Evaluation(None, trace.to_dict(), near_miss=True)
+        _pulse_miss(pulse, trace)
+        return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
 
     # Rule 7b — spread (absolute cap)
     spread_ok = spread_points <= cfg.max_spread_points
@@ -309,7 +452,8 @@ def evaluate(
         f"spread {spread_points:.0f} points (max {cfg.max_spread_points})",
     )
     if not spread_ok:
-        return Evaluation(None, trace.to_dict(), near_miss=True)
+        _pulse_miss(pulse, trace)
+        return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
 
     if trigger == "sfp":
         assert sig_sfp is not None
@@ -383,7 +527,8 @@ def evaluate(
         # poor geometry — the nearest opposing structure sits closer than
         # min_rr x risk: the market is predicted to hit the barrier first
         trace.add("targets", False, target_note)
-        return Evaluation(None, trace.to_dict(), near_miss=True)
+        _pulse_miss(pulse, trace)
+        return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
     realized_rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
 
     # D-041 — spread vs risk: entering at ask/exiting at bid costs one
@@ -398,7 +543,8 @@ def evaluate(
         f" (max {cfg.max_spread_to_risk:.0%} of risk)",
     )
     if not spread_risk_ok:
-        return Evaluation(None, trace.to_dict(), near_miss=True)
+        _pulse_miss(pulse, trace)
+        return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
 
     trace.add(
         "targets", True,
@@ -413,6 +559,12 @@ def evaluate(
         + (1.0 if session_ok else 0.0) * W_SESSION
         + atr_strength(atr_value, cfg) * W_ATR
     ) / max(W_TREND + W_MTF + W_TRIGGER + W_RSI + W_SESSION + W_ATR, 1e-9)
+    # D-051 — the REAL-TIME whale pulse boost: big-player entries in the
+    # trade direction make the signal MORE believable (user directive:
+    # "আমি মনে করি সেই সিগন্যাল টাকে বেশি গুরুত্ব দেওয়া উচিত")
+    whale_ok = any(
+        f["name"] == "whale_pulse" and f["ok"] for f in factors
+    ) if factors else False
     if trigger == "zone":
         # D-048 — zone setups: the LOCATION + rejection carry the score;
         # the ICT factor panel and the classic filters shape it but the
@@ -439,6 +591,10 @@ def evaluate(
         )
     else:
         confidence = base_confidence
+    if whale_ok:
+        # D-051 — big players in the trade direction: the signal itself
+        # gets the extra weight (clamped to 1.0 below)
+        confidence = min(confidence + cfg.whale_confidence_boost, 1.0)
     trace_dict = trace.to_dict()
     trace_dict["trigger"] = trigger  # survives inside signals.trace JSON (D-041)
     trace_dict["confluence_factors"] = factors  # D-042 — Signal Analysis panel
@@ -459,7 +615,21 @@ def evaluate(
         "session": session_name,
         "spread_points": spread_points,
     }
-    return Evaluation(payload, trace_dict, near_miss=False)
+    # D-051 — the fired-signal summary for the strategy radar
+    pulse["fired"] = {
+        "direction": payload["direction"],
+        "entry": payload["entry"],
+        "sl": payload["sl"],
+        "tp": payload["tp"],
+        "entry_type": payload["entry_type"],
+        "market_ref": payload["market_ref"],
+        "confidence": payload["confidence"],
+        "trigger": trigger,
+        "whale": whale_ok,
+    }
+    _pulse_miss(pulse, trace)  # fills checks (+ no near-miss on a fire)
+    pulse["near_miss"] = None
+    return Evaluation(payload, trace_dict, near_miss=False, pulse=pulse)
 
 
 class SignalEngine:
@@ -550,6 +720,11 @@ class SignalEngine:
         # (user directive: "অটো ট্রেড ওপেন থাকুক বা না থাকুক সিগন্যাল আসবে" —
         # signals keep coming regardless).
         if self._in_cooldown(cfg, bar_open):
+            await self._broadcast_pulse(
+                symbol, tf, bar_close_time,
+                {"price": round(float(closed_bar["c"]), 2),
+                 "near_miss": f"cooldown — {cfg.cooldown_bars} bars after the last signal"},
+            )
             return
         active_now = tracker.active
         if callable(active_now):  # duck-typed fakes may expose a method
@@ -557,8 +732,20 @@ class SignalEngine:
         filled = [s for s in active_now if getattr(s, "status", "active") != "pending"]
         pending = [s for s in active_now if getattr(s, "status", "") == "pending"]
         if len(filled) >= max(int(cfg.max_positions), 1):
+            await self._broadcast_pulse(
+                symbol, tf, bar_close_time,
+                {"price": round(float(closed_bar["c"]), 2),
+                 "near_miss": f"position budget full ({len(filled)}/{cfg.max_positions})"},
+            )
             return
         if len(pending) >= max(int(cfg.max_pending_signals), 1):
+            await self._broadcast_pulse(
+                symbol, tf, bar_close_time,
+                {"price": round(float(closed_bar["c"]), 2),
+                 "near_miss": (
+                     f"pending budget full ({len(pending)}/"
+                     f"{cfg.max_pending_signals}) — orders awaiting fills")},
+            )
             return
 
         try:
@@ -601,6 +788,9 @@ class SignalEngine:
             base, htf, bar_close_time, cfg, self._last_spread_points, news=news,
             point_size=self._point_size,
         )
+        # D-051 — the strategy radar frame: every M1 close, signal or not,
+        # tells the UI which strategy is doing what, within seconds
+        await self._broadcast_pulse(symbol, tf, bar_close_time, ev.pulse)
         if ev.signal is None:
             if ev.near_miss and ev.trace["checks"]:
                 last = ev.trace["checks"][-1]
@@ -658,6 +848,26 @@ class SignalEngine:
             return False
         elapsed = (bar_open - self._last_signal_bar).total_seconds()
         return elapsed < cfg.cooldown_bars * TIMEFRAME_MINUTES[cfg.timeframe] * 60
+
+    async def _broadcast_pulse(
+        self, symbol: str, tf: str, bar_close_time: datetime, pulse: dict | None
+    ) -> None:
+        """D-051 — strategy_pulse WS frame (user directive: "অ্যাপ এর
+        প্রত্যেকটি স্টাডিজির ডাটা রিয়েল টাইমে সেকেন্ডের মধ্যে দেখাতে হবে").
+
+        Broadcast is best-effort — a WS hiccup must never touch the
+        engine's trading path.
+        """
+        if pulse is None:
+            return
+        try:
+            await self._hub.broadcast_all(
+                "strategy_pulse",
+                {**pulse, "symbol": symbol, "tf": tf,
+                 "ts": pulse.get("ts") or bar_close_time.isoformat()},
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("strategy_pulse broadcast failed", exc_info=True)
 
     async def _log(self, level: str, message: str) -> None:
         logger.log(getattr(logging, level.upper(), logging.INFO), "%s", message)

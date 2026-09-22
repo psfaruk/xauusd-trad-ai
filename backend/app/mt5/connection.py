@@ -191,46 +191,71 @@ class ConnectionManager:
             from app.engine.config import DEFAULT_CONFIG
 
             cfg = DEFAULT_CONFIG
+        # D-051 — one engine per market the CONFIG asks for (user
+        # directive: "বিটকয়েনের উপর কোন সিগন্যাল ... হচ্ছে না"). Market
+        # names are normalized (XAUUSDm -> XAUUSD) so the broker-suffixed
+        # primary and the platform-keyed extras never collide into
+        # duplicate runtimes for the same feed (the pre-D-051 bug).
+        from app.mt5.base import market_key
         from app.services.runtime import EngineRuntime
 
-        self.runtime = EngineRuntime(
-            source=self._source,
-            hub=self._hub,
-            repo=self._repo,
-            symbol=self.state.symbol or "XAUUSDm",
-            point_size=self.state.point_size,
-            cfg=cfg,
-            news_service=self._news,
-            trading_manager=self.trading_manager,
+        available: dict[str, str] = {}  # market key -> concrete symbol
+        available[market_key(self.state.symbol or "XAUUSDm")] = (
+            self.state.symbol or "XAUUSDm"
         )
-        await self.runtime.start()
+        for s in getattr(self._source, "platform_symbols", None) or []:
+            available.setdefault(market_key(s), s)
+        want = [m for m in cfg.signal_symbols if market_key(m) in available]
+        if not want:  # config asks for markets the source cannot stream
+            want = [market_key(self.state.symbol or "XAUUSDm")]
 
-        # D-035 — extra engine runtimes for the additional pairs the source
-        # streams (BTCUSD): every platform symbol gets its own signal engine.
-        extra_symbols = [
-            s for s in (getattr(self._source, "platform_symbols", None) or [])
-            if s and s != self.state.symbol
-        ]
-        for sym in extra_symbols:
+        point_getter = getattr(self._source, "point_size", None)
+        primary_key = market_key(self.state.symbol or "XAUUSDm")
+        for mk in want:
+            concrete = available[mk]
             point = 0.01
-            point_getter = getattr(self._source, "point_size", None)
             if callable(point_getter):
                 try:
-                    point = point_getter(sym)
+                    point = point_getter(concrete)
                 except Exception:  # noqa: BLE001 — default point is fine
                     pass
             rt = EngineRuntime(
                 source=self._source,
                 hub=self._hub,
                 repo=self._repo,
-                symbol=sym,
+                symbol=concrete,
                 point_size=point,
                 cfg=cfg,
                 news_service=self._news,
                 trading_manager=self.trading_manager,
             )
             await rt.start()
-            self.runtimes[sym] = rt
+            if mk == primary_key:
+                self.runtime = rt  # the app-state runtime stays the primary
+            else:
+                self.runtimes[mk] = rt
+        logger.info(
+            "engine runtimes started: %s (primary %s)",
+            ", ".join(want), self.state.symbol,
+        )
+
+    async def apply_config(self, cfg: Any) -> None:
+        """D-051 — live config update: every running engine follows AND the
+        market set reconciles (a changed signal_symbols list starts/stops
+        the per-market runtimes without a restart)."""
+        if self.runtime is not None:
+            await self.runtime.apply_config(cfg)
+        for rt in list(self.runtimes.values()):
+            await rt.apply_config(cfg)
+        from app.mt5.base import market_key
+
+        current = {market_key(self.runtime.symbol)} if self.runtime else set()
+        current |= {mk for mk in self.runtimes}
+        want = {market_key(m) for m in cfg.signal_symbols}
+        if want and current != want:
+            # the market SET changed — rebuild the runtimes (connect state
+            # is untouched; only the engines restart)
+            await self._start_runtime()
 
     async def _stop_runtime(self) -> None:
         if self.runtime is not None:

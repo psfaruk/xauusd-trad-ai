@@ -146,7 +146,56 @@ const ENGINE_NUM_FIELDS: { key: keyof EngineConfig; label: string; hint?: string
   { key: "max_spread_points", label: "Max spread (points)" },
   { key: "cooldown_bars", label: "Cooldown (bars)" },
   { key: "expiry_bars", label: "Expiry (bars)" },
+  { key: "trusted_min_votes", label: "Trusted votes", hint: "D-051: trusted core (whale ×2, M1 structure, sweep, zone) fires the signal", step: "0.5" },
+  { key: "pending_target_usd", label: "Pending target $", hint: "preferred entry distance from market", step: "0.5" },
+  { key: "pending_max_usd", label: "Pending max $", hint: "hard cap — orders further than this never fill", step: "0.5" },
 ];
+
+/** D-051 — the markets on offer (broker suffixes normalize server-side). */
+const MARKETS = ["XAUUSD", "BTCUSD"];
+
+function MarketToggles({
+  label, hint, options, value, onChange, disabled,
+}: {
+  label: string;
+  hint: string;
+  options: string[];
+  value: string[];
+  onChange: (next: string[]) => void;
+  disabled?: boolean;
+}) {
+  const toggle = (m: string) => {
+    const has = value.includes(m);
+    if (has && value.length === 1) return; // never empty
+    onChange(has ? value.filter((v) => v !== m) : [...value, m]);
+  };
+  return (
+    <div className="min-w-0 rounded-xl border border-zinc-800/70 bg-zinc-900/40 px-3 py-2.5">
+      <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">{label}</p>
+      <p className="mb-2 mt-0.5 text-[10px] leading-relaxed text-zinc-500">{hint}</p>
+      <div className="flex flex-wrap gap-1.5">
+        {options.map((m) => {
+          const on = value.includes(m);
+          return (
+            <button
+              key={m}
+              type="button"
+              disabled={disabled}
+              onClick={() => toggle(m)}
+              className={`rounded-full border px-3 py-1 text-[11px] font-bold tracking-wide transition-colors disabled:opacity-50 ${
+                on
+                  ? "border-gold/50 bg-gold/15 text-gold"
+                  : "border-zinc-700 bg-zinc-800/60 text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              {on ? "✓ " : ""}{m}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function EngineCard({ token, isAdmin }: { token: string; isAdmin: boolean }) {
   const [cfg, setCfg] = useState<EngineConfig | null>(null);
@@ -206,6 +255,30 @@ function EngineCard({ token, isAdmin }: { token: string; isAdmin: boolean }) {
         {" "}{cfg.trend_tf} sets the trend, {(cfg.confirm_tfs ?? []).join(" + ") || "higher TFs"} must
         confirm, then an M1 pattern (liquidity sweep or trend pullback) triggers the entry.
       </p>
+
+      {/* D-051 — per-market controls: which markets SIGNAL, which EXECUTE */}
+      <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <MarketToggles
+          label="Signal markets"
+          hint="One engine per market — signals always generate, auto-trade or not."
+          options={MARKETS}
+          value={cfg.signal_symbols ?? ["XAUUSD"]}
+          disabled={!isAdmin}
+          onChange={(next) => {
+            // execution markets must stay a subset of the signal set
+            const exec = (cfg.auto_trade_symbols ?? []).filter((m) => next.includes(m));
+            patch({ signal_symbols: next, auto_trade_symbols: exec.length ? exec : next.slice(0, 1) });
+          }}
+        />
+        <MarketToggles
+          label="Auto-trade markets"
+          hint="Orders execute ONLY here (users activate which markets auto-trade runs on)."
+          options={cfg.signal_symbols ?? MARKETS}
+          value={cfg.auto_trade_symbols ?? []}
+          disabled={!isAdmin}
+          onChange={(next) => patch({ auto_trade_symbols: next })}
+        />
+      </div>
 
       <div className="grid grid-cols-2 gap-2">
         {ENGINE_NUM_FIELDS.map((f) => (

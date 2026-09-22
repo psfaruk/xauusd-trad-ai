@@ -13,7 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.mt5.base import validate_tf
+from app.mt5.base import market_key, validate_tf
 
 logger = logging.getLogger("xauusd.engine")
 
@@ -57,23 +57,33 @@ class EngineConfig(BaseModel):
     supply/demand zones must confirm with >= min_confluence votes;
     SL/TP are zone-aware (app-controlled exits), and up to max_positions
     signals/entries can run CONCURRENTLY (multi-entry directive).
-    D-050: the base timeframe moved to M5 (user directive: short-term
-    trading off the 5-minute chart) and every signal becomes a PENDING
-    LIMIT order placed at a structural POI level BEYOND the current
-    market — BUY limits BELOW the nearest demand (support) zone, SELL
-    limits ABOVE the nearest supply (resistance) zone (user directive:
-    "মার্জিন" between market and entry so noise cannot stop out the
-    trade straight away).
+    D-050: every signal becomes a PENDING LIMIT order placed at a
+    structural POI level BEYOND the current market — BUY limits BELOW the
+    nearest demand (support) zone, SELL limits ABOVE the nearest supply
+    (resistance) zone (user directive: "মার্জিন" between market and entry
+    so noise cannot stop out the trade straight away).
+    D-051 (user directives, Bengali): the base timeframe is BACK on M1
+    ("আগে অ্যাপ এ এক মিনিটের টাইম ফ্রেম এর উপর ভিত্তি করে সিগন্যাল আসতো.
+    ওটাই টিক টিক ছিলো" — the M1 profile is the one that produced
+    signals, M5 starved the flow); pending entries clamp to a 4-6 USD
+    distance from the market ("সর্বোচ্চ 4 থেকে 6 usd উপরে অথবা নিচে
+    পেন্ডিং অর্ডার বসাবেন ... অবশ্যই এক মিনিটের ক্যান্ডেল দেখে এন্ট্রি
+    বসাবেন"); a few TRUSTED strategies voting together is enough
+    ("বিশ্বাসযোগ্য কয়েকটি স্ট্র্যাটেজি" + real-time big buyer/seller
+    weighting); BTCUSD signals + per-market auto-trade control; every
+    strategy's state streams to the UI in real time (strategy_pulse WS
+    frame each bar close).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    timeframe: str = "M5"     # trigger timeframe (D-050: M1 -> M5, user
-    #                                  directive: short-term trading on the
-    #                                  5-minute chart)
+    timeframe: str = "M1"     # trigger timeframe (D-051: back to M1 — the
+    #                                  user's signals came on the 1-minute
+    #                                  chart; every pending entry is placed
+    #                                  off the M1 candle)
     trend_tf: str = "H1"      # major trend timeframe
     confirm_tfs: list[str] = Field(
-        default_factory=lambda: ["M15"],
+        default_factory=lambda: ["M5", "M15"],
         description="MTF confirmation timeframes — each must be > timeframe",
     )
     min_tf_agree: int = Field(
@@ -89,8 +99,9 @@ class EngineConfig(BaseModel):
     rsi_sell_min: float = Field(35.0, ge=0, le=100)
     rsi_sell_max: float = Field(60.0, ge=0, le=100)
     atr_period: int = Field(14, ge=1)
-    min_atr: float = Field(0.25, ge=0)   # M5 ATR floor (D-050: 0.15 M1 ->
-    #                                    0.25 M5 recalibration)
+    min_atr: float = Field(0.15, ge=0)   # M1 ATR floor (D-051: back to the
+    #                                    M1 calibration that produced the
+    #                                    user's original signal flow)
     sfp_lookback: int = Field(20, ge=2)
     sfp_wick_atr_ratio: float = Field(0.35, gt=0)
     sl_buffer_atr: float = Field(0.2, ge=0)
@@ -98,9 +109,10 @@ class EngineConfig(BaseModel):
         description="TP multiple used ONLY when no structural target "
                     "sits within tp_max_r — the primary TP is predicted "
                     "from the nearest opposing zone/liquidity/TPO level")
-    expiry_bars: int = Field(36, ge=1)  # D-050: 3h on M5 (was 45 M1)
-    #                                     # — structure TPs need room to be
-    #                                     # HIT, not expire mid-flight
+    expiry_bars: int = Field(45, ge=1)  # D-051: 45 min on M1 (the profile
+    #                                     # that produced the user's original
+    #                                     # signal flow) — structure TPs get
+    #                                     # room to be HIT, not expire mid-flight
     cooldown_bars: int = Field(4, ge=0)
     # -------------------------------------------------- D-041 pullback trigger
     pullback_enabled: bool = True
@@ -221,26 +233,45 @@ class EngineConfig(BaseModel):
         0.35, gt=0,
         description="minimum distance (ATRs) between the current market "
                     "and a pending entry — the 'মার্জিন' that keeps noise "
-                    "away from the fill (plus 2 spreads, whichever is "
-                    "larger)",
+                    "away from the fill (plus 2 spreads and entry_min_usd, "
+                    "whichever is larger)",
+    )
+    entry_min_usd: float = Field(
+        1.0, gt=0,
+        description="D-051 — absolute USD floor for the pending-entry "
+                    "distance (the ATR floor collapses on quiet M1 bars; "
+                    "an entry closer than this fills on pure spread noise)",
     )
     pending_offset_atr: float = Field(
         0.8, gt=0,
         description="fallback pending distance (ATRs) when no same-side "
                     "POI zone sits within reach of the market",
     )
+    pending_target_usd: float = Field(
+        4.5, gt=0,
+        description="D-051 — preferred pending distance in USD when no "
+                    "same-side POI zone anchors the entry (user directive: "
+                    "'সর্বোচ্চ 4 থেকে 6 usd উপরে অথবা নিচে পেন্ডিং অর্ডার "
+                    "বসাবেন' — 4-6 USD away so the order actually books)",
+    )
     pending_max_atr: float = Field(
-        10.0, gt=0,
-        description="maximum pending distance (ATRs) — a zone deeper than "
-                    "this clamps the entry so fills stay realistic "
-                    "(D-050: ~10 USD at M5 ATR 1.0 — the user's worked "
-                    "example: market 4513, BUY at 4503)",
+        15.0, gt=0,
+        description="maximum pending distance (ATRs) — secondary cap; "
+                        "the USD cap below normally binds first (D-051)",
+    )
+    pending_max_usd: float = Field(
+        6.0, gt=0,
+        description="D-051 — HARD USD cap on the pending-entry distance "
+                    "from the market (user directive: at most 4-6 USD — "
+                    "orders further than this simply never fill; the M1 "
+                    "candle decides the exact anchor inside the cap)",
     )
     pending_expiry_bars: int = Field(
-        24, ge=1,
+        60, ge=1,
         description="how many engine-TF bars a PENDING signal may wait for "
-                    "its fill before expiring unfilled (2h on M5) — an "
-                    "unfilled order is a MISSED trade, never a loss",
+                    "its fill before expiring unfilled (1h on M1 — a 4-6 "
+                    "USD retrace takes its time; an unfilled order is a "
+                    "MISSED trade, never a loss)",
     )
     max_pending_signals: int = Field(
         6, ge=1,
@@ -249,6 +280,74 @@ class EngineConfig(BaseModel):
                     "clog the signal flow (user directive: signals must "
                     "keep coming)",
     )
+    # -------------------------------------------------- D-051 trusted-vote block
+    trusted_min_votes: float = Field(
+        2.0, ge=1.0, le=6.0,
+        description="D-051 — a few TRUSTED strategies voting together is "
+                    "enough (user directive: 'যদি কয়েকটি স্ট্যাটাজি মিলে "
+                    "ভোট দেয়, বিশ্বাসযোগ্য কয়েকটি স্ট্রাটেজি হতে হবে'): "
+                    "when the trusted core (real-time whale pulse counts "
+                    "DOUBLE, M1 structure, liquidity sweep, POI zone) "
+                    "reaches this score the signal fires even if the full "
+                    "ICT panel is short of min_confluence",
+    )
+    whale_pulse_bars: int = Field(
+        3, ge=1, le=10,
+        description="D-051 — how many recent M1 bars the REAL-TIME whale "
+                    "pulse scans (user directive: 'কখন বড় ভাইয়ার এন্ট্রি "
+                    "নিলো এই বিষয়টি রিয়েল টাইমে ধরা লাগবে' — big "
+                    "buyer/seller entries must be caught as they happen)",
+    )
+    whale_confidence_boost: float = Field(
+        0.05, ge=0.0, le=0.2,
+        description="confidence bonus when the real-time whale pulse agrees "
+                    "with the trade direction (big-player entries matter "
+                    "MORE — user directive)",
+    )
+    # -------------------------------------------------- D-051 multi-market block
+    signal_symbols: list[str] = Field(
+        default_factory=lambda: ["XAUUSD", "BTCUSD"],
+        description="D-051 — markets the SIGNAL ENGINES run on (user "
+                    "directive: 'বিটকয়েনের উপর কোন সিগন্যাল ... হচ্ছে না'): "
+                    "one engine per market; signals are ALWAYS generated "
+                    "for every listed market regardless of auto-trade",
+    )
+    auto_trade_symbols: list[str] = Field(
+        default_factory=lambda: ["XAUUSD"],
+        description="D-051 — markets where AUTO-TRADE may EXECUTE orders "
+                    "(user directive: users activate which markets "
+                    "auto-trading executes on). Signals still generate for "
+                    "every signal_symbols market — only execution is gated",
+    )
+
+    @field_validator("signal_symbols", "auto_trade_symbols")
+    @classmethod
+    def _symbol_lists(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("symbol list may not be empty")
+        seen: set[str] = set()
+        out: list[str] = []
+        for s in v:
+            clean = s.strip().upper()
+            if not clean or not clean.isalnum():
+                raise ValueError(f"invalid market symbol: {s!r}")
+            if clean in seen:
+                continue  # tolerate duplicates, keep one
+            seen.add(clean)
+            out.append(clean)
+        return out
+
+    @model_validator(mode="after")
+    def _auto_trade_subset(self) -> EngineConfig:
+        # execution markets must reference markets we actually signal on
+        # (normalize broker suffixes: XAUUSDm -> XAUUSD)
+        signal_keys = {market_key(s) for s in self.signal_symbols}
+        for m in self.auto_trade_symbols:
+            if market_key(m) not in signal_keys:
+                raise ValueError(
+                    f"auto_trade_symbols entry {m!r} is not in signal_symbols"
+                )
+        return self
 
     @field_validator("timeframe", "trend_tf")
     @classmethod
@@ -358,6 +457,51 @@ _D050_PROFILE = {
     "min_atr": 0.25,
     "expiry_bars": 36,
 }
+
+#: D-051 — the exact D-050 shipped profile (M5 + 24-bar pendings). Rows
+#: still carrying it were set by the D-050 AUTO-UPGRADE (never hand-
+#: edited by the user), so they move BACK to M1 (user directive:
+#: "আগে অ্যাপ এ এক মিনিটের টাইম ফ্রেম এর উপর ভিত্তি করে সিগন্যাল আসতো.
+#: ওটাই টিক টিক ছিলো" — M5 starved the signal flow). Any user-
+#: customized value stays put, same rule as every legacy upgrade.
+_LEGACY_D051_PROFILE = {
+    "timeframe": "M5",
+    "confirm_tfs": ["M15"],
+    "min_atr": 0.25,
+    "expiry_bars": 36,
+    "pending_expiry_bars": 24,
+    "pending_max_atr": 10.0,
+}
+_D051_PROFILE = {
+    "timeframe": "M1",
+    "confirm_tfs": ["M5", "M15"],
+    "min_atr": 0.15,
+    "expiry_bars": 45,
+    "pending_expiry_bars": 60,
+    "pending_max_atr": 15.0,
+}
+
+
+def upgrade_legacy_d051(raw: dict) -> tuple[dict, bool]:
+    """D-051 — move rows still on the D-050 auto-set M5 profile BACK to
+    the M1 profile the user's signal flow came from (user directive).
+
+    Returns (payload, moved). Only a row with `entry_mode` (a D-050 row)
+    still carrying the EXACT D-050 shipped values AND no `signal_symbols`
+    key (pre-D-051) moves; anything user-customized stays forever.
+    """
+    if not isinstance(raw, dict):
+        return raw, False
+    if "signal_symbols" in raw:
+        return raw, False  # already a D-051 row
+    if "entry_mode" not in raw:
+        return raw, False  # pre-D-050 row: the d050 upgrade handles it
+    for key, want in _LEGACY_D051_PROFILE.items():
+        if raw.get(key) != want:
+            return raw, False
+    out = dict(raw)
+    out.update(_D051_PROFILE)
+    return out, True
 
 
 def upgrade_legacy_d050(raw: dict) -> tuple[dict, bool]:
@@ -517,9 +661,11 @@ class ConfigRepo:
             raw, upgraded_confluence = upgrade_legacy_confluence(raw)
             raw, moved_d049 = upgrade_legacy_d049(raw)
             raw, upgraded_d050 = upgrade_legacy_d050(raw)
+            raw, upgraded_d051 = upgrade_legacy_d051(raw)
             upgraded = (
                 upgraded_strategy or upgraded_sessions
                 or upgraded_confluence or bool(moved_d049) or upgraded_d050
+                or upgraded_d051
             )
             cfg = EngineConfig.model_validate(raw)
             if upgraded:
@@ -534,6 +680,8 @@ class ConfigRepo:
                     why.append("d049:" + "+".join(moved_d049))
                 if upgraded_d050:
                     why.append("d050:M5-profile")
+                if upgraded_d051:
+                    why.append("d051:M1-back")
                 logger.info(
                     "engine config upgraded (%s) — persisting",
                     "+".join(why) or "strategy",

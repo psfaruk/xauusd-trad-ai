@@ -385,18 +385,22 @@ def test_config_d048_defaults() -> None:
     assert DEFAULT_CONFIG.tp_min_rr == 1.2
     assert DEFAULT_CONFIG.tp_max_r == 3.0
     assert DEFAULT_CONFIG.rr == 1.6
-    assert DEFAULT_CONFIG.expiry_bars == 36  # D-050: 3h on the M5 base TF
+    assert DEFAULT_CONFIG.expiry_bars == 45  # D-051: 45 min on M1 (back)
     assert DEFAULT_CONFIG.max_spread_to_risk == 0.30
     assert DEFAULT_CONFIG.max_trades_per_day == 6
-    # D-050 — M5 short-term profile + POI pending entries
-    assert DEFAULT_CONFIG.timeframe == "M5"
-    assert DEFAULT_CONFIG.confirm_tfs == ["M15"]
-    assert DEFAULT_CONFIG.min_atr == 0.25
+    # D-051 — back on M1 (the user's signal-flow TF) + POI pending entries
+    assert DEFAULT_CONFIG.timeframe == "M1"
+    assert DEFAULT_CONFIG.confirm_tfs == ["M5", "M15"]
+    assert DEFAULT_CONFIG.min_atr == 0.15
     assert DEFAULT_CONFIG.entry_mode == "poi_limit"
-    assert DEFAULT_CONFIG.entry_offset_atr == 0.35
-    assert DEFAULT_CONFIG.pending_offset_atr == 0.8
-    assert DEFAULT_CONFIG.pending_max_atr == 10.0
-    assert DEFAULT_CONFIG.pending_expiry_bars == 24
+    # D-051 — the 4-6 USD pending window + trusted votes + multi-market
+    assert DEFAULT_CONFIG.entry_min_usd == 1.0
+    assert DEFAULT_CONFIG.pending_target_usd == 4.5
+    assert DEFAULT_CONFIG.pending_max_usd == 6.0
+    assert DEFAULT_CONFIG.trusted_min_votes == 2.0
+    assert DEFAULT_CONFIG.signal_symbols == ["XAUUSD", "BTCUSD"]
+    assert DEFAULT_CONFIG.pending_max_atr == 15.0  # USD cap binds first
+    assert DEFAULT_CONFIG.pending_expiry_bars == 60  # 1h on M1
     assert DEFAULT_CONFIG.max_pending_signals == 6
     # bounds enforced
     try:

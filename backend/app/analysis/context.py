@@ -100,6 +100,7 @@ def build_confluence(
     entry: float,                # candidate entry price
     bar_time: datetime,          # close time of the trigger bar
     max_zone_atr: float = 0.9,   # entry-to-zone proximity in ATRs
+    whale_pulse_bars: int = 3,   # D-051 — real-time whale window (M1 bars)
 ) -> list[dict]:
     """ICT/SMC confirmation factors for one candidate trade.
 
@@ -328,13 +329,64 @@ def build_confluence(
         "detail": detail,
     })
 
+    # 13 — D-051 REAL-TIME whale pulse (TRUSTED, DOUBLE vote): a big
+    # buyer/seller entered on one of the last few M1 bars (user directive:
+    # "কখন বড় ভাইয়ার এন্ট্রি নিলো এই বিষয়টি রিয়েল টাইমে ধরা লাগবে" —
+    # catching the big-player entry AS IT HAPPENS, not bars later).
+    # Momentum/absorption events on the trigger side inside the window
+    # count; sweeps count on the OPPOSITE side (a sell-side sweep IS
+    # big-buyer evidence).
+    try:
+        win = max(int(whale_pulse_bars), 1)
+        wlook = min(60, max(len(base) - 5, 6))
+        evs = of.detect_whale_events(base.iloc[-(wlook + win):], lookback=wlook)
+        win_from = base["time_utc"].iloc[-win]
+        recent = [e for e in evs if e["t"] >= win_from]
+        want_side = "buy" if want_bull else "sell"
+        pulse_ok = any(
+            e["side"] == want_side
+            or (e["kind"] == "sweep" and e["side"] != want_side)
+            for e in recent
+        )
+        if recent:
+            e = recent[-1]
+            wdetail = f"big {e['side']} {e['kind']} {e['vol_z']}z — {e['note']}"
+        else:
+            wdetail = f"no big-player entry in the last {win} M1 bars"
+    except Exception:  # noqa: BLE001 — whale pulse must never break the pipeline
+        pulse_ok, wdetail = False, "whale pulse unavailable"
+    factors.append({
+        "name": "whale_pulse",
+        "ok": bool(pulse_ok),
+        "detail": wdetail,
+    })
+
     return factors
+
+
+#: D-051 — the TRUSTED core (user directive: "যদি কয়েকটি স্ট্যাটাজি মিলে
+#: ভোট দেয়, বিশ্বাসযোগ্য কয়েকটি স্ট্রাটেজি হতে হবে"): when these
+#: strategies vote together the signal fires even if the full 6-factor
+#: ICT panel is short. The REAL-TIME whale pulse counts DOUBLE (a big
+#: buyer/seller entry is the strongest single evidence there is).
+TRUSTED_GATE = ("whale_pulse", "structure_m1", "liquidity_sweep", "zone")
+#: how many votes each trusted factor carries
+TRUSTED_WEIGHTS = {"whale_pulse": 2.0}
+
+
+def trusted_score(factors: list[dict]) -> float:
+    """D-051 — weighted votes of the TRUSTED core (whale counts double)."""
+    return sum(
+        TRUSTED_WEIGHTS.get(f["name"], 1.0)
+        for f in factors
+        if f["name"] in TRUSTED_GATE and f["ok"]
+    )
 
 
 CONFLUENCE_GATE = ("structure_m1", "htf_structure", "ob_retest",
                    "fvg_fill", "liquidity_sweep", "zone")
 CONFLUENCE_BONUS = ("volume", "killzone", "whale_bias", "delta_confirms",
-                    "flow_active", "at_tpo_level")
+                    "flow_active", "at_tpo_level", "whale_pulse")
 
 #: D-049 — the stop must survive at least this many spreads of noise
 SPREAD_FLOOR_MULT = 2.5

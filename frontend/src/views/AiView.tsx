@@ -33,6 +33,7 @@ import {
   Badge, Btn, Card, EmptyState, Field, SectionTitle, Stat, inputCls,
 } from "../components/ui";
 import { fmtTime } from "../components/SignalDetail";
+import StrategyRadar from "../components/StrategyRadar";
 
 interface Props {
   token: string;
@@ -1031,6 +1032,9 @@ export default function AiView({
   return (
     <div className="flex min-w-0 flex-col gap-3">
       <ArmCard status={autoStatus} token={token} onArmChanged={onArmChanged} />
+
+      {/* D-051 — live per-strategy state, every M1 close (all markets) */}
+      <StrategyRadar symbols={symbols} />
 
       {activeSignals.length > 0 && (
         <Card>

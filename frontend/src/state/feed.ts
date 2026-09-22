@@ -10,7 +10,9 @@
  */
 
 import { useSyncExternalStore } from "react";
-import type { Candle, Timeframe, WsBarMsg, WsTickMsg } from "../types";
+import type {
+  Candle, Timeframe, WsBarMsg, WsStrategyPulseMsg, WsTickMsg,
+} from "../types";
 
 export interface TickSnapshot {
   bid: number;
@@ -29,6 +31,9 @@ class FeedStore {
   private tickListeners = new Map<string, Set<Listener>>();
   private bars = new Map<string, Candle>();
   private barListeners = new Map<string, Set<Listener>>();
+  /** D-051 — latest strategy_pulse frame per symbol (M1-close cadence). */
+  private pulses = new Map<string, WsStrategyPulseMsg>();
+  private pulseListeners = new Map<string, Set<Listener>>();
 
   /* ------------------------------------------------------------- ingest */
 
@@ -59,6 +64,13 @@ class FeedStore {
     this.barListeners.get(key)?.forEach((l) => l());
   }
 
+  /** D-051 — strategy radar frame from the engine (every M1 close). */
+  pushPulse(msg: WsStrategyPulseMsg): void {
+    if (!msg.symbol) return;
+    this.pulses.set(msg.symbol, msg);
+    this.pulseListeners.get(msg.symbol)?.forEach((l) => l());
+  }
+
   /** Drop all fast state for a symbol (symbol switch / disconnect). */
   clearSymbol(symbol: string): void {
     this.ticks.delete(symbol);
@@ -74,8 +86,10 @@ class FeedStore {
   clearAll(): void {
     this.ticks.clear();
     this.bars.clear();
+    this.pulses.clear();
     this.tickListeners.forEach((set) => set.forEach((l) => l()));
     this.barListeners.forEach((set) => set.forEach((l) => l()));
+    this.pulseListeners.forEach((set) => set.forEach((l) => l()));
   }
 
   /* ---------------------------------------------------------- subscribe */
@@ -108,6 +122,20 @@ class FeedStore {
     set.add(listener);
     return () => set!.delete(listener);
   }
+
+  getPulse(symbol: string): WsStrategyPulseMsg | null {
+    return this.pulses.get(symbol) ?? null;
+  }
+
+  subscribePulse(symbol: string, listener: Listener): () => void {
+    let set = this.pulseListeners.get(symbol);
+    if (!set) {
+      set = new Set();
+      this.pulseListeners.set(symbol, set);
+    }
+    set.add(listener);
+    return () => set!.delete(listener);
+  }
 }
 
 export const feed = new FeedStore();
@@ -126,6 +154,15 @@ export function useFormingBar(symbol: string, tf: Timeframe): Candle | null {
   return useSyncExternalStore(
     (cb) => feed.subscribeBar(symbol, tf, cb),
     () => feed.getBar(symbol, tf),
+    () => null,
+  );
+}
+
+/** D-051 — the latest strategy_pulse frame for a market. */
+export function usePulse(symbol: string): WsStrategyPulseMsg | null {
+  return useSyncExternalStore(
+    (cb) => feed.subscribePulse(symbol, cb),
+    () => feed.getPulse(symbol),
     () => null,
   );
 }

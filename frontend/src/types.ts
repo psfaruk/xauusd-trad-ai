@@ -260,6 +260,18 @@ export interface EngineConfig {
   max_positions: number;
   daily_max_loss_pct: number;
   magic: number;
+  /* ---------------------------------------------------------- D-051 block */
+  /** markets the SIGNAL engines run on (one engine per market). */
+  signal_symbols?: string[];
+  /** markets where AUTO-TRADE may EXECUTE (signals always generate). */
+  auto_trade_symbols?: string[];
+  /** pending-entry geometry: preferred / hard-cap USD distance. */
+  pending_target_usd?: number;
+  pending_max_usd?: number;
+  entry_min_usd?: number;
+  /** trusted-vote gate + real-time whale weighting. */
+  trusted_min_votes?: number;
+  whale_pulse_bars?: number;
 }
 
 export interface ConfigResponse {
@@ -467,6 +479,86 @@ export interface WsHeartbeatMsg {
   detail?: string;
 }
 
+/** D-051 — the just-closed M1 candle's buyer/seller story. */
+export interface PulseCandle {
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+  dir: "bull" | "bear" | "flat";
+  change: number;
+  range: number;
+  delta: number;
+  buy_pct: number;
+  sell_pct: number;
+  body_ratio: number;
+  wick: "upper" | "lower" | "none";
+  vol_ratio: number;
+  reaction: string;
+}
+
+/** D-051 — one strategy-check state inside the radar frame. */
+export interface PulseCheck {
+  name: string;
+  ok: boolean;
+  value: string | number | null;
+}
+
+/** D-051 — nearest POI zone on the radar (USD distance from price). */
+export interface PulseZone {
+  side: "demand" | "supply";
+  lo: number;
+  hi: number;
+  quality: number;
+  source: string;
+  dist_usd: number;
+}
+
+/**
+ * D-051 — strategy_pulse: every M1 close the engine streams its live
+ * per-strategy state (user directive: "অ্যাপ এর প্রত্যেকটি স্টাডিজির
+ * ডাটা রিয়েল টাইমে সেকেন্ডের মধ্যে দেখাতে হবে") — which strategy is
+ * doing WHAT, why no signal fired THIS bar, and the candle's
+ * buyer/seller dominance.
+ */
+export interface WsStrategyPulseMsg {
+  type: "strategy_pulse";
+  symbol: string;
+  tf: string;
+  ts: string;
+  price: number | null;
+  bias: "BULL" | "BEAR" | "NEUTRAL" | null;
+  rsi: number | null;
+  atr: number | null;
+  spread_points: number | null;
+  session: string | null;
+  triggers: { sfp: boolean; zone: boolean; pullback: boolean };
+  whale: {
+    bias: string | null;
+    buy_events: number | null;
+    sell_events: number | null;
+    last: string | null;
+  } | null;
+  candle: PulseCandle | null;
+  zones: PulseZone[];
+  fired: {
+    direction: "BUY" | "SELL";
+    entry: number;
+    sl: number;
+    tp: number;
+    entry_type: string;
+    market_ref: number;
+    confidence: number;
+    trigger: string;
+    whale: boolean;
+  } | null;
+  trigger?: string;
+  near_miss: string | null;
+  checks: PulseCheck[];
+  factors?: { name: string; ok: boolean; detail: string }[];
+}
+
 export type WsMessage =
   | WsTickMsg
   | WsBarMsg
@@ -478,6 +570,7 @@ export type WsMessage =
   | WsTradingAccountMsg
   | WsTradingLogMsg
   | WsMt5AutoMsg
+  | WsStrategyPulseMsg
   | WsHeartbeatMsg;
 
 /* ------------------------------------------------- D-034 real MT5 account */

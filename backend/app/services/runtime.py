@@ -89,6 +89,11 @@ class EngineRuntime:
     def running(self) -> bool:
         return self.stream.running and not self._stopped.is_set()
 
+    @property
+    def symbol(self) -> str:
+        """D-051 — the market this runtime's engine evaluates."""
+        return self._symbol
+
     async def apply_config(self, cfg: EngineConfig) -> None:
         """Live config update (PUT /api/config) — engine + stream TF follow."""
         await self.engine.apply_config(cfg)

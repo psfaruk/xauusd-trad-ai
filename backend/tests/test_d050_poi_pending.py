@@ -24,6 +24,7 @@ from app.engine.config import (
     DEFAULT_CONFIG,
     EngineConfig,
     upgrade_legacy_d050,
+    upgrade_legacy_d051,
 )
 from app.engine.engine import evaluate
 from app.engine.executor import OrderExecutor, TradeRepo
@@ -44,58 +45,63 @@ CFG = EngineConfig()
 
 def test_pending_buy_anchors_below_demand_zone() -> None:
     """BUY limit = the demand zone's LOWER edge (below the support zone).
-    The user's worked example: market 4513, BUY at ~4503."""
-    zones = [{"side": "demand", "source": "sd", "lo": 4503.0, "hi": 4506.0,
+    D-051: the zone sits 4-6 USD below the market — inside the USD window
+    the user asked for ("সর্বোচ্চ 4 থেকে 6 usd")."""
+    zones = [{"side": "demand", "source": "sd", "lo": 4508.0, "hi": 4510.0,
               "quality": 0.8, "t": None}]
     entry, note = poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=CFG)
-    assert entry == 4503.0  # zone.lo — "সাপোর্ট জোন এর নিচ"
-    assert entry < 4513.0 - CFG.entry_offset_atr  # real margin from market
+    assert entry == 4508.0  # zone.lo — "সাপোর্ট জোন এর নিচ"
+    assert 1.0 <= 4513.0 - entry <= CFG.pending_max_usd  # the USD window
     assert "demand" in note
 
 
 def test_pending_sell_anchors_above_supply_zone() -> None:
-    """SELL limit = the supply zone's UPPER edge (above the resistance)."""
-    zones = [{"side": "supply", "source": "sd", "lo": 4515.0, "hi": 4520.0,
+    """SELL limit = the supply zone's UPPER edge (above the resistance),
+    inside the 4-6 USD window."""
+    zones = [{"side": "supply", "source": "sd", "lo": 4516.0, "hi": 4518.5,
               "quality": 0.8, "t": None}]
     entry, note = poi_pending_entry("SELL", 4513.0, zones, atr=1.0, cfg=CFG)
-    assert entry == 4520.0  # zone.hi — "রেসিস্টেন্স এর উপর"
-    assert entry > 4513.0 + CFG.entry_offset_atr
+    assert entry == 4518.5  # zone.hi — "রেসিস্টেন্স এর উপর"
+    assert 1.0 <= entry - 4513.0 <= CFG.pending_max_usd
     assert "supply" in note
 
 
 def test_pending_nearest_zone_wins() -> None:
     zones = [
-        {"side": "demand", "source": "sd", "lo": 4495.0, "hi": 4498.0,
-         "quality": 0.9, "t": None},
-        {"side": "demand", "source": "ob", "lo": 4505.0, "hi": 4507.0,
-         "quality": 0.6, "t": None},
+        {"side": "demand", "source": "sd", "lo": 4500.0, "hi": 4502.0,
+         "quality": 0.9, "t": None},   # 11 USD away — deeper, better q
+        {"side": "demand", "source": "ob", "lo": 4507.5, "hi": 4509.0,
+         "quality": 0.6, "t": None},   # 5.5 USD away — nearest usable
     ]
     entry, _ = poi_pending_entry("BUY", 4513.0, zones, atr=2.0, cfg=CFG)
-    assert entry == 4505.0  # nearest usable zone, not the best quality
+    assert entry == 4507.5  # nearest usable zone, not the best quality
 
 
 def test_pending_fallback_offset_without_zone() -> None:
+    """D-051 — no usable zone: the user's preferred 4-6 USD offset."""
     entry, note = poi_pending_entry("BUY", 4513.0, [], atr=1.0, cfg=CFG)
-    assert entry == pytest.approx(4513.0 - CFG.pending_offset_atr)
+    assert entry == pytest.approx(4513.0 - CFG.pending_target_usd)
     entry_s, _ = poi_pending_entry("SELL", 4513.0, [], atr=1.0, cfg=CFG)
-    assert entry_s == pytest.approx(4513.0 + CFG.pending_offset_atr)
+    assert entry_s == pytest.approx(4513.0 + CFG.pending_target_usd)
     assert "no demand POI" in note
 
 
 def test_pending_min_offset_floor_enforced() -> None:
-    """A zone hugging the market still yields a real margin (ATR floor)."""
+    """A zone hugging the market still yields a real margin (USD floor)."""
     zones = [{"side": "demand", "source": "sd", "lo": 4512.8, "hi": 4513.0,
               "quality": 0.8, "t": None}]  # only 0.2 below the market
     entry, _ = poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=CFG)
-    assert entry <= 4513.0 - CFG.entry_offset_atr
+    assert entry <= 4513.0 - CFG.entry_min_usd  # USD floor wins
 
 
 def test_pending_deep_zone_clamps() -> None:
     zones = [{"side": "demand", "source": "sd", "lo": 4400.0, "hi": 4410.0,
               "quality": 0.9, "t": None}]  # 113 below — way beyond the cap
-    entry, _ = poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=CFG)
-    assert entry == pytest.approx(4513.0 - CFG.pending_max_atr)
+    entry, note = poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=CFG)
+    # D-051 — the USD cap binds: never further than pending_max_usd
+    assert entry == pytest.approx(4513.0 - CFG.pending_max_usd)
     assert 4513.0 - entry < 113.0  # clamped, not the full distance
+    assert "clamped" in note
 
 
 def test_pending_ignores_weak_and_opposing_zones() -> None:
@@ -106,7 +112,8 @@ def test_pending_ignores_weak_and_opposing_zones() -> None:
          "quality": 0.10, "t": None},  # too weak to anchor to
     ]
     entry, _ = poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=CFG)
-    assert entry == pytest.approx(4513.0 - CFG.pending_offset_atr)  # fallback
+    # D-051 fallback = the USD target offset
+    assert entry == pytest.approx(4513.0 - CFG.pending_target_usd)
 
 
 # ------------------------------------------------------------- evaluate path
@@ -361,11 +368,20 @@ class TestMockPendingOrders:
 # ------------------------------------------------------------------- config
 
 class TestD050Config:
-    def test_m5_profile_defaults(self):
-        assert DEFAULT_CONFIG.timeframe == "M5"
-        assert DEFAULT_CONFIG.confirm_tfs == ["M15"]
+    def test_m1_profile_defaults(self):
+        """D-051 — the engine is BACK on M1 (the user's signal-flow TF),
+        with the 4-6 USD pending window and multi-market defaults."""
+        assert DEFAULT_CONFIG.timeframe == "M1"
+        assert DEFAULT_CONFIG.confirm_tfs == ["M5", "M15"]
         assert DEFAULT_CONFIG.trend_tf == "H1"
         assert DEFAULT_CONFIG.entry_mode == "poi_limit"
+        assert DEFAULT_CONFIG.entry_min_usd == 1.0
+        assert DEFAULT_CONFIG.pending_target_usd == 4.5
+        assert DEFAULT_CONFIG.pending_max_usd == 6.0
+        assert DEFAULT_CONFIG.pending_expiry_bars == 60
+        assert DEFAULT_CONFIG.signal_symbols == ["XAUUSD", "BTCUSD"]
+        assert DEFAULT_CONFIG.auto_trade_symbols == ["XAUUSD"]
+        assert DEFAULT_CONFIG.trusted_min_votes == 2.0
 
     def test_legacy_upgrade_moves_untouched_m1_rows(self):
         raw = {"timeframe": "M1", "confirm_tfs": ["M5", "M15"],
@@ -390,6 +406,33 @@ class TestD050Config:
         out, moved = upgrade_legacy_d050(raw)
         assert not moved
 
+    def test_legacy_d051_moves_untouched_d050_rows_back_to_m1(self):
+        """D-051 — a row still on the D-050 auto-set M5 profile returns to
+        the M1 profile the user's signal flow came from."""
+        raw = {"entry_mode": "poi_limit", "timeframe": "M5",
+               "confirm_tfs": ["M15"], "min_atr": 0.25, "expiry_bars": 36,
+               "pending_expiry_bars": 24, "pending_max_atr": 10.0}
+        out, moved = upgrade_legacy_d051(raw)
+        assert moved
+        assert out["timeframe"] == "M1"
+        assert out["confirm_tfs"] == ["M5", "M15"]
+        assert out["min_atr"] == 0.15
+        assert out["expiry_bars"] == 45
+        assert out["pending_expiry_bars"] == 60
+
+    def test_legacy_d051_preserves_custom_rows(self):
+        raw = {"entry_mode": "poi_limit", "timeframe": "M15",  # user's own TF
+               "confirm_tfs": ["M15"], "min_atr": 0.25, "expiry_bars": 36,
+               "pending_expiry_bars": 24, "pending_max_atr": 10.0}
+        out, moved = upgrade_legacy_d051(raw)
+        assert not moved
+        assert out is raw
+
+    def test_legacy_d051_skips_d051_rows(self):
+        raw = {"signal_symbols": ["XAUUSD"], "timeframe": "M1"}
+        out, moved = upgrade_legacy_d051(raw)
+        assert not moved
+        assert out is raw
 
 # ------------------------------------------------------ signals-always-flow
 

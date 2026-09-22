@@ -137,8 +137,16 @@ def make_trader(client: FakeTerminal, hub: FakeHub | None = None,
                 cfg=None, market_state=None):
     hub = hub or FakeHub()
     repo = TradeRepo(None)
+    if cfg is None:
+        # D-051 — these tests exercise the LIVE plane mechanics on BTC
+        # signals; the default auto-trade market list is XAUUSD-only, so
+        # the fixtures opt BTC in explicitly (the market gate itself has
+        # its own tests below).
+        cfg = DEFAULT_CONFIG.model_copy(
+            update={"auto_trade_symbols": ["XAUUSD", "BTCUSD"]}
+        )
     trader = McpAutoTrader(
-        source=make_source(client), cfg=cfg or DEFAULT_CONFIG, repo=repo,
+        source=make_source(client), cfg=cfg, repo=repo,
         hub=hub, config_repo=None, market_state=market_state,
     )
     return trader, hub, repo
@@ -375,6 +383,34 @@ async def test_duplicate_signal_is_idempotent() -> None:
     assert len(client.orders) == 1
 
 
+async def test_market_not_enabled_skips_but_keeps_signal() -> None:
+    """D-051 (user directive: users activate WHICH markets auto-trade
+    executes on): a BTC signal against the DEFAULT XAUUSD-only list is
+    skipped honestly — the signal itself stays alive for the UI."""
+    client = FakeTerminal()
+    trader, hub, _ = make_trader(client, cfg=DEFAULT_CONFIG)
+    await trader.arm(True, owner="admin-1")
+    await trader.on_signal(dict(SIG), "BTCUSD", 0.01)
+    assert client.orders == []  # never touched the terminal
+    skip = next(
+        p for k, p in hub.events if k == "mt5_auto" and p["event"] == "skip"
+    )
+    assert "not enabled" in skip["reason"]
+    assert "BTCUSD" in skip["reason"]
+
+
+async def test_market_enabled_by_config_executes() -> None:
+    """D-051 — activating BTC in auto_trade_symbols lets the same signal
+    through (broker suffixes normalize: BTCUSDm == BTCUSD)."""
+    client = FakeTerminal()
+    cfg = DEFAULT_CONFIG.model_copy(update={"auto_trade_symbols": ["BTCUSD"]})
+    trader, _, _ = make_trader(client, cfg=cfg)
+    await trader.arm(True, owner="admin-1")
+    await trader.on_signal(dict(SIG), "BTCUSD", 0.01)
+    assert len(client.orders) == 1
+    assert client.orders[0]["symbol"] == "BTCUSDm"
+
+
 async def test_weekend_market_closed_skips_honestly() -> None:
     """The forex-weekend logic: gold closed Sat/Sun -> signal kept, NO order."""
     client = FakeTerminal()
@@ -414,7 +450,10 @@ async def test_terminal_down_at_signal_skips_not_queues() -> None:
 async def test_daily_loss_kill_switch_closes_all_and_disarms() -> None:
     """§9 emergency: real equity drop past daily_max_loss -> close-all+disarm."""
     client = FakeTerminal()
-    cfg = DEFAULT_CONFIG.model_copy(update={"daily_max_loss_pct": 3.0})
+    cfg = DEFAULT_CONFIG.model_copy(update={
+        "daily_max_loss_pct": 3.0,
+        "auto_trade_symbols": ["XAUUSD", "BTCUSD"],  # D-051 market gate
+    })
     trader, hub, _ = make_trader(client, cfg=cfg)
     await trader.arm(True, owner="admin-1")
     # first order fills; then the account bleeds below the -3% anchor

@@ -213,6 +213,39 @@ class TestOrderFlow:
         assert "momentum" in kinds  # the 2.2-body impulse bar
         assert any(e["side"] == "buy" for e in evs)
 
+    def test_candle_pulse_buyers_dominate(self):
+        """D-051 — a bar closing at its high reads as buyer dominance."""
+        bar = pd.Series(
+            {"o": 4500.0, "h": 4512.0, "l": 4499.0, "c": 4511.5, "v": 300.0}
+        )
+        cp = of.candle_pulse(bar, prev_close=4500.0)
+        assert cp["dir"] == "bull"
+        assert cp["buy_pct"] > 80.0
+        assert cp["sell_pct"] < 20.0
+        assert cp["delta"] > 0.6
+        assert "buyers dominate" in cp["reaction"]
+        assert cp["wick"] == "none"  # tiny wicks, full conviction
+
+    def test_candle_pulse_sellers_reject_the_high(self):
+        """D-051 — long upper wick = sellers rejected the high."""
+        bar = pd.Series(
+            {"o": 4500.0, "h": 4514.0, "l": 4499.0, "c": 4501.0, "v": 100.0}
+        )
+        cp = of.candle_pulse(bar)
+        assert cp["wick"] == "upper"
+        assert "upper wick" in cp["reaction"]
+        assert cp["body_ratio"] < 0.2
+
+    def test_candle_pulse_volume_spike_flagged(self):
+        """D-051 — volume >= 2x the trailing mean is flagged in the story."""
+        bar = pd.Series(
+            {"o": 4500.0, "h": 4504.0, "l": 4499.5, "c": 4503.5, "v": 500.0}
+        )
+        vols = pd.Series([80.0, 90.0, 110.0, 100.0])
+        cp = of.candle_pulse(bar, vol_window=vols)
+        assert cp["vol_ratio"] >= 4.0
+        assert "volume spike" in cp["reaction"]
+
 
 # ----------------------------------------------------------------- context
 
@@ -260,18 +293,34 @@ class TestConfluence:
 
 
 class TestEngineConfluenceGate:
-    def _run(self, min_confluence: int, spread: float = 20.0):
+    def _run(
+        self, min_confluence: int, spread: float = 20.0,
+        trusted_min_votes: float = 2.0,
+    ):
         m1 = bullish_ict_m1()
         htf = htf_frames()
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
-        cfg = EngineConfig(smc_enabled=True, min_confluence=min_confluence)
+        cfg = EngineConfig(
+            smc_enabled=True, min_confluence=min_confluence,
+            trusted_min_votes=trusted_min_votes,
+        )
         return evaluate(m1, htf, close_time, cfg, spread_points=spread)
 
     def test_high_gate_blocks(self):
-        ev = self._run(min_confluence=6)  # nothing passes ALL six
+        # D-051 — the trusted core must be unreachable for the pure
+        # full-panel-gate semantics this test pins (max trusted = 5)
+        ev = self._run(min_confluence=6, trusted_min_votes=5.5)
         assert ev.signal is None
         names = [c["name"] for c in ev.trace["checks"]]
         assert "confluence" in names
+
+    def test_trusted_votes_fire_without_full_panel(self):
+        """D-051 (user directive): a few TRUSTED strategies voting together
+        is enough — the signal fires even when the full panel is short."""
+        ev = self._run(min_confluence=6, trusted_min_votes=2.0)
+        assert ev.signal is not None, ev.trace
+        fired = ev.pulse and ev.pulse.get("fired")
+        assert fired and fired["direction"] == "BUY"
 
     def test_default_gate_emits_ict_signal(self):
         ev = self._run(min_confluence=2)

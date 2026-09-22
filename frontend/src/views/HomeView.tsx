@@ -11,6 +11,7 @@ import type {
 } from "../types";
 import { Badge, Btn, Card, Dot, SectionTitle, Skeleton, Stat } from "../components/ui";
 import { LatestSignalCard } from "../components/SignalDetail";
+import { CandlePulseCard } from "../components/StrategyRadar";
 import type { TickSnapshot } from "../state/feed";
 
 interface Props {
@@ -139,6 +140,9 @@ export default function HomeView({
       )}
 
       <PriceHero symbol={symbol} tick={tick} market={market} />
+
+      {/* D-051 — live per-candle buyer/seller dominance (tick-driven) */}
+      <CandlePulseCard symbol={symbol} />
 
       {/* AI auto trading */}
       <Card>

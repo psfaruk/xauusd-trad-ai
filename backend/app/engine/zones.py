@@ -264,13 +264,13 @@ def zone_trigger_quality(sig: ZoneRetestSignal) -> float:
 
 def poi_pending_entry(
     direction: str,  # "BUY" | "SELL"
-    market: float,  # current market reference (trigger-bar close)
+    market: float,  # current market reference (trigger-bar close — the M1 candle)
     zones: list[dict],  # ranked POI zones (app.analysis.poi.poi_zones)
     atr: float,
     cfg: EngineConfig,
     spread_price: float = 0.0,  # current spread in price units
 ) -> tuple[float, str]:
-    """D-050 — the PENDING limit-entry price + its anchor note.
+    """D-050/D-051 — the PENDING limit-entry price + its anchor note.
 
     BUY  -> a BUY LIMIT below the market anchored at the nearest DEMAND
             (support) zone's LOWER edge: "সাপোর্ট জোন এর নিচ থেকে buy order".
@@ -278,23 +278,33 @@ def poi_pending_entry(
             (resistance) zone's UPPER edge: "রেসিস্টেন্স এর উপর থেকে sell
             order".
 
-    The distance between the market and the entry is the "মার্জিন" the old
-    market-entry mode lacked — entering AT the close meant noise stopped
-    trades out immediately; a limit BEYOND the zone only fills where the
-    reaction is structurally expected, so stop-loss hits collapse.
+    D-051 (user directive: "সর্বোচ্চ 4 থেকে 6 usd উপরে অথবা নিচে পেন্ডিং
+    অর্ডার বসাবেন ... অবশ্যই এক মিনিটের ক্যান্ডেল দেখে এন্ট্রি বসাবেন"):
+    the entry distance is now USD-BOUNDED — the market reference IS the
+    M1 trigger close, the anchor is the nearest structural POI level the
+    M1 candle can see, and the distance never exceeds pending_max_usd
+    (6.0). Orders further out than that simply never book (the exact
+    complaint: "আমার মনে হয় না অর্ডার গুলো বুক করবে").
 
-    Geometry guards:
-    - minimum distance: entry_offset_atr*ATR floored at 2 spreads;
-    - maximum distance: pending_max_atr*ATR (deeper zones clamp);
+    Geometry guards (combined ATR + USD):
+    - minimum distance: max(entry_offset_atr*ATR, 2 spreads, entry_min_usd);
+    - maximum distance: min(pending_max_atr*ATR, pending_max_usd) with a
+      1.5x-minimum floor so the window is never empty;
     - zone must sit on the RIGHT side (demand below the market for BUY,
       supply above for SELL) with a quality >= 0.30;
-    - no usable zone -> plain pending_offset_atr*ATR offset.
+    - no usable zone -> the pending_target_usd offset (4.5 USD by
+      default, clamped into the window).
 
     Ties prefer the NEAREST zone (highest fill probability); the ranked
     zone list is quality-sorted, so quality is the implicit tie-break.
     """
-    min_off = max(cfg.entry_offset_atr * atr, 2.0 * spread_price)
-    max_off = max(cfg.pending_max_atr * atr, 1.5 * min_off)
+    min_off = max(
+        cfg.entry_offset_atr * atr, 2.0 * spread_price, cfg.entry_min_usd
+    )
+    max_off = max(
+        min(cfg.pending_max_atr * atr, cfg.pending_max_usd),
+        1.5 * min_off,
+    )
     want = "demand" if direction == "BUY" else "supply"
 
     best: tuple[float, float, dict] | None = None  # (dist, anchor, zone)
@@ -316,22 +326,29 @@ def poi_pending_entry(
         dist, anchor, z = best
         where = "below" if direction == "BUY" else "above"
         if dist > max_off:
+            # D-051 — clamp to the USD cap: the order stays close enough
+            # to actually book (the user's 4-6 USD window)
             entry = (market - max_off) if direction == "BUY" else (market + max_off)
             note = (
                 f"{want} POI {z['lo']:.2f}-{z['hi']:.2f} too deep "
-                f"({dist / atr:.1f} ATR) — clamped to {max_off / atr:.1f} ATR"
+                f"({dist:.2f} USD) — clamped to {max_off:.2f} USD"
+                f" (cap {cfg.pending_max_usd:.1f})"
             )
         else:
             entry = anchor
             note = (
                 f"{where} {want} POI {z['lo']:.2f}-{z['hi']:.2f} "
-                f"({z['source']}, q {float(z['quality']):.2f}) at {anchor:.2f}"
+                f"({z['source']}, q {float(z['quality']):.2f}) at {anchor:.2f} "
+                f"— {dist:.2f} USD from market"
             )
         return round(entry, 2), note
 
-    # fallback — no same-side POI in range: a plain ATR offset (still on the
-    # right side of the market, still a limit, still margin from the noise)
-    off = max(cfg.pending_offset_atr * atr, min_off)
+    # fallback — no same-side POI within the window: the user's preferred
+    # 4-6 USD offset (still on the right side, still a limit, still margin)
+    off = max(min(cfg.pending_target_usd, max_off), min_off)
     entry = (market - off) if direction == "BUY" else (market + off)
-    note = f"no {want} POI within {max_off / atr:.1f} ATR — offset {off:.2f}"
+    note = (
+        f"no {want} POI within {max_off:.2f} USD — "
+        f"offset {off:.2f} USD (target {cfg.pending_target_usd:.1f})"
+    )
     return round(entry, 2), note

@@ -115,6 +115,10 @@ export default function Dashboard() {
         case "bar_close":
           feed.pushBar(msg);
           break;
+        case "strategy_pulse":
+          // D-051 — per-strategy radar frame, every M1 close
+          feed.pushPulse(msg);
+          break;
         case "signal":
         case "signal_update":
           void queryClient.invalidateQueries({ queryKey: ["signals"] });

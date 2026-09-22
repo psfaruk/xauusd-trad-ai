@@ -93,6 +93,87 @@ def delta_proxy(bar: pd.Series) -> float:
     return pos * 2.0 - 1.0
 
 
+def candle_pulse(
+    bar: pd.Series, prev_close: float | None = None,
+    vol_window: pd.Series | None = None,
+) -> dict:
+    """D-051 — one closed candle's buyer/seller story (user directive:
+    "প্রতি সেকেন্ডে ক্যান্ডেলস্টিকের reaction আর ক্রেতা-বিক্রেতা কে
+    dominate করছে সেটা বোঝা") — streamed on the strategy_pulse frame
+    every M1 close, and recomputed in the UI from the forming bar's
+    live ticks.
+
+    Returns {o, h, l, c, v, dir, change, range, delta, buy_pct,
+    sell_pct, body_ratio, wick, vol_ratio, reaction}:
+
+    - delta / buy_pct / sell_pct — the close's position inside the
+      range, weighted by volume, maps to an estimated buy-vs-sell
+      dominance split;
+    - body_ratio — conviction (body / range);
+    - wick — the dominant REJECTION side (upper = sellers rejected
+      higher prices, lower = buyers bought the dip);
+    - vol_ratio — this bar's tick volume vs the trailing mean (a
+      spike >= 2.0 marks participation, not noise);
+    - reaction — a one-line human verdict for the radar panel.
+    """
+    o, h, lo, c = (float(bar["o"]), float(bar["h"]),
+                   float(bar["l"]), float(bar["c"]))
+    v = float(bar["v"])
+    rng = h - lo
+    delta = delta_proxy(bar)
+    buy_pct = round((delta + 1.0) / 2.0 * 100.0, 1)
+    body = abs(c - o)
+    body_ratio = (body / rng) if rng > 0 else 0.0
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - lo
+    if upper_wick > lower_wick * 1.2 and upper_wick > 0.25 * rng:
+        wick = "upper"
+    elif lower_wick > upper_wick * 1.2 and lower_wick > 0.25 * rng:
+        wick = "lower"
+    else:
+        wick = "none"
+    vol_ratio = 1.0
+    if vol_window is not None and len(vol_window) and float(vol_window.mean()) > 0:
+        vol_ratio = v / float(vol_window.mean())
+    change = c - (prev_close if prev_close is not None else o)
+
+    if rng <= 0:
+        direction, reaction = "flat", "no trade — a doji with zero range"
+    elif delta >= 0.6:
+        direction = "bull"
+        reaction = f"buyers dominate — closed near the high ({buy_pct:.0f}% buy)"
+    elif delta <= -0.6:
+        direction = "bear"
+        reaction = f"sellers dominate — closed near the low ({100 - buy_pct:.0f}% sell)"
+    elif c >= o:
+        direction = "bull"
+        reaction = f"mild buying pressure ({buy_pct:.0f}% buy)"
+    else:
+        direction = "bear"
+        reaction = f"mild selling pressure ({100 - buy_pct:.0f}% sell)"
+    if wick == "upper":
+        reaction += "; upper wick — sellers rejected the high"
+    elif wick == "lower":
+        reaction += "; lower wick — buyers absorbed the dip"
+    if vol_ratio >= 2.0:
+        reaction += f"; volume spike {vol_ratio:.1f}x"
+    return {
+        "o": round(o, 2), "h": round(h, 2),
+        "l": round(lo, 2), "c": round(c, 2),
+        "v": v,
+        "dir": direction,
+        "change": round(change, 2),
+        "range": round(rng, 2),
+        "delta": round(delta, 3),
+        "buy_pct": buy_pct,
+        "sell_pct": round(100.0 - buy_pct, 1),
+        "body_ratio": round(body_ratio, 2),
+        "wick": wick,
+        "vol_ratio": round(vol_ratio, 2),
+        "reaction": reaction,
+    }
+
+
 def cumulative_delta(df: pd.DataFrame, window: int = 0) -> float:
     """Sum of per-bar delta proxy (whole frame or trailing window)."""
     frame = df.iloc[-window:] if window > 0 else df

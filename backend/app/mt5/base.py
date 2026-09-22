@@ -31,6 +31,25 @@ TIMEFRAME_MINUTES: dict[str, int] = {
 RATES_COLUMNS = ["time_utc", "o", "h", "l", "c", "v"]
 
 
+def market_key(symbol: str) -> str:
+    """D-051 — normalize any broker symbol spelling to a market key.
+
+    "XAUUSDm" / "XAUUSDm.x" / "XAUUSD.pro" / "XAUUSD" -> "XAUUSD";
+    "BTCUSDm" -> "BTCUSD". Used to compare the executor's auto-trade
+    market list against the symbol a signal was generated for (broker
+    suffixes must never hide an enabled market).
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+    s = s.split(".")[0]
+    for suffix in ("MICRO", "PRO", "M"):
+        if s.endswith(suffix) and len(s) - len(suffix) >= 6:
+            s = s[: len(s) - len(suffix)]
+            break
+    return s
+
+
 @dataclass(frozen=True)
 class Tick:
     bid: float

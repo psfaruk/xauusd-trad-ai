@@ -396,14 +396,33 @@ class OrderExecutor:
     async def execute_signal(
         self, signal: dict, symbol: str, point_size: float
     ) -> OrderResult | None:
-        """Send one market order for `signal` after all §9 guards.
+        """Send one market or pending-limit order for `signal` after the §9
+        guards.
 
-        Returns None when skipped (kill switch / cooldown / duplicate /
-        daily budget); logs the reason via engine_log + the logs table.
+        Returns None when skipped (kill switch / market not enabled /
+        cooldown / duplicate / daily budget); logs the reason via
+        engine_log + the logs table.
         """
         async with self._lock:
             if not self.auto_trade:
                 self.last_skip_reason = "auto-trade disarmed"
+                return None
+            # D-051 — per-market auto-trade gate (user directive: users
+            # activate WHICH markets auto-trading executes on; signals
+            # still generate for every signal_symbols market).
+            from app.mt5.base import market_key
+
+            traded = signal.get("symbol") or symbol
+            enabled = {market_key(m) for m in self._cfg.auto_trade_symbols}
+            if market_key(traded) not in enabled:
+                self.last_skip_reason = (
+                    f"market {market_key(traded)} not enabled for auto-trade "
+                    f"(enabled: {', '.join(sorted(enabled))})"
+                )
+                await self._log(
+                    "info",
+                    f"auto-trade skip — {self.last_skip_reason} — signal kept",
+                )
                 return None
             signal_id = signal.get("id")
             if signal_id and await self._repo.has_trade_for_signal(signal_id, self._owner):
