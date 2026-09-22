@@ -77,13 +77,14 @@ def tpo_profile(
 
     idx_lo = np.clip(((lo - grid_lo) / bucket).astype(int), 0, n - 1)
     idx_hi = np.clip(((hi - grid_lo) / bucket).astype(int), 0, n - 1)
-    minutes = np.zeros(n, dtype=float)
-    for k in range(len(hi)):
-        a, b = int(idx_lo[k]), int(idx_hi[k])
-        if b < a:
-            a, b = b, a
-        span = b - a + 1
-        minutes[a:b + 1] += 1.0 / span  # overlap-weighted TPO minute
+    # D-048 — vectorized overlap-weighted distribution: every bar adds
+    # 1/span to each bucket it spans (range-update via bincount + cumsum;
+    # replaces the per-bar Python loop that dominated backtest runtime)
+    spans = idx_hi - idx_lo + 1
+    w = 1.0 / spans
+    add = np.bincount(idx_lo, weights=w, minlength=n + 1)
+    sub = np.bincount(idx_hi + 1, weights=w, minlength=n + 1)
+    minutes = np.cumsum(add - sub)[:n]
 
     total = float(minutes.sum())
     if total <= 0:

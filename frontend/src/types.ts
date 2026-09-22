@@ -673,6 +673,21 @@ export interface SmcZone {
   mitigated?: boolean;
 }
 
+/** D-048 — one unified POI zone (the zone-retest trigger's source). */
+export interface PoiZone {
+  side: "demand" | "supply";
+  /** sd = supply/demand base, ob = order block, fvg = fair value gap,
+   *  tpo = time-at-price level, pd = prior-day high/low */
+  source: "sd" | "ob" | "fvg" | "tpo" | "pd";
+  t: string;
+  hi: number;
+  lo: number;
+  /** 0..1 — hard-coded POI quality (impulse, freshness, age, TPO, HTF) */
+  quality: number;
+  /** true when the zone originates on M15 structure (institutional TF) */
+  htf?: boolean;
+}
+
 export interface LiquidityLevel {
   kind: "BSL" | "SSL";
   price: number;
@@ -750,6 +765,8 @@ export interface AnalysisResponse {
   flow?: FlowStats;
   /** D-047 — time-at-price profile: where the market SPENT TIME (S/R) */
   tpo?: TpoBlock;
+  /** D-048 — unified POI zones (zone-retest trigger source) */
+  poi?: { zones: PoiZone[] };
   /** D-044 — upcoming high-impact USD economic events */
   news?: NewsBlock;
   /** D-044 — weekly CFTC institutional positioning */

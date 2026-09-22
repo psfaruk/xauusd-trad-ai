@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pandas as pd
 
 # ------------------------------------------------------------------ helpers
@@ -26,11 +27,18 @@ def sma(series: pd.Series, period: int) -> pd.Series:
 
 
 def true_range(df: pd.DataFrame) -> pd.Series:
-    h, low, c = df["h"], df["l"], df["c"]
-    prev_c = c.shift(1)
-    return pd.concat(
-        [h - low, (h - prev_c).abs(), (low - prev_c).abs()], axis=1
-    ).max(axis=1)
+    """Vectorized TR (D-048): the pandas concat/max axis path this
+    replaces ran ~4700x per backtest and dominated the remaining runtime.
+    First bar: TR = high - low (matches the NaN-shift semantics)."""
+    h = df["h"].to_numpy(dtype=float)
+    low = df["l"].to_numpy(dtype=float)
+    c = df["c"].to_numpy(dtype=float)
+    prev_c = np.concatenate(([c[0]], c[:-1])) if len(c) else c
+    tr = np.maximum(
+        h - low,
+        np.maximum(np.abs(h - prev_c), np.abs(low - prev_c)),
+    )
+    return pd.Series(tr, index=df.index, dtype=float)
 
 
 def atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:

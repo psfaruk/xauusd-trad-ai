@@ -126,6 +126,7 @@ export default function PriceChart({
     whales: true,
     draw: true, // D-043 — professional auto-drawings (levels/TL/fib/notes)
     setup: true, // D-043 — entry-setup boxes
+    poi: true, // D-048 — unified POI zones (engine watchlist)
   });
   const layersRef = useRef(layers);
   layersRef.current = layers;
@@ -695,6 +696,26 @@ export default function PriceChart({
         drawZone(z, ZONE_STYLE[z.side] ?? ZONE_STYLE.demand);
       }
     }
+    // D-048 — unified POI zones: the engine's zone-retest watchlist,
+    // ranked by quality (amber = strong). Drawn from the top-level
+    // analysis payload (M1-derived, visible on every TF view).
+    if (L.poi && analysis?.poi?.zones) {
+      for (const z of analysis.poi.zones) {
+        const base = ZONE_STYLE[z.side] ?? ZONE_STYLE.demand;
+        const style = {
+          ...base,
+          // strong POIs (q >= 0.7) glow gold — the engine fires retests there
+          fill: z.quality >= 0.7 ? "rgba(212,175,55,0.16)" : base.fill,
+        };
+        drawZone(
+          { ...z, side: z.side },
+          style,
+          `${z.source.toUpperCase()}${z.htf ? "·HTF" : ""} q${
+            Math.round(z.quality * 100)
+          }`,
+        );
+      }
+    }
     if (L.ob) {
       for (const ob of snap.order_blocks ?? []) {
         drawZone(
@@ -793,6 +814,7 @@ export default function PriceChart({
   const layerChips: { key: keyof typeof layers; label: string }[] = [
     { key: "setup", label: "SETUP" },
     { key: "draw", label: "DRAW" },
+    { key: "poi", label: "POI" },
     { key: "zones", label: "S/D" },
     { key: "ob", label: "OB" },
     { key: "fvg", label: "FVG" },

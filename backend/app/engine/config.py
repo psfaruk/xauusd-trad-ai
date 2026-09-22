@@ -128,10 +128,11 @@ class EngineConfig(BaseModel):
         description="extra HTF frames whose STRUCTURE must bias the trade",
     )
     min_confluence: int = Field(
-        3, ge=0, le=6,
+        2, ge=0, le=6,
         description="how many of the 6 ICT gating factors must confirm "
-        "(D-043: 4 -> 3 — user directive for more signals; backtest grid "
-        "shows ~2x frequency at near-equal net expectancy on this spread)",
+        "(D-048: 3 -> 2 — user directive for more signals + honest smc "
+        "indexing; backtest on real 31d M1: c2 beats c3 on BOTH frequency "
+        "(40/d vs 23/d) and expectancy (expR -0.087 vs -0.107))",
     )
     max_zone_atr: float = Field(
         0.9, gt=0,
@@ -144,6 +145,26 @@ class EngineConfig(BaseModel):
     max_sl_atr: float = Field(
         3.5, gt=0,
         description="SL at most this many ATRs from entry (risk cap)",
+    )
+    # -------------------------------------------------- D-048 POI zone block
+    zone_trigger_enabled: bool = Field(
+        True,
+        description="POI zone-retest trigger (supply/demand/OB/FVG/TPO): "
+        "price returning to a QUALITY zone and rejecting IS the entry — "
+        "the ICT factor count does NOT gate this path (user directive: "
+        "not every strategy must agree at once)",
+    )
+    min_zone_quality: float = Field(
+        0.45, ge=0.0, le=1.0,
+        description="POI quality gate for a WITH-TREND zone retest signal",
+    )
+    counter_trend_quality: float = Field(
+        0.70, ge=0.0, le=1.0,
+        description="higher POI quality a COUNTER-TREND zone reversal needs",
+    )
+    zone_retest_window: int = Field(
+        2, ge=1, le=5,
+        description="bars before the trigger that may have entered the zone",
     )
 
     @field_validator("timeframe", "trend_tf")
@@ -231,7 +252,7 @@ _LEGACY_STRATEGY_DEFAULTS = {
     # D-042 ICT block
     "smc_enabled": True,
     "bias_tfs": ["H4"],
-    "min_confluence": 3,
+    "min_confluence": 2,
     "max_zone_atr": 0.9,
     "vol_z_min": 0.8,
     "max_sl_atr": 3.5,
@@ -260,6 +281,23 @@ _LEGACY_SESSIONS = [{"name": "london", "utc": [7, 16]},
 _D047_SESSIONS = [{"name": "tokyo", "utc": [0, 7]},
                   {"name": "london", "utc": [7, 16]},
                   {"name": "newyork", "utc": [13, 20]}]
+
+#: D-048 — 3 was the shipped D-043..D-047 default for min_confluence, so a
+#: row still sitting on it was never user-customized; it moves to the new
+#: default 2 (honest smc indexing + zone trigger make 2 the measured
+#: better gate). Rows on any OTHER value (4, 5, a user's 1…) stay put.
+_LEGACY_MIN_CONFLUENCE = 3
+
+
+def upgrade_legacy_confluence(raw: dict) -> tuple[dict, bool]:
+    """D-048 — move untouched old-default rows (min_confluence == 3) to 2."""
+    if not isinstance(raw, dict):
+        return raw, False
+    if raw.get("min_confluence") != _LEGACY_MIN_CONFLUENCE:
+        return raw, False
+    out = dict(raw)
+    out["min_confluence"] = 2
+    return out, True
 
 
 def upgrade_legacy_sessions(raw: dict) -> tuple[dict, bool]:
@@ -324,12 +362,20 @@ class ConfigRepo:
                 return self._mem_config, self._mem_auto_trade
             raw, upgraded = upgrade_legacy_payload(raw)
             raw, upgraded_sessions = upgrade_legacy_sessions(raw)
-            upgraded = upgraded or upgraded_sessions
+            raw, upgraded_confluence = upgrade_legacy_confluence(raw)
+            upgraded = upgraded or upgraded_sessions or upgraded_confluence
             cfg = EngineConfig.model_validate(raw)
             if upgraded:
+                why = []
+                if upgraded:  # pre-D-042 row: full strategy block moved
+                    why.append("strategy")
+                if upgraded_sessions:
+                    why.append("sessions")
+                if upgraded_confluence:
+                    why.append("confluence")
                 logger.info(
                     "engine config upgraded (%s) — persisting",
-                    "sessions+strategy" if upgraded_sessions else "strategy",
+                    "+".join(why) or "strategy",
                 )
                 await self.save(db_engine, cfg, bool(row[1]))
             self._mem_config, self._mem_auto_trade = cfg, bool(row[1])

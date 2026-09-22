@@ -62,6 +62,14 @@ from app.engine.sfp import (
     sfp_quality,
 )
 from app.engine.trace import Trace
+from app.engine.zones import (
+    ZoneRetestSignal,
+    build_levels_zone,
+    check_rsi_zone,
+    detect_zone_retest,
+    zone_retest_note,
+    zone_trigger_quality,
+)
 from app.mt5.base import TIMEFRAME_MINUTES
 
 logger = logging.getLogger("xauusd.engine")
@@ -134,18 +142,26 @@ def evaluate(
     if trend_frame is None or not check_trend(trend_frame, cfg, trace):
         return Evaluation(None, trace.to_dict(), near_miss=False)
 
-    # D-041 rule 1b — MTF confirmation (hard gate on min_tf_agree)
-    agreed = check_mtf(htf, trace.direction, cfg, trace)
-    if agreed < cfg.min_tf_agree:
-        return Evaluation(None, trace.to_dict(), near_miss=False)
-
-    # D-041 dual trigger — SFP sweep first (higher-quality pattern), then the
-    # trend-pullback rejection candle.
-    trigger: str
+    # D-048 — trigger ARBITRATION (user directive: "সব গুলো স্ট্রাটেজি
+    # একই সময় AGREE নাও থাকতে পারে"): every candidate setup is gathered
+    # first (all need only the H1 direction), then each trigger passes
+    # ITS OWN gates — the BEST available strategy fires on its own merit
+    # instead of waiting for the whole panel to agree.
     sig_sfp = detect_sfp(base, cfg, trace)
+    sig_zone: ZoneRetestSignal | None = None
+    if cfg.zone_trigger_enabled:
+        from app.analysis.poi import poi_zones
+
+        zones = poi_zones(base, htf)
+        sig_zone = detect_zone_retest(base, zones, cfg, trace.direction)
     sig_pb: PullbackSignal | None = None
+    trigger: str
     if sig_sfp is not None:
-        trigger = "sfp"
+        trigger = "sfp"  # sweep reversal — rarest, strongest pattern
+    elif sig_zone is not None:
+        trigger = "zone"  # D-048 — POI zone retest (location + rejection)
+        trace.direction = sig_zone.direction  # signal direction wins downstream
+        trace.add("zone_retest", True, zone_retest_note(sig_zone))
     elif cfg.pullback_enabled:
         sig_pb = detect_pullback(base, cfg, trace)
         if sig_pb is None:
@@ -155,6 +171,24 @@ def evaluate(
         return Evaluation(None, trace.to_dict(), near_miss=False)
 
     # After a trigger fired, every later failure is a NEAR MISS (worth a log).
+    #
+    # Per-trigger gates (D-048):
+    #   sfp / pullback — MTF confirmation + the ICT factor-count gate
+    #                    (the premium "everything aligns" setups);
+    #   zone           — the POI location + rejection IS the setup: MTF and
+    #                    the factor count NEVER block (confidence only) —
+    #                    signals at supply/demand zones must not be missed.
+    mtf_score: float
+    if trigger in ("sfp", "pullback"):
+        agreed = check_mtf(htf, trace.direction, cfg, trace)
+        if agreed < cfg.min_tf_agree:
+            return Evaluation(None, trace.to_dict(), near_miss=False)
+        mtf_score = agreed / max(len(cfg.confirm_tfs), 1)
+    else:
+        # informational posture vs the SIGNAL direction — never gates
+        agreed = check_mtf(htf, trace.direction, cfg, trace)
+        mtf_score = agreed / max(len(cfg.confirm_tfs), 1)
+
     # D-042 — ICT/SMC confluence stage (zone/OB/structure/volume votes).
     factors: list[dict] = []
     if cfg.smc_enabled:
@@ -170,21 +204,31 @@ def evaluate(
             "structure_m1", "htf_structure", "ob_retest",
             "fvg_fill", "liquidity_sweep", "zone",
         )])
-        confluence_ok = votes >= cfg.min_confluence
-        if not confluence_ok:
+        if trigger == "zone":
             trace.add(
-                "confluence", False,
-                f"{votes}/{n_gate} ICT factors confirm"
-                f" (need {cfg.min_confluence})",
+                "confluence", True,
+                f"{votes}/{n_gate} ICT factors align (zone setup — "
+                "quality-gated, count does not block)",
             )
-            return Evaluation(None, trace.to_dict(), near_miss=True)
-        trace.add(
-            "confluence", True,
-            f"{votes} ICT factors confirm (need {cfg.min_confluence})"
-            f" + {bonus_score(factors)} bonus",
-        )
+        else:
+            confluence_ok = votes >= cfg.min_confluence
+            if not confluence_ok:
+                trace.add(
+                    "confluence", False,
+                    f"{votes}/{n_gate} ICT factors confirm"
+                    f" (need {cfg.min_confluence})",
+                )
+                return Evaluation(None, trace.to_dict(), near_miss=True)
+            trace.add(
+                "confluence", True,
+                f"{votes} ICT factors confirm (need {cfg.min_confluence})"
+                f" + {bonus_score(factors)} bonus",
+            )
 
-    rsi_ok, rsi_value = check_rsi(base, cfg, trace)
+    if trigger == "zone":
+        rsi_ok, rsi_value = check_rsi_zone(base, cfg, trace)
+    else:
+        rsi_ok, rsi_value = check_rsi(base, cfg, trace)
     if not rsi_ok:
         return Evaluation(None, trace.to_dict(), near_miss=True)
     atr_ok, atr_value = check_atr(base, cfg, trace)
@@ -212,7 +256,14 @@ def evaluate(
     if sig_sfp is not None:
         entry, sl_base, _ = build_levels(sig_sfp, cfg)
         trigger_quality = sfp_quality(sig_sfp, cfg)
-        trigger_tag: SfpSignal | PullbackSignal = sig_sfp
+        trigger_tag: SfpSignal | PullbackSignal | ZoneRetestSignal = sig_sfp
+    elif sig_zone is not None:
+        # D-048 — zone retest: SL beyond the zone's far edge, then the
+        # same smart_targets pass (ATR floor/cap + TPO anchor + liquidity
+        # TP snap) every other trigger uses.
+        entry, sl_base = build_levels_zone(sig_zone, cfg)
+        trigger_quality = zone_trigger_quality(sig_zone)
+        trigger_tag = sig_zone
     else:
         assert sig_pb is not None  # for the type checker
         entry, sl_base, _ = build_levels_pullback(sig_pb, cfg)
@@ -253,7 +304,6 @@ def evaluate(
     if not spread_risk_ok:
         return Evaluation(None, trace.to_dict(), near_miss=True)
 
-    mtf_score = agreed / max(len(cfg.confirm_tfs), 1)
     base_confidence = (
         1.0 * W_TREND
         + mtf_score * W_MTF
@@ -262,7 +312,25 @@ def evaluate(
         + (1.0 if session_ok else 0.0) * W_SESSION
         + atr_strength(atr_value, cfg) * W_ATR
     ) / max(W_TREND + W_MTF + W_TRIGGER + W_RSI + W_SESSION + W_ATR, 1e-9)
-    if cfg.smc_enabled and factors:
+    if trigger == "zone":
+        # D-048 — zone setups: the LOCATION + rejection carry the score;
+        # the ICT factor panel and the classic filters shape it but the
+        # zone blend is the dominant term (best-strategy arbitration).
+        assert sig_zone is not None
+        zone_blend = zone_trigger_quality(sig_zone)
+        if cfg.smc_enabled and factors:
+            gate = confluence_score(factors) / 6.0
+            bonus = bonus_score(factors) / 6.0
+            confidence = (
+                0.50 * zone_blend
+                + 0.30 * base_confidence
+                + 0.20 * (0.7 * gate + 0.3 * bonus)
+            )
+        else:
+            confidence = 0.60 * zone_blend + 0.40 * base_confidence
+        if sig_zone.counter_trend:
+            confidence = min(confidence, 0.72)  # reversal trades stay modest
+    elif cfg.smc_enabled and factors:
         gate = confluence_score(factors) / 6.0
         bonus = bonus_score(factors) / 6.0  # D-047: 6 bonus factors
         confidence = (1.0 - W_CONFLUENCE) * base_confidence + W_CONFLUENCE * (

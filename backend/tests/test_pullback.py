@@ -135,7 +135,7 @@ class TestLegacyConfigUpgrade:
         assert up["confirm_tfs"] == ["M5", "M15"]
         assert up["rr"] == 1.1
         assert up["min_sl_atr"] == 1.5
-        assert up["min_confluence"] == 3          # D-043: more-signals directive
+        assert up["min_confluence"] == 2          # D-048: honest smc indexing gate
         assert up["max_positions"] == 3           # D-042 multi-entry default
         # user-customized risk/session values survive
         assert up["risk_percent"] == 1.0

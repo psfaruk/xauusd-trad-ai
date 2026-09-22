@@ -27,6 +27,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from app.analysis.indicators import atr as atr_last
@@ -154,89 +155,105 @@ def detect_order_blocks(df: pd.DataFrame, max_zones: int = 6,
     Bullish OB: a down-close candle whose NEXT candle's body >= impulse_atr*ATR
     and closes above the swing area — zone = the down candle's full candle
     range. Mitigated once price trades back through it.
+
+    D-048: hot path rewritten on numpy arrays (this runs on every bar
+    close for poi_zones AND build_confluence — the pandas .iloc row
+    access it replaced dominated the backtest runtime 20x over).
     """
     a = atr_series(df, 14)
     if len(df) < 20 or a.isna().all():
         return []
+    o = df["o"].to_numpy(dtype=float)
+    h = df["h"].to_numpy(dtype=float)
+    low = df["l"].to_numpy(dtype=float)
+    c = df["c"].to_numpy(dtype=float)
+    atr_np = a.to_numpy(dtype=float)
+    t_arr = df["time_utc"].to_numpy()
     out: list[dict] = []
     n = len(df)
     for k in range(2, n - 1):
-        atr_v = float(a.iloc[k]) if pd.notna(a.iloc[k]) else 0.0
+        atr_v = float(atr_np[k]) if np.isfinite(atr_np[k]) else 0.0
         if atr_v <= 0:
             continue
-        bar, nxt = df.iloc[k], df.iloc[k + 1]
-        body = abs(float(nxt["c"]) - float(nxt["o"]))
+        body = abs(c[k + 1] - o[k + 1])
         if body < impulse_atr * atr_v:
             continue
-        zone_hi = max(float(bar["o"]), float(bar["c"]))
-        zone_lo = min(float(bar["o"]), float(bar["c"]))
-        wick_hi, wick_lo = float(bar["h"]), float(bar["l"])
-        if float(bar["c"]) < float(bar["o"]) and float(nxt["c"]) > float(nxt["o"]):
-            out.append({"side": "bullish", "t": df["time_utc"].iloc[k],
-                        "hi": zone_hi, "lo": zone_lo, "wick_hi": wick_hi,
-                        "wick_lo": wick_lo, "impulse": round(body / atr_v, 2)})
-        elif float(bar["c"]) > float(bar["o"]) and float(nxt["c"]) < float(nxt["o"]):
-            out.append({"side": "bearish", "t": df["time_utc"].iloc[k],
-                        "hi": zone_hi, "lo": zone_lo, "wick_hi": wick_hi,
-                        "wick_lo": wick_lo, "impulse": round(body / atr_v, 2)})
+        zone_hi = max(o[k], c[k])
+        zone_lo = min(o[k], c[k])
+        if c[k] < o[k] and c[k + 1] > o[k + 1]:
+            out.append({"side": "bullish", "t": t_arr[k],
+                        "hi": zone_hi, "lo": zone_lo, "wick_hi": h[k],
+                        "wick_lo": low[k], "impulse": round(body / atr_v, 2)})
+        elif c[k] > o[k] and c[k + 1] < o[k + 1]:
+            out.append({"side": "bearish", "t": t_arr[k],
+                        "hi": zone_hi, "lo": zone_lo, "wick_hi": h[k],
+                        "wick_lo": low[k], "impulse": round(body / atr_v, 2)})
     # mitigation: first time price returned into the zone after formation
     # (`mit_t` — ICT retests the zone; the FIRST touch is the entry, so
     # the confluence factor accepts fresh touches, not never-touched only)
-    n = len(df)
     for ob in out:
-        idx = df.index[df["time_utc"] == ob["t"]]
-        start = int(idx[0]) + 2 if len(idx) else 0
+        k0 = _time_pos(t_arr, ob["t"])
+        start = k0 + 2 if k0 >= 0 else 0
         ob["mitigated"] = False
         ob["mit_t"] = None
-        for k in range(start, n):
-            hi, lo = float(df["h"].iloc[k]), float(df["l"].iloc[k])
-            if lo <= ob["hi"] and hi >= ob["lo"]:
+        if start < n:
+            seg_l = low[start:]
+            seg_h = h[start:]
+            mask = (seg_l <= ob["hi"]) & (seg_h >= ob["lo"])
+            hit = int(np.argmax(mask)) if mask.any() else -1
+            if hit >= 0:
                 ob["mitigated"] = True
-                ob["mit_t"] = df["time_utc"].iloc[k]
-                break
+                ob["mit_t"] = t_arr[start + hit]
     return out[-max_zones:]
 
 
-# -------------------------------------------------------- fair value gaps
+def _time_pos(t_arr: np.ndarray, t: Any) -> int:
+    """Row position of timestamp `t` in the ascending time array (-1)."""
+    i = int(np.searchsorted(t_arr, t))
+    if i < len(t_arr) and t_arr[i] == t:
+        return i
+    return -1
 
 
 def detect_fvg(df: pd.DataFrame, max_gaps: int = 8) -> list[dict]:
-    """3-candle imbalances. Bullish FVG: bar[k-1].high < bar[k+1].low."""
+    """3-candle imbalances. Bullish FVG: bar[k-1].high < bar[k+1].low.
+
+    D-048: numpy hot path (see detect_order_blocks).
+    """
     out: list[dict] = []
     n = len(df)
     if n < 3:
         return out
+    h = df["h"].to_numpy(dtype=float)
+    low = df["l"].to_numpy(dtype=float)
+    t_arr = df["time_utc"].to_numpy()
     for k in range(1, n - 1):
-        prev_hi = float(df["h"].iloc[k - 1])
-        prev_lo = float(df["l"].iloc[k - 1])
-        nxt_hi = float(df["h"].iloc[k + 1])
-        nxt_lo = float(df["l"].iloc[k + 1])
+        prev_hi, prev_lo = h[k - 1], low[k - 1]
+        nxt_hi, nxt_lo = h[k + 1], low[k + 1]
         if nxt_lo > prev_hi:
             gap = nxt_lo - prev_hi
-            out.append({"side": "bullish", "t": df["time_utc"].iloc[k],
+            out.append({"side": "bullish", "t": t_arr[k],
                         "hi": nxt_lo, "lo": prev_hi, "gap": gap,
                         "filled": False, "filled_pct": 0})
         elif nxt_hi < prev_lo:
             gap = prev_lo - nxt_hi
-            out.append({"side": "bearish", "t": df["time_utc"].iloc[k],
+            out.append({"side": "bearish", "t": t_arr[k],
                         "hi": prev_lo, "lo": nxt_hi, "gap": gap,
                         "filled": False, "filled_pct": 0})
     # fill check: when did price first trade through the gap's near edge
-    n = len(df)
     for g in out:
-        idx = df.index[df["time_utc"] == g["t"]]
-        start = int(idx[0]) + 2 if len(idx) else 0
+        k0 = _time_pos(t_arr, g["t"])
+        start = k0 + 2 if k0 >= 0 else 0
         g["fill_t"] = None
-        for k in range(start, n):
-            lo, hi = float(df["l"].iloc[k]), float(df["h"].iloc[k])
-            if g["side"] == "bullish" and lo <= g["lo"]:
+        if start < n:
+            if g["side"] == "bullish":
+                mask = low[start:] <= g["lo"]
+            else:
+                mask = h[start:] >= g["hi"]
+            hit = int(np.argmax(mask)) if mask.any() else -1
+            if hit >= 0:
                 g["filled"] = True
-                g["fill_t"] = df["time_utc"].iloc[k]
-                break
-            if g["side"] == "bearish" and hi >= g["hi"]:
-                g["filled"] = True
-                g["fill_t"] = df["time_utc"].iloc[k]
-                break
+                g["fill_t"] = t_arr[start + hit]
     return [g for g in out if g["gap"] > 0][-max_gaps:]
 
 
@@ -272,8 +289,11 @@ def detect_liquidity(df: pd.DataFrame, tol_atr: float = 0.15,
             i -= 1
     # prior-day high/low as classic liquidity draws
     if "time_utc" in df and len(df) > 2:
-        last_day = pd.Timestamp(df["time_utc"].iloc[-1]).date()
-        prev = df[[pd.Timestamp(t).date() != last_day for t in df["time_utc"]]]
+        t_ser = pd.Series(pd.to_datetime(df["time_utc"]))
+        last_day = t_ser.iloc[-1].date()
+        # D-048: vectorized day mask (the per-row Timestamp loop this
+        # replaced ran on every bar close)
+        prev = df[t_ser.dt.date.to_numpy() != last_day]
         if len(prev):
             levels.append({"kind": "BSL", "price": float(prev["h"].max()),
                            "t": prev["time_utc"].iloc[-1], "hits": 1,
@@ -305,38 +325,48 @@ def detect_supply_demand(df: pd.DataFrame, max_zones: int = 4) -> list[dict]:
     Demand: the last down candle before an up impulse that set a swing
     high. Supply: mirror. Zones use the base candle range (wick-to-wick
     for the origin side).
+
+    D-048: numpy hot path (see detect_order_blocks) + impulse strength
+    of the launching move (POI quality input).
     """
     a = atr_series(df, 14)
     out: list[dict] = []
     n = len(df)
     if n < 30:
         return out
+    o = df["o"].to_numpy(dtype=float)
+    h = df["h"].to_numpy(dtype=float)
+    low = df["l"].to_numpy(dtype=float)
+    c = df["c"].to_numpy(dtype=float)
+    atr_np = a.to_numpy(dtype=float)
+    t_arr = df["time_utc"].to_numpy()
     for k in range(3, n - 1):
-        atr_v = float(a.iloc[k]) if pd.notna(a.iloc[k]) else 0.0
+        atr_v = float(atr_np[k]) if np.isfinite(atr_np[k]) else 0.0
         if atr_v <= 0:
             continue
-        base, nxt = df.iloc[k], df.iloc[k + 1]
-        body = abs(float(nxt["c"]) - float(nxt["o"]))
+        body = abs(c[k + 1] - o[k + 1])
         if body < 1.5 * atr_v:
             continue
-        if float(nxt["c"]) > float(nxt["o"]) and float(base["c"]) < float(base["o"]):
-            out.append({"side": "demand", "t": df["time_utc"].iloc[k],
-                        "hi": float(base["h"]), "lo": float(base["l"])})
-        elif float(nxt["c"]) < float(nxt["o"]) and float(base["c"]) > float(base["o"]):
-            out.append({"side": "supply", "t": df["time_utc"].iloc[k],
-                        "hi": float(base["h"]), "lo": float(base["l"])})
+        if c[k + 1] > o[k + 1] and c[k] < o[k]:
+            out.append({"side": "demand", "t": t_arr[k],
+                        "hi": h[k], "lo": low[k],
+                        "impulse": round(body / atr_v, 2)})
+        elif c[k + 1] < o[k + 1] and c[k] > o[k]:
+            out.append({"side": "supply", "t": t_arr[k],
+                        "hi": h[k], "lo": low[k],
+                        "impulse": round(body / atr_v, 2)})
     # drop zones fully traded through (broken)
     kept: list[dict] = []
     for z in out:
-        idx = df.index[df["time_utc"] == z["t"]]
-        start = int(idx[0]) + 2 if len(idx) else 0
+        k0 = _time_pos(t_arr, z["t"])
+        start = k0 + 2 if k0 >= 0 else 0
         broken = False
-        for k in range(start, n):
-            c = float(df["c"].iloc[k])
-            if z["side"] == "demand" and c < z["lo"]:
-                broken = True
-            if z["side"] == "supply" and c > z["hi"]:
-                broken = True
+        if start < n:
+            seg = c[start:]
+            if z["side"] == "demand":
+                broken = bool((seg < z["lo"]).any())
+            else:
+                broken = bool((seg > z["hi"]).any())
         if not broken:
             kept.append(z)
     return kept[-max_zones:]

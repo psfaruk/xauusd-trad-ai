@@ -112,6 +112,22 @@ class AnalysisService:
         except Exception:  # noqa: BLE001 — TPO must never break the snapshot
             payload["tpo"] = {"poc": None, "va_lo": None, "va_hi": None,
                               "va_minutes": 0.0, "total_minutes": 0.0, "levels": []}
+        # D-048 — unified POI zone list (the zone-retest trigger's source):
+        # supply/demand bases, order blocks, FVGs, TPO levels and PDH/PDL
+        # ranked by hard-coded quality — chart overlay + AI panel + engine
+        try:
+            from app.analysis.poi import poi_zones
+
+            payload["poi"] = {
+                "zones": (
+                    poi_zones(frames["M1"],
+                              {tf: f for tf, f in frames.items() if tf != "M1"},
+                              max_zones=8)
+                    if frames.get("M1") is not None else []
+                ),
+            }
+        except Exception:  # noqa: BLE001 — POI must never break the snapshot
+            payload["poi"] = {"zones": []}
         # D-044 — news events + weekly institutional positioning
         payload["news"] = await self._news_block()
         payload["cot"] = await self._cot_block()

@@ -7,6 +7,7 @@ on bar close only — SPEC §8.2).
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 
@@ -32,9 +33,17 @@ def rsi(closes: pd.Series, period: int = 14) -> float:
 
 
 def true_range(df: pd.DataFrame) -> pd.Series:
-    h, low, c = df["h"], df["l"], df["c"]
-    prev_c = c.shift(1)
-    return pd.concat([h - low, (h - prev_c).abs(), (low - prev_c).abs()], axis=1).max(axis=1)
+    """Vectorized TR (D-048 — hot path: called by every trigger detector
+    on every bar close)."""
+    h = df["h"].to_numpy(dtype=float)
+    low = df["l"].to_numpy(dtype=float)
+    c = df["c"].to_numpy(dtype=float)
+    prev_c = np.concatenate(([c[0]], c[:-1])) if len(c) else c
+    tr = np.maximum(
+        h - low,
+        np.maximum(np.abs(h - prev_c), np.abs(low - prev_c)),
+    )
+    return pd.Series(tr, index=df.index, dtype=float)
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> float:

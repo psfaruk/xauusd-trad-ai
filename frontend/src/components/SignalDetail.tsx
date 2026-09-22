@@ -132,7 +132,11 @@ export function SignalDetail({ signal }: { signal: Signal }) {
         <Badge tone="zinc">{signal.symbol} · {signal.tf}</Badge>
         <Badge tone={statusTone(signal.status)}>{signal.status}</Badge>
         <Badge tone="blue">
-          {trigger === "sfp" ? "Liquidity Sweep" : "Trend Pullback"}
+          {trigger === "sfp"
+            ? "Liquidity Sweep"
+            : trigger === "zone"
+              ? "POI Zone Retest"
+              : "Trend Pullback"}
         </Badge>
         <span className="ml-auto text-[11px] text-zinc-500">{fmtTime(signal.ts)}</span>
       </div>
