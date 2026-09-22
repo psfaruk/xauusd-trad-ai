@@ -629,6 +629,21 @@ export interface NewsBlock {
   available?: boolean;
 }
 
+/** D-047 — time-at-price profile: levels where the market SPENT TIME */
+export interface TpoBlock {
+  poc?: number | null;
+  va_lo?: number | null;
+  va_hi?: number | null;
+  va_minutes?: number;
+  total_minutes?: number;
+  levels?: {
+    price: number;
+    minutes: number;
+    side: "support" | "resistance";
+    strength: number;
+  }[];
+}
+
 export interface CotBlock {
   report_date?: string;
   open_interest?: number;
@@ -733,6 +748,8 @@ export interface AnalysisResponse {
   drawings?: ChartDrawing[];
   /** D-044 — order-flow statistics (USD value, delta, whale zones) */
   flow?: FlowStats;
+  /** D-047 — time-at-price profile: where the market SPENT TIME (S/R) */
+  tpo?: TpoBlock;
   /** D-044 — upcoming high-impact USD economic events */
   news?: NewsBlock;
   /** D-044 — weekly CFTC institutional positioning */

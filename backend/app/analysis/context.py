@@ -16,7 +16,7 @@ import pandas as pd
 
 from app.analysis import indicators as ind
 from app.analysis import orderflow as of
-from app.analysis import smc
+from app.analysis import smc, tpo
 
 # timeframes the /api/analysis endpoint reports by default
 ANALYSIS_TFS: tuple[str, ...] = ("M1", "M5", "M15", "H1", "H4")
@@ -304,13 +304,37 @@ def build_confluence(
         "detail": detail,
     })
 
+    # 12 — D-047 time-at-price level (bonus, not gating): the entry forms
+    # AT a price level where the market SPENT TIME (TPO high-time node) —
+    # support under a BUY, resistance over a SELL. Levels the market kept
+    # returning to are where professionals expect a reaction.
+    try:
+        prof = tpo.tpo_profile(base, lookback_minutes=1440)
+        want_side = "support" if want_bull else "resistance"
+        side_levels = [lv for lv in prof["levels"] if lv["side"] == want_side]
+        near = tpo.nearest_level(side_levels, entry, max_dist=0.5 * a)
+        tpo_ok = near is not None
+        detail = (
+            f"entry at {want_side} TPO {near['price']:.2f}"
+            f" ({near['minutes']:.0f}m of time held there)"
+            if near else
+            f"no {want_side} time-at-price level within {0.5 * a:.2f}"
+        )
+    except Exception:  # noqa: BLE001 — TPO math must never break the pipeline
+        tpo_ok, detail = True, "TPO unavailable"
+    factors.append({
+        "name": "at_tpo_level",
+        "ok": bool(tpo_ok),
+        "detail": detail,
+    })
+
     return factors
 
 
 CONFLUENCE_GATE = ("structure_m1", "htf_structure", "ob_retest",
                    "fvg_fill", "liquidity_sweep", "zone")
 CONFLUENCE_BONUS = ("volume", "killzone", "whale_bias", "delta_confirms",
-                    "flow_active")
+                    "flow_active", "at_tpo_level")
 
 
 def confluence_score(factors: list[dict]) -> int:
@@ -333,11 +357,16 @@ def smart_targets(
     rr: float,
     min_sl_atr: float,
     max_sl_atr: float,
+    tpo_levels: list[dict] | None = None,  # D-047 time-at-price levels
 ) -> tuple[float, float, float]:
     """Zone-aware (entry, sl, tp) — app-controlled exits (user directive).
 
     SL: the structural invalidation (sweep extreme / swing / zone edge),
     floored at min_sl_atr*ATR and capped at max_sl_atr*ATR from entry.
+    D-047: when a STRONG time-at-price level sits beyond the structural
+    SL, the stop is extended JUST PAST it (a stop resting in front of a
+    price the market kept returning to gets swept) — never wider than
+    max_sl_atr.
     TP: rr * risk, snapped just in front of the nearest opposing
     liquidity pool when one sits inside [0.75, 1.6]x risk (ICT: price
     is drawn to liquidity).
@@ -356,6 +385,26 @@ def smart_targets(
     if risk <= 0:  # pathological (cap below floor) — fall back to floor
         sl = entry - min_sl_atr * a if want_bull else entry + min_sl_atr * a
         risk = min_sl_atr * a
+
+    # --- D-047 TPO anchoring: extend the stop past a strong level that
+    # sits beyond it (BUY: supports below sl; SELL: resistances above sl)
+    if tpo_levels:
+        strong = [lv for lv in tpo_levels if float(lv.get("strength", 0)) >= 0.5]
+        pad = 0.15 * a
+        if want_bull:
+            below = [float(lv["price"]) for lv in strong if lv["price"] < sl]
+            if below:
+                cand = min(below) - pad
+                if entry - cand <= max_sl_atr * a:
+                    sl = cand
+                    risk = entry - sl
+        else:
+            above = [float(lv["price"]) for lv in strong if lv["price"] > sl]
+            if above:
+                cand = max(above) + pad
+                if cand - entry <= max_sl_atr * a:
+                    sl = cand
+                    risk = sl - entry
 
     # --- take profit: rr * risk, liquidity-snapped
     tp = entry + rr * risk if want_bull else entry - rr * risk

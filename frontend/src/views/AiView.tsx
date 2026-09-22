@@ -459,6 +459,7 @@ function MarketIntelligenceCard({ token, symbol }: { token: string; symbol: stri
   const flow = snap?.flow;
   const news = snap?.news;
   const cot = snap?.cot;
+  const tpo = snap?.tpo;
 
   return (
     <Card>
@@ -522,6 +523,36 @@ function MarketIntelligenceCard({ token, symbol }: { token: string; symbol: stri
                 </span>
                 <span className="shrink-0 text-[9px] text-zinc-500">
                   vol z{z.vol_z.toFixed(1)} · {fmtTime(z.t)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* D-047 — time-at-price levels: where the market SPENT TIME */}
+      {tpo?.levels && tpo.levels.length > 0 && (
+        <div className="mt-3 min-w-0">
+          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+            Time-at-price levels (24h)
+          </p>
+          <ul className="flex min-w-0 flex-col gap-1.5">
+            {tpo.levels.slice(0, 4).map((lv, i) => (
+              <li
+                key={i}
+                className="flex min-w-0 items-center gap-2 rounded-lg border border-zinc-800/70 bg-zinc-900/40 px-3 py-2"
+              >
+                <Badge tone={lv.side === "support" ? "green" : "red"}>
+                  {lv.side === "support" ? "S" : "R"}
+                </Badge>
+                <span className="min-w-0 flex-1 font-mono text-[11px] tabular-nums text-zinc-300">
+                  {lv.price.toFixed(2)}
+                  {lv.price === tpo.poc && (
+                    <span className="ml-1.5 text-[9px] font-bold text-amber-400">POC</span>
+                  )}
+                </span>
+                <span className="shrink-0 text-[9px] text-zinc-500">
+                  held {Math.round(lv.minutes)}m
                 </span>
               </li>
             ))}

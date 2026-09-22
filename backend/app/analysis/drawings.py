@@ -81,9 +81,14 @@ def _killzone_note(now: datetime) -> str | None:
 
 
 def _key_levels(
-    m15: dict | None, h1: dict | None, price: float
+    m15: dict | None, h1: dict | None, price: float,
+    m1: pd.DataFrame | None = None,
 ) -> list[dict]:
-    """PDH/PDL + POC + the liquidity pools a trader would mark first."""
+    """PDH/PDL + POC + the liquidity pools a trader would mark first.
+
+    D-047: strong time-at-price levels join the mark — every place the
+    market SPENT >= 15 minutes becomes a labeled S/R line ("TPO·S 42m").
+    """
     out: list[dict] = []
     seen: set[float] = set()
 
@@ -98,6 +103,25 @@ def _key_levels(
             "kind": "hline", "price": round(float(price_level), 2),
             "label": label, "tone": tone, "style": style,
         })
+
+    # D-047 — time-at-price levels FIRST (they are the strongest marks:
+    # the market itself proved these prices matter by spending time there)
+    if m1 is not None and len(m1) >= 60:
+        try:
+            from app.analysis.tpo import tpo_profile
+
+            prof = tpo_profile(m1)
+            for lv in prof.get("levels") or []:
+                if float(lv.get("minutes", 0)) < 20:
+                    continue  # only meaningful marks make the chart
+                side_tag = "S" if lv["side"] == "support" else "R"
+                add(
+                    lv["price"], f"TPO·{side_tag} {lv['minutes']:.0f}m",
+                    "bull" if lv["side"] == "support" else "bear",
+                    "solid",
+                )
+        except Exception:  # noqa: BLE001 — drawings must never break
+            pass
 
     for snap in (h1, m15):
         if not snap or not snap.get("ok"):
@@ -114,18 +138,20 @@ def _key_levels(
         poc = (m15.get("volume_profile") or {}).get("poc")
         if poc:
             add(poc, "POC", "gold", "solid")
-    # keep the ones a trader cares about: nearest above + below price, PDH/PDL/POC
-    above = sorted([d for d in out if d["price"] > price], key=lambda d: d["price"])[:3]
-    below = sorted([d for d in out if d["price"] <= price], key=lambda d: -d["price"])[:3]
+    # keep the ones a trader cares about: nearest above + below price,
+    # PDH/PDL/POC + the strongest TPO marks
+    above = sorted([d for d in out if d["price"] > price], key=lambda d: d["price"])[:4]
+    below = sorted([d for d in out if d["price"] <= price], key=lambda d: -d["price"])[:4]
     keep = {id(d) for d in above + below}
     pdh_pdl_poc = [d for d in out if d["label"] in ("PDH", "PDL", "POC")]
+    tpo_marks = [d for d in out if d["label"].startswith("TPO·")][:4]
     merged: list[dict] = []
     seen_ids: set[int] = set()
-    for d in [d for d in out if id(d) in keep] + pdh_pdl_poc:
+    for d in [d for d in out if id(d) in keep] + tpo_marks + pdh_pdl_poc:
         if id(d) not in seen_ids:
             seen_ids.add(id(d))
             merged.append(d)
-    return merged[:8]
+    return merged[:10]
 
 
 # -------------------------------------------------------------- trendlines
@@ -482,7 +508,7 @@ def _build(
     if setup is not None:
         out.append(setup)
 
-    out.extend(_key_levels(s15, h1, price))
+    out.extend(_key_levels(s15, h1, price, m1=m1))
     atr5 = float(s5.get("atr") or 0.0) if s5 and s5.get("ok") else 0.0
     out.extend(_trendlines(frames.get("M5"), atr5))
     fib = _fib(frames.get("M15"), (s15 or {}).get("premium_discount") if s15 else None)

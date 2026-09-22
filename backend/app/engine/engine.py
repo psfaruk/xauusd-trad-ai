@@ -221,9 +221,20 @@ def evaluate(
 
     # D-042 — zone-aware exits: SL beyond the structural invalidation,
     # floored/capped in ATRs; TP snapped toward opposing liquidity.
+    # D-047 — TPO levels from the last day of M1 bars: strong time-at-price
+    # nodes extend the stop just past the level (never past max_sl_atr).
+    tpo_levels: list[dict] = []
+    try:
+        from app.analysis.tpo import tpo_profile
+
+        tpo_levels = tpo_profile(
+            base, lookback_minutes=cfg.tpo_lookback_min
+        )["levels"]
+    except Exception:  # noqa: BLE001 — anchoring is best-effort
+        tpo_levels = []
     entry, sl, tp = smart_targets(
         base, trigger_tag.direction, entry, sl_base, cfg.rr,
-        cfg.min_sl_atr, cfg.max_sl_atr,
+        cfg.min_sl_atr, cfg.max_sl_atr, tpo_levels=tpo_levels,
     )
 
     # D-041 — spread vs risk: entering at ask/exiting at bid costs one spread;
@@ -253,7 +264,7 @@ def evaluate(
     ) / max(W_TREND + W_MTF + W_TRIGGER + W_RSI + W_SESSION + W_ATR, 1e-9)
     if cfg.smc_enabled and factors:
         gate = confluence_score(factors) / 6.0
-        bonus = bonus_score(factors) / 5.0  # D-044: 5 bonus factors
+        bonus = bonus_score(factors) / 6.0  # D-047: 6 bonus factors
         confidence = (1.0 - W_CONFLUENCE) * base_confidence + W_CONFLUENCE * (
             0.7 * gate + 0.3 * bonus
         )

@@ -15,19 +15,30 @@ Config:
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
+import ssl
 import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from datetime import UTC
 from typing import Any
 
 DEFAULT_URL = "http://127.0.0.1:22346/mcp"
 DEFAULT_KEY_FILE = "/home/z/mt5stack/mcp_key.txt"
 _TIMEOUT = 60  # order ops can take a few seconds; info ops are fast
+#: D-047 — TLS handshake / connect budget. The PUBLIC bridge (HTTPS tunnel)
+#: occasionally stalls a fresh handshake for the FULL socket timeout, which
+#: used to freeze tick polling for 60s+ ("candles stop updating"). Connecting
+#: with a short budget fails fast and retries on a FRESH connection instead.
+_CONNECT_TIMEOUT_S = float(os.environ.get("MT5_MCP_CONNECT_TIMEOUT_S", "8"))
+#: D-047 — keep-alive idle limit. Tunnel gateways silently drop idle
+#: connections (often ~60s); the next request on a dead socket fails with
+#: RemoteDisconnected. Reconnecting proactively after this idle window makes
+#: stale-connection failures rare instead of routine.
+_CONN_MAX_IDLE_S = float(os.environ.get("MT5_MCP_CONN_MAX_IDLE_S", "25"))
 
 log = logging.getLogger("xauusd.mcp")
 
@@ -85,9 +96,70 @@ class MT5TerminalClient:
         self._session: str | None = None
         self._id = 0
         self._lock = threading.Lock()
+        # D-047 — per-thread KEEP-ALIVE connection pool. urllib.urlopen opened
+        # a fresh TCP+TLS connection for EVERY call; the public HTTPS bridge
+        # intermittently stalled those handshakes (SSL timeout every few
+        # minutes in production logs) and each stall froze a tick worker for
+        # the whole socket timeout. A persistent per-thread connection
+        # handshakes ONCE and reuses; on any transport error it is discarded
+        # and rebuilt (fresh path through the tunnel).
+        self._local = threading.local()
+
+    # ------------------------------------------------------- connection pool
+
+    def _conn_parts(self) -> urllib.parse.SplitResult:
+        return urllib.parse.urlsplit(self.url)
+
+    def _drop_local_conn(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        self._local.conn = None
+        self._local.conn_at = 0.0
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 — closing a dead socket
+                pass
+
+    def _acquire_conn(self) -> http.client.HTTPConnection:
+        """This thread's warm connection, proactively rebuilt when stale."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            idle = time.monotonic() - getattr(self._local, "used_at", 0.0)
+            if idle > _CONN_MAX_IDLE_S:
+                self._drop_local_conn()
+            else:
+                return conn
+        parts = self._conn_parts()
+        if parts.scheme == "https":
+            conn = http.client.HTTPSConnection(
+                parts.hostname, parts.port or 443,
+                timeout=_CONNECT_TIMEOUT_S,
+                context=ssl.create_default_context(),
+            )
+        else:
+            conn = http.client.HTTPConnection(
+                parts.hostname, parts.port or 80, timeout=_CONNECT_TIMEOUT_S
+            )
+        conn.connect()  # handshake failures surface HERE (fast, no request sent)
+        self._local.conn = conn
+        self._local.used_at = time.monotonic()
+        return conn
 
     # ------------------------------------------------------------------ rpc
-    def _post(self, payload: dict[str, Any], timeout: int = _TIMEOUT) -> dict[str, Any]:
+    def _post(
+        self, payload: dict[str, Any], timeout: int = _TIMEOUT,
+        idempotent: bool = False,
+    ) -> dict[str, Any]:
+        """POST one JSON-RPC message over the warm keep-alive connection.
+
+        D-047 retry ladder (the "hard-code the feed" directive):
+        - connect/handshake failure  -> request NEVER left the box: safe to
+          retry on a fresh connection for EVERY tool (orders included);
+        - send/response failure      -> request may have reached the terminal:
+          retry ONLY idempotent read tools (orders must never double-fire);
+        - every retry drops the thread's cached connection first so the next
+          attempt takes a brand-new path through the tunnel.
+        """
         key = self._key if self._key is not None else _cfg_key()
         if not key:
             raise MCPError("MT5 MCP key not configured (MT5_MCP_KEY / key file)")
@@ -95,25 +167,55 @@ class MT5TerminalClient:
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
             "Authorization": f"Bearer {key}",
+            "Connection": "keep-alive",
         }
         if self._session:
             headers["Mcp-Session-Id"] = self._session
-        req = urllib.request.Request(
-            self.url, data=json.dumps(payload).encode(), headers=headers, method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                sid = r.headers.get("Mcp-Session-Id")
-                if sid:
-                    self._session = sid
-                body = r.read().decode(errors="replace")
-        except urllib.error.HTTPError as e:
-            # 401 -> key rotated/stale session; drop session and surface code
-            self._session = None
-            raise MCPError(f"MT5 MCP HTTP {e.code}") from e
-        except (urllib.error.URLError, OSError) as e:
-            self._session = None
-            raise MCPError(f"MT5 terminal unreachable: {e}") from e
+        path = self._conn_parts().path or "/"
+        data = json.dumps(payload).encode()
+        body = ""
+        for attempt in (1, 2):
+            if attempt > 1:
+                self._drop_local_conn()
+            try:
+                conn = self._acquire_conn()
+            except (OSError, ssl.SSLError) as e:
+                if attempt >= 2:
+                    self._session = None
+                    raise MCPError(f"MT5 terminal unreachable: {e}") from e
+                time.sleep(0.25)
+                continue
+            try:
+                conn.sock.settimeout(float(timeout))
+                conn.request("POST", path, body=data, headers=headers)
+                r = conn.getresponse()
+                raw = r.read()
+                status = r.status
+                sid = r.getheader("Mcp-Session-Id")
+                reusable = not r.will_close
+            except (http.client.HTTPException, OSError, ssl.SSLError) as e:
+                self._drop_local_conn()
+                # response-phase failure: the request MAY have been processed —
+                # only idempotent tools may take the second attempt
+                if attempt >= 2 or not idempotent:
+                    self._session = None
+                    raise MCPError(f"MT5 terminal unreachable: {e}") from e
+                time.sleep(0.5)
+                continue
+            finally:
+                used = getattr(self._local, "used_at", None)
+                if used is not None:
+                    self._local.used_at = time.monotonic()
+            if not reusable:
+                self._drop_local_conn()
+            if sid:
+                self._session = sid
+            if status >= 400:
+                if status in (401, 403, 404):
+                    self._session = None
+                raise MCPError(f"MT5 MCP HTTP {status}")
+            body = raw.decode(errors="replace")
+            break
         if not body.strip():
             return {}
         if body.startswith("event:") or body.startswith("data:"):
@@ -128,13 +230,13 @@ class MT5TerminalClient:
 
     def _call(self, name: str, arguments: dict[str, Any] | None = None,
               timeout: int = _TIMEOUT) -> Any:
-        # D-041 — idempotent read tools get ONE transport-level retry (fresh
-        # session + short pause). The public bridge sits behind a gateway that
-        # can blip for a second; a single retry absorbs that without flipping
-        # the whole platform to "disconnected". Order tools never retry.
+        # D-041/D-047 — idempotent read tools get the transport retry ladder
+        # (fresh connection per attempt inside _post, plus this outer retry
+        # for one more total chance). Order tools never retry above the
+        # send-phase-only safety retry inside _post.
         idempotent = name in _IDEMPOTENT_TOOLS
         try:
-            return self._call_once(name, arguments, timeout)
+            return self._call_once(name, arguments, timeout, idempotent=idempotent)
         except MCPError as first:
             if not idempotent:
                 raise
@@ -142,10 +244,10 @@ class MT5TerminalClient:
             time.sleep(1.0)
             with self._lock:
                 self._session = None
-            return self._call_once(name, arguments, timeout)
+            return self._call_once(name, arguments, timeout, idempotent=idempotent)
 
     def _call_once(self, name: str, arguments: dict[str, Any] | None,
-                   timeout: int) -> Any:
+                   timeout: int, idempotent: bool = False) -> Any:
         with self._lock:
             if self._session is None:
                 self._connect_locked()
@@ -154,7 +256,7 @@ class MT5TerminalClient:
             resp = self._post(
                 {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
                  "params": {"name": name, "arguments": arguments or {}}},
-                timeout=timeout,
+                timeout=timeout, idempotent=idempotent,
             )
         if "error" in resp:
             # session might be stale — one transparent retry
@@ -166,7 +268,7 @@ class MT5TerminalClient:
                     resp = self._post(
                         {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
                          "params": {"name": name, "arguments": arguments or {}}},
-                        timeout=timeout,
+                        timeout=timeout, idempotent=idempotent,
                     )
                 if "error" in resp:
                     raise MCPError(str(resp["error"].get("message", resp["error"])))

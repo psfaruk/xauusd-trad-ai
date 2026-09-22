@@ -98,6 +98,20 @@ class AnalysisService:
             payload["drawings"] = []
         # D-044 — order-flow statistics off the M1 tape
         payload["flow"] = flow_stats(frames["M1"]) if frames.get("M1") is not None else {}
+        # D-047 — time-at-price profile: where the market SPENT TIME becomes
+        # marked S/R levels (POC / value area / strong nodes)
+        try:
+            from app.analysis.tpo import tpo_profile
+
+            payload["tpo"] = (
+                tpo_profile(frames["M1"])
+                if frames.get("M1") is not None else
+                {"poc": None, "va_lo": None, "va_hi": None,
+                 "va_minutes": 0.0, "total_minutes": 0.0, "levels": []}
+            )
+        except Exception:  # noqa: BLE001 — TPO must never break the snapshot
+            payload["tpo"] = {"poc": None, "va_lo": None, "va_hi": None,
+                              "va_minutes": 0.0, "total_minutes": 0.0, "levels": []}
         # D-044 — news events + weekly institutional positioning
         payload["news"] = await self._news_block()
         payload["cot"] = await self._cot_block()

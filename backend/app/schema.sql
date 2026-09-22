@@ -137,7 +137,7 @@ values (1, '{
   "pullback_enabled": true,
   "pullback_min_range_atr": 0.35, "pullback_wick_ratio": 0.45,
   "min_sl_atr": 1.5, "max_spread_to_risk": 0.5,
-  "sessions": [{"name": "london", "utc": [7, 16]}, {"name": "newyork", "utc": [13, 20]}],
+  "sessions": [{"name": "tokyo", "utc": [0, 7]}, {"name": "london", "utc": [7, 16]}, {"name": "newyork", "utc": [13, 20]}],
   "news_blackout_min": 30, "max_spread_points": 35,
   "risk_mode": "percent", "risk_percent": 0.5, "fixed_lot": 0.01,
   "max_positions": 3, "daily_max_loss_pct": 3.0, "magic": 234000,

@@ -405,9 +405,24 @@ class TestEvaluatePure:
         assert ev.trace["checks"][-1]["name"] == "mtf_m15"
 
     def test_off_session_blocks(self):
-        # base 01:00 UTC -> the sweep closes 02:01 UTC — off-session
-        m1, htf = self._frames(hour_shift=-14)
+        # base 20:00 UTC -> the sweep closes 21:01 UTC — off-session
+        # (D-047: the dead zone is now only 20:00-24:00 UTC; the Asian
+        # morning 00-07 UTC is IN-SESSION via the Tokyo window)
+        m1, htf = self._frames(hour_shift=5)
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
         ev = evaluate(m1, htf, close_time, EngineConfig(smc_enabled=False), spread_points=20)
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "session"
+
+    def test_asian_morning_is_in_session(self):
+        # D-047 — the user's morning (e.g. 02:00 UTC = 08:00 Dhaka) must NOT
+        # be blocked by the session filter anymore (was the "no signals all
+        # morning" root cause): the same setup at 02:01 UTC passes session.
+        m1, htf = self._frames(hour_shift=-14)
+        close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
+        ev = evaluate(m1, htf, close_time, EngineConfig(smc_enabled=False), spread_points=20)
+        names = [c["name"] for c in ev.trace["checks"]]
+        assert "session" in names
+        session_check = next(c for c in ev.trace["checks"] if c["name"] == "session")
+        assert session_check["pass"] is True
+        assert session_check["value"] == "tokyo"

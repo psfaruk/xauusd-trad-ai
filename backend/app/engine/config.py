@@ -99,12 +99,19 @@ class EngineConfig(BaseModel):
         description="skip when spread > this fraction of the SL distance")
     sessions: list[SessionRule] = Field(
         default_factory=lambda: [
+            # D-047 — Tokyo added: the old london+newyork pair silently
+            # blocked the ENTIRE Asian morning (00-07 UTC = 06:00-13:00
+            # Dhaka), which is exactly when the user watches the chart.
+            SessionRule(name="tokyo", utc=(0, 7)),
             SessionRule(name="london", utc=(7, 16)),
             SessionRule(name="newyork", utc=(13, 20)),
         ]
     )
     news_blackout_min: int = Field(30, ge=0)
     max_spread_points: int = Field(35, ge=1)
+    #: D-047 — how deep the time-at-price (TPO) profile reaches (minutes of
+    #: M1 history) for S/R level detection + SL anchoring
+    tpo_lookback_min: int = Field(1440, ge=60, le=10080)
     risk_mode: str = Field("percent", pattern="^(percent|fixed)$")
     risk_percent: float = Field(0.5, gt=0, le=100)
     fixed_lot: float = Field(0.01, gt=0)
@@ -245,6 +252,34 @@ def upgrade_legacy_payload(raw: dict) -> tuple[dict, bool]:
     return out, True
 
 
+#: D-047 — the exact pre-D-047 default session pair. Rows still carrying
+#: it were NEVER customized by the user, so they are auto-upgraded to the
+#: Tokyo-inclusive default; anything else is a user choice and stays.
+_LEGACY_SESSIONS = [{"name": "london", "utc": [7, 16]},
+                    {"name": "newyork", "utc": [13, 20]}]
+_D047_SESSIONS = [{"name": "tokyo", "utc": [0, 7]},
+                  {"name": "london", "utc": [7, 16]},
+                  {"name": "newyork", "utc": [13, 20]}]
+
+
+def upgrade_legacy_sessions(raw: dict) -> tuple[dict, bool]:
+    """D-047 — add the Tokyo (Asian) session to untouched old-default rows.
+
+    The pre-D-047 default (london+newyork only) made the engine refuse to
+    fire ANY signal from 20:00 to 07:00 UTC — the entire Asian session,
+    which is the platform's user morning (e.g. 06:00-13:00 in Dhaka).
+    Rows still carrying that exact pair are upgraded; customized session
+    lists are preserved untouched.
+    """
+    if not isinstance(raw, dict):
+        return raw, False
+    if raw.get("sessions") != _LEGACY_SESSIONS:
+        return raw, False
+    out = dict(raw)
+    out["sessions"] = [dict(s) for s in _D047_SESSIONS]
+    return out, True
+
+
 DEFAULT_CONFIG = EngineConfig()
 
 
@@ -288,9 +323,14 @@ class ConfigRepo:
                                type(raw).__name__)
                 return self._mem_config, self._mem_auto_trade
             raw, upgraded = upgrade_legacy_payload(raw)
+            raw, upgraded_sessions = upgrade_legacy_sessions(raw)
+            upgraded = upgraded or upgraded_sessions
             cfg = EngineConfig.model_validate(raw)
             if upgraded:
-                logger.info("engine config upgraded to the D-041 M1 strategy — persisting")
+                logger.info(
+                    "engine config upgraded (%s) — persisting",
+                    "sessions+strategy" if upgraded_sessions else "strategy",
+                )
                 await self.save(db_engine, cfg, bool(row[1]))
             self._mem_config, self._mem_auto_trade = cfg, bool(row[1])
             return cfg, bool(row[1])

@@ -121,9 +121,17 @@ class TestSession:
         ok, name = check_session(datetime(2025, 1, 6, 18, 0, tzinfo=UTC), CFG, trace)
         assert ok and name == "newyork"
 
-    def test_asia_off_session(self):
+    def test_asia_now_in_session(self):
+        # D-047 — the Asian morning (03:00 UTC = 09:00 Dhaka) is IN-SESSION
+        # via the Tokyo window; the old default silently blocked it.
         trace = Trace()
-        ok, _ = check_session(datetime(2025, 1, 6, 3, 0, tzinfo=UTC), CFG, trace)
+        ok, name = check_session(datetime(2025, 1, 6, 3, 0, tzinfo=UTC), CFG, trace)
+        assert ok and name == "tokyo"
+
+    def test_dead_zone_off_session(self):
+        # the true dead zone is now only after the NY close (20-24 UTC)
+        trace = Trace()
+        ok, _ = check_session(datetime(2025, 1, 6, 21, 30, tzinfo=UTC), CFG, trace)
         assert not ok
 
     def test_custom_24h_session(self):
