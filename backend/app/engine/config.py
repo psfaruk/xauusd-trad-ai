@@ -45,25 +45,35 @@ class SessionRule(BaseModel):
 
 
 class EngineConfig(BaseModel):
-    """Strategy parameters (SPEC §8.6 defaults, D-041 M1 rework, D-042 ICT).
+    """Strategy parameters (SPEC §8.6 defaults, D-041 M1 rework, D-042 ICT,
+    D-050 M5 + POI pending entries).
 
-    D-041: the engine trades the M1 timeframe with multi-timeframe
-    confirmation — H1 sets the trend, M5+M15 confirm (mtf_align), and the
-    trigger is a REAL M1 pattern (liquidity-sweep SFP or an EMA pullback
-    rejection candle).
+    D-041: the engine trades with multi-timeframe confirmation — the trend
+    TF sets the bias, the confirm TFs must agree, and the trigger is a REAL
+    base-TF pattern (liquidity-sweep SFP, EMA pullback rejection or a POI
+    zone retest).
     D-042: ICT/SMC confluence — after the trigger, market structure
     (BOS/CHoCH), order blocks, fair value gaps, liquidity sweeps and
     supply/demand zones must confirm with >= min_confluence votes;
     SL/TP are zone-aware (app-controlled exits), and up to max_positions
     signals/entries can run CONCURRENTLY (multi-entry directive).
+    D-050: the base timeframe moved to M5 (user directive: short-term
+    trading off the 5-minute chart) and every signal becomes a PENDING
+    LIMIT order placed at a structural POI level BEYOND the current
+    market — BUY limits BELOW the nearest demand (support) zone, SELL
+    limits ABOVE the nearest supply (resistance) zone (user directive:
+    "মার্জিন" between market and entry so noise cannot stop out the
+    trade straight away).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    timeframe: str = "M1"     # trigger timeframe (D-041)
+    timeframe: str = "M5"     # trigger timeframe (D-050: M1 -> M5, user
+    #                                  directive: short-term trading on the
+    #                                  5-minute chart)
     trend_tf: str = "H1"      # major trend timeframe
     confirm_tfs: list[str] = Field(
-        default_factory=lambda: ["M5", "M15"],
+        default_factory=lambda: ["M15"],
         description="MTF confirmation timeframes — each must be > timeframe",
     )
     min_tf_agree: int = Field(
@@ -79,7 +89,8 @@ class EngineConfig(BaseModel):
     rsi_sell_min: float = Field(35.0, ge=0, le=100)
     rsi_sell_max: float = Field(60.0, ge=0, le=100)
     atr_period: int = Field(14, ge=1)
-    min_atr: float = Field(0.15, ge=0)   # M1 ATR floor (D-041 — was 0.8 on M15)
+    min_atr: float = Field(0.25, ge=0)   # M5 ATR floor (D-050: 0.15 M1 ->
+    #                                    0.25 M5 recalibration)
     sfp_lookback: int = Field(20, ge=2)
     sfp_wick_atr_ratio: float = Field(0.35, gt=0)
     sl_buffer_atr: float = Field(0.2, ge=0)
@@ -87,8 +98,9 @@ class EngineConfig(BaseModel):
         description="TP multiple used ONLY when no structural target "
                     "sits within tp_max_r — the primary TP is predicted "
                     "from the nearest opposing zone/liquidity/TPO level")
-    expiry_bars: int = Field(45, ge=1)  # D-049: 20 -> 45 — structure TPs
-    # need room to be HIT, not expire into the spread mid-flight
+    expiry_bars: int = Field(36, ge=1)  # D-050: 3h on M5 (was 45 M1)
+    #                                     # — structure TPs need room to be
+    #                                     # HIT, not expire mid-flight
     cooldown_bars: int = Field(4, ge=0)
     # -------------------------------------------------- D-041 pullback trigger
     pullback_enabled: bool = True
@@ -194,6 +206,49 @@ class EngineConfig(BaseModel):
         2, ge=1, le=5,
         description="bars before the trigger that may have entered the zone",
     )
+    # -------------------------------------------------- D-050 POI pending block
+    entry_mode: str = Field(
+        "poi_limit",
+        pattern="^(market|poi_limit)$",
+        description="D-050 — 'poi_limit' turns every signal into a PENDING "
+                    "LIMIT order anchored at a POI zone level BEYOND the "
+                    "market (BUY limit below the demand/support zone, SELL "
+                    "limit above the supply/resistance zone — user "
+                    "directive); 'market' keeps the legacy enter-at-close "
+                    "behaviour",
+    )
+    entry_offset_atr: float = Field(
+        0.35, gt=0,
+        description="minimum distance (ATRs) between the current market "
+                    "and a pending entry — the 'মার্জিন' that keeps noise "
+                    "away from the fill (plus 2 spreads, whichever is "
+                    "larger)",
+    )
+    pending_offset_atr: float = Field(
+        0.8, gt=0,
+        description="fallback pending distance (ATRs) when no same-side "
+                    "POI zone sits within reach of the market",
+    )
+    pending_max_atr: float = Field(
+        10.0, gt=0,
+        description="maximum pending distance (ATRs) — a zone deeper than "
+                    "this clamps the entry so fills stay realistic "
+                    "(D-050: ~10 USD at M5 ATR 1.0 — the user's worked "
+                    "example: market 4513, BUY at 4503)",
+    )
+    pending_expiry_bars: int = Field(
+        24, ge=1,
+        description="how many engine-TF bars a PENDING signal may wait for "
+                    "its fill before expiring unfilled (2h on M5) — an "
+                    "unfilled order is a MISSED trade, never a loss",
+    )
+    max_pending_signals: int = Field(
+        6, ge=1,
+        description="concurrent PENDING (unfilled) signal budget — kept "
+                    "separate from max_positions so unfilled limits never "
+                    "clog the signal flow (user directive: signals must "
+                    "keep coming)",
+    )
 
     @field_validator("timeframe", "trend_tf")
     @classmethod
@@ -286,6 +341,43 @@ _LEGACY_STRATEGY_DEFAULTS = {
     "max_sl_atr": 3.5,
     "max_positions": 3,
 }
+
+#: D-050 — the exact pre-D-050 shipped default profile (M1 engine). Rows
+#: still carrying it were NEVER customized by the user (the field is
+#: admin-config only), so they move to the M5 short-term profile. Any
+#: other value (a user's own TF choice, their own confirm list) stays put.
+_LEGACY_D050_PROFILE = {
+    "timeframe": "M1",
+    "confirm_tfs": ["M5", "M15"],
+    "min_atr": 0.15,
+    "expiry_bars": 45,
+}
+_D050_PROFILE = {
+    "timeframe": "M5",
+    "confirm_tfs": ["M15"],
+    "min_atr": 0.25,
+    "expiry_bars": 36,
+}
+
+
+def upgrade_legacy_d050(raw: dict) -> tuple[dict, bool]:
+    """D-050 — move untouched pre-D-050 rows (M1 shipped profile) to the
+    M5 short-term profile (user directive: 5-minute timeframe trading).
+
+    Returns (payload, moved). Only a row still carrying the EXACT old
+    shipped profile AND no entry_mode key moves (same rule as the
+    D-047/D-048/D-049 upgrades); user-customized values stay forever.
+    """
+    if not isinstance(raw, dict):
+        return raw, False
+    if "entry_mode" in raw:
+        return raw, False  # already a D-050 row
+    for key, want in _LEGACY_D050_PROFILE.items():
+        if raw.get(key) != want:
+            return raw, False
+    out = dict(raw)
+    out.update(_D050_PROFILE)
+    return out, True
 
 
 def upgrade_legacy_payload(raw: dict) -> tuple[dict, bool]:
@@ -424,9 +516,10 @@ class ConfigRepo:
             raw, upgraded_sessions = upgrade_legacy_sessions(raw)
             raw, upgraded_confluence = upgrade_legacy_confluence(raw)
             raw, moved_d049 = upgrade_legacy_d049(raw)
+            raw, upgraded_d050 = upgrade_legacy_d050(raw)
             upgraded = (
                 upgraded_strategy or upgraded_sessions
-                or upgraded_confluence or bool(moved_d049)
+                or upgraded_confluence or bool(moved_d049) or upgraded_d050
             )
             cfg = EngineConfig.model_validate(raw)
             if upgraded:
@@ -439,6 +532,8 @@ class ConfigRepo:
                     why.append("confluence")
                 if moved_d049:
                     why.append("d049:" + "+".join(moved_d049))
+                if upgraded_d050:
+                    why.append("d050:M5-profile")
                 logger.info(
                     "engine config upgraded (%s) — persisting",
                     "+".join(why) or "strategy",

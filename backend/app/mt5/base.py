@@ -48,6 +48,12 @@ class Order:
     deviation: int = 30  # points (SPEC §9)
     magic: int = 0
     comment: str = ""
+    # D-050 — pending (limit) order support: order_type "market" behaves
+    # exactly as before; "buy_limit"/"sell_limit" place a PENDING order
+    # at `price` (the signal's POI-anchored entry) that fills when the
+    # market retraces to it.
+    order_type: str = "market"  # "market" | "buy_limit" | "sell_limit"
+    price: float | None = None  # limit price (pending orders only)
 
 
 @dataclass(frozen=True)

@@ -185,7 +185,9 @@ class TestConfigRoutes:
         assert r.status_code == 200
         body = r.json()
         assert body["auto_trade"] is False  # global kill switch OFF by default
-        assert body["config"]["timeframe"] == "M1"
+        assert body["config"]["timeframe"] == "M5"  # D-050 — M1 -> M5
+        assert body["config"]["confirm_tfs"] == ["M15"]  # D-050 single confirm
+        assert body["config"]["entry_mode"] == "poi_limit"  # D-050 POI pending
         assert body["config"]["rr"] == 1.6  # D-049 fallback TP multiple
         assert body["config"]["magic"] == 234000
         # D-042 ICT block is served to the frontend

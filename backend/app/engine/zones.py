@@ -250,3 +250,88 @@ def build_levels_zone(
 def zone_trigger_quality(sig: ZoneRetestSignal) -> float:
     """0..1 — confidence contribution of a zone setup (location + rejection)."""
     return max(0.0, min(1.0, 0.55 * sig.quality + 0.45 * sig.rejection))
+
+
+# ------------------------------------------------------------------ D-050
+# POI pending-entry anchor (user directive):
+#   "মার্কেট প্রাইস এখন 4513 যদি সেল সিগন্যাল আসে তখন পেন্ডিং অর্ডার creat
+#    করতে হবে, এন্ট্রি প্রাইস 4520 বা তার আসে পাশে বসাতে হবে, আর যদি buy
+#    signal আসে, তখন এন্ট্রি প্রাইস 4503 বা তার আসে পাশে অর্ডার বসাতে হবে,
+#    এতে করে স্টপ লস হিট কম হবে ... মার্কেট এর সাপোর্ট জোন এর নিচ থেকে buy
+#    order বসাবেন, আর মার্কেট এর রেসিসটেন্স এর উপর থেকে sell order বসাবেন,
+#    এটাই হলো POI ZONE এর এন্ট্রি।"
+
+
+def poi_pending_entry(
+    direction: str,  # "BUY" | "SELL"
+    market: float,  # current market reference (trigger-bar close)
+    zones: list[dict],  # ranked POI zones (app.analysis.poi.poi_zones)
+    atr: float,
+    cfg: EngineConfig,
+    spread_price: float = 0.0,  # current spread in price units
+) -> tuple[float, str]:
+    """D-050 — the PENDING limit-entry price + its anchor note.
+
+    BUY  -> a BUY LIMIT below the market anchored at the nearest DEMAND
+            (support) zone's LOWER edge: "সাপোর্ট জোন এর নিচ থেকে buy order".
+    SELL -> a SELL LIMIT above the market anchored at the nearest SUPPLY
+            (resistance) zone's UPPER edge: "রেসিস্টেন্স এর উপর থেকে sell
+            order".
+
+    The distance between the market and the entry is the "মার্জিন" the old
+    market-entry mode lacked — entering AT the close meant noise stopped
+    trades out immediately; a limit BEYOND the zone only fills where the
+    reaction is structurally expected, so stop-loss hits collapse.
+
+    Geometry guards:
+    - minimum distance: entry_offset_atr*ATR floored at 2 spreads;
+    - maximum distance: pending_max_atr*ATR (deeper zones clamp);
+    - zone must sit on the RIGHT side (demand below the market for BUY,
+      supply above for SELL) with a quality >= 0.30;
+    - no usable zone -> plain pending_offset_atr*ATR offset.
+
+    Ties prefer the NEAREST zone (highest fill probability); the ranked
+    zone list is quality-sorted, so quality is the implicit tie-break.
+    """
+    min_off = max(cfg.entry_offset_atr * atr, 2.0 * spread_price)
+    max_off = max(cfg.pending_max_atr * atr, 1.5 * min_off)
+    want = "demand" if direction == "BUY" else "supply"
+
+    best: tuple[float, float, dict] | None = None  # (dist, anchor, zone)
+    for z in zones:
+        if z.get("side") != want:
+            continue
+        if float(z.get("quality", 0.0)) < 0.30:
+            continue  # weak zone — not worth anchoring an entry to
+        zlo, zhi = float(z["lo"]), float(z["hi"])
+        # far edge: below the support zone (BUY) / above the resistance (SELL)
+        anchor = zlo if direction == "BUY" else zhi
+        dist = (market - anchor) if direction == "BUY" else (anchor - market)
+        if dist < min_off:
+            continue  # zone hugs the market — no margin to be had from it
+        if best is None or dist < best[0]:
+            best = (dist, anchor, z)
+
+    if best is not None:
+        dist, anchor, z = best
+        where = "below" if direction == "BUY" else "above"
+        if dist > max_off:
+            entry = (market - max_off) if direction == "BUY" else (market + max_off)
+            note = (
+                f"{want} POI {z['lo']:.2f}-{z['hi']:.2f} too deep "
+                f"({dist / atr:.1f} ATR) — clamped to {max_off / atr:.1f} ATR"
+            )
+        else:
+            entry = anchor
+            note = (
+                f"{where} {want} POI {z['lo']:.2f}-{z['hi']:.2f} "
+                f"({z['source']}, q {float(z['quality']):.2f}) at {anchor:.2f}"
+            )
+        return round(entry, 2), note
+
+    # fallback — no same-side POI in range: a plain ATR offset (still on the
+    # right side of the market, still a limit, still margin from the noise)
+    off = max(cfg.pending_offset_atr * atr, min_off)
+    entry = (market - off) if direction == "BUY" else (market + off)
+    note = f"no {want} POI within {max_off / atr:.1f} ATR — offset {off:.2f}"
+    return round(entry, 2), note

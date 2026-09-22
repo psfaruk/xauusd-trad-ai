@@ -79,7 +79,13 @@ class TestEngineE2E:
 
         hub = EventHub()
         repo = SignalRepo(None)
-        engine = SignalEngine(EngineConfig(smc_enabled=False), hub, repo)
+        engine = SignalEngine(
+            EngineConfig(
+                smc_enabled=False, timeframe="M1", entry_mode="market",
+                confirm_tfs=["M5", "M15"],  # D-050: this e2e tape expects both MTF checks
+            ),
+            hub, repo,
+        )  # D-050: legacy M1/market profile
         tracker = SignalTracker()
 
         async def _bias_direction() -> str | None:
@@ -196,7 +202,11 @@ class TestEngineE2E:
 
         hub = EventHub()
         repo = SignalRepo(None)
-        engine = SignalEngine(EngineConfig(smc_enabled=False), hub, repo)
+        # D-050: legacy M1/market profile
+        engine = SignalEngine(
+            EngineConfig(smc_enabled=False, timeframe="M1", entry_mode="market"),
+            hub, repo,
+        )
         tracker = SignalTracker()
         await engine.on_bar_close("M1", closed_bar_of(m1), src, tracker, symbol)
 
@@ -218,7 +228,11 @@ class TestEngineE2E:
         m1 = await src.get_rates(symbol, "M1", 200)
         hub = EventHub()
         repo = SignalRepo(None)
-        engine = SignalEngine(EngineConfig(smc_enabled=False), hub, repo)
+        # D-050: legacy M1/market profile
+        engine = SignalEngine(
+            EngineConfig(smc_enabled=False, timeframe="M1", entry_mode="market"),
+            hub, repo,
+        )
         tracker = SignalTracker()
 
         # replay both closed bars
@@ -243,7 +257,11 @@ class TestEngineE2E:
         await src.connect({"server": "s", "login": "1", "password": "x"})
         hub = EventHub()
         repo = SignalRepo(None)
-        engine = SignalEngine(EngineConfig(smc_enabled=False), hub, repo)
+        # D-050: legacy M1/market profile
+        engine = SignalEngine(
+            EngineConfig(smc_enabled=False, timeframe="M1", entry_mode="market"),
+            hub, repo,
+        )
         tracker = SignalTracker()
         df = await src.get_rates(src.SYMBOL, "M5", 10)
         await engine.on_bar_close("M5", closed_bar_of(df), src, tracker, src.SYMBOL)
@@ -365,7 +383,11 @@ class TestEvaluatePure:
     def test_full_pass_emits_signal(self):
         m1, htf = self._frames()
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
-        ev = evaluate(m1, htf, close_time, EngineConfig(smc_enabled=False), spread_points=20)
+        ev = evaluate(
+            m1, htf, close_time,
+            EngineConfig(smc_enabled=False, entry_mode="market"),
+            spread_points=20,
+        )
         assert ev.signal is not None, ev.trace
         assert ev.signal["direction"] == "BUY"
         assert ev.signal["trigger"] == "sfp"
@@ -374,7 +396,11 @@ class TestEvaluatePure:
     def test_spread_blocks(self):
         m1, htf = self._frames()
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
-        ev = evaluate(m1, htf, close_time, EngineConfig(smc_enabled=False), spread_points=99)
+        ev = evaluate(
+            m1, htf, close_time,
+            EngineConfig(smc_enabled=False, entry_mode="market"),
+            spread_points=99,
+        )
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "spread"
 
@@ -412,14 +438,14 @@ class TestEvaluatePure:
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
         # 30 points passes the absolute cap (35) but the risk is only ~0.54
         ev = evaluate(
-            m1, htf, close_time, EngineConfig(smc_enabled=False),
+            m1, htf, close_time, EngineConfig(smc_enabled=False, entry_mode="market"),
             spread_points=30, point_size=0.01,
         )
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "spread_risk"
         # and the SAME tape trades fine when the spread is small
         ev_ok = evaluate(
-            m1, htf, close_time, EngineConfig(smc_enabled=False),
+            m1, htf, close_time, EngineConfig(smc_enabled=False, entry_mode="market"),
             spread_points=10, point_size=0.01,
         )
         assert ev_ok.signal is not None, ev_ok.trace
@@ -448,7 +474,11 @@ class TestEvaluatePure:
         # morning 00-07 UTC is IN-SESSION via the Tokyo window)
         m1, htf = self._frames(hour_shift=5)
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
-        ev = evaluate(m1, htf, close_time, EngineConfig(smc_enabled=False), spread_points=20)
+        ev = evaluate(
+            m1, htf, close_time,
+            EngineConfig(smc_enabled=False, entry_mode="market"),
+            spread_points=20,
+        )
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "session"
 
@@ -458,7 +488,11 @@ class TestEvaluatePure:
         # morning" root cause): the same setup at 02:01 UTC passes session.
         m1, htf = self._frames(hour_shift=-14)
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
-        ev = evaluate(m1, htf, close_time, EngineConfig(smc_enabled=False), spread_points=20)
+        ev = evaluate(
+            m1, htf, close_time,
+            EngineConfig(smc_enabled=False, entry_mode="market"),
+            spread_points=20,
+        )
         names = [c["name"] for c in ev.trace["checks"]]
         assert "session" in names
         session_check = next(c for c in ev.trace["checks"] if c["name"] == "session")

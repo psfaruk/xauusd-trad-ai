@@ -450,6 +450,21 @@ class OrderExecutor:
             sl_distance = abs(signal["entry"] - signal["sl"])
             lot = size_lot(self._cfg, equity, sl_distance, sym_info)
 
+            # D-050 — pending limit orders: a signal carrying entry_type
+            # "limit" (POI zone entry) becomes a real BUY/SELL LIMIT at the
+            # signal's entry price instead of a market order. The margin
+            # between the market and the limit means the fill only happens
+            # where the structure expects the reaction — fewer noise
+            # stop-outs (user directive).
+            entry_type = signal.get("entry_type", "market")
+            order_type = "market"
+            price: float | None = None
+            if entry_type == "limit":
+                order_type = (
+                    "buy_limit" if signal["direction"] == "BUY" else "sell_limit"
+                )
+                price = float(signal["entry"])
+
             order = Order(
                 symbol=symbol,
                 side=signal["direction"],
@@ -459,6 +474,8 @@ class OrderExecutor:
                 deviation=30,
                 magic=self._cfg.magic,
                 comment=f"xauai-{str(signal_id)[:8] if signal_id else 'manual'}",
+                order_type=order_type,
+                price=price,
             )
             result = await self._place_with_retry(order)
             if result.ok:
@@ -469,16 +486,20 @@ class OrderExecutor:
                         "ticket": result.ticket,
                         "side": order.side,
                         "volume": order.volume,
-                        "price_open": result.price,
+                        "price_open": result.price or price,
                         "sl": order.sl,
                         "tp": order.tp,
                         "opened_at": datetime.now(tz=UTC).isoformat(),
                     }
                 )
+            label = (
+                f"{order_type} @ {price:.2f}" if order_type != "market" else "market"
+            )
             await self._log(
                 "info" if result.ok else "warning",
-                f"order {order.side} {order.volume} {symbol} @ {result.price} "
-                f"retcode={result.retcode} — {result.comment}",
+                f"order {order.side} {order.volume} {symbol} [{label}] "
+                f"@ {result.price or price} retcode={result.retcode} "
+                f"— {result.comment}",
             )
             return result
 

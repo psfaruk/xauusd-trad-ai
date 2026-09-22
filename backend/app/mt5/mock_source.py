@@ -144,6 +144,8 @@ class MockDataSource(PaperPlaneMixin, DataSource):
         self._account = _Account()
         self._positions: list[Position] = []
         self._next_ticket = 100_000
+        # D-050 — pending limit orders awaiting their fill price
+        self._pending_orders: list[tuple[int, Order]] = []
 
         self._t0 = time_mod.monotonic()
         self._manual_seconds = 0.0
@@ -423,6 +425,39 @@ class MockDataSource(PaperPlaneMixin, DataSource):
         if not self._connected:
             return OrderResult(ok=False, retcode=0, comment="mock: not connected")
         tick = await self.get_tick(order.symbol)
+        # D-050 — pending limit orders: fill immediately when the market has
+        # ALREADY reached the limit (limit or better); otherwise the order
+        # waits in the pending book until a later tick trades through it
+        # (promotion happens in get_positions/_promote_pendings).
+        if order.order_type in ("buy_limit", "sell_limit") and order.price:
+            self._next_ticket += 1
+            buy_fill = order.order_type == "buy_limit" and tick.ask <= order.price
+            sell_fill = order.order_type == "sell_limit" and tick.bid >= order.price
+            if buy_fill or sell_fill:
+                fill = order.price
+                self._positions.append(
+                    Position(
+                        ticket=self._next_ticket,
+                        symbol=order.symbol,
+                        side=order.side,
+                        volume=order.volume,
+                        price_open=fill,
+                        sl=order.sl,
+                        tp=order.tp,
+                        profit=0.0,
+                        time=self._vnow(),
+                    )
+                )
+                return OrderResult(
+                    ok=True, ticket=self._next_ticket, price=fill,
+                    retcode=TRADE_RETCODE_DONE, comment="mock pending fill",
+                )
+            self._pending_orders.append((self._next_ticket, order))
+            return OrderResult(
+                ok=True, ticket=self._next_ticket, price=order.price,
+                retcode=TRADE_RETCODE_DONE,
+                comment="mock pending order placed — waiting for fill price",
+            )
         price = tick.ask if order.side == "BUY" else tick.bid
         self._next_ticket += 1
         self._positions.append(
@@ -443,8 +478,45 @@ class MockDataSource(PaperPlaneMixin, DataSource):
             retcode=TRADE_RETCODE_DONE, comment="mock fill",
         )
 
+    async def _promote_pendings(self) -> None:
+        """D-050 — broker-like pending-order fills on the paper plane.
+
+        A BUY limit fills when the ask trades down to its price; a SELL
+        limit when the bid trades up. Fills land at the limit price and
+        become ordinary paper positions (SL/TP then apply via check_stops).
+        """
+        if not self._pending_orders:
+            return
+        still: list[tuple[int, Order]] = []
+        for ticket, order in self._pending_orders:
+            try:
+                tick = await self.get_tick(order.symbol)
+            except Exception:  # noqa: BLE001 — feed hiccup: keep waiting
+                still.append((ticket, order))
+                continue
+            buy_fill = order.order_type == "buy_limit" and tick.ask <= float(order.price)
+            sell_fill = order.order_type == "sell_limit" and tick.bid >= float(order.price)
+            if buy_fill or sell_fill:
+                self._positions.append(
+                    Position(
+                        ticket=ticket,
+                        symbol=order.symbol,
+                        side=order.side,
+                        volume=order.volume,
+                        price_open=float(order.price),
+                        sl=order.sl,
+                        tp=order.tp,
+                        profit=0.0,
+                        time=self._vnow(),
+                    )
+                )
+            else:
+                still.append((ticket, order))
+        self._pending_orders = still
+
     async def get_positions(self) -> list[Position]:
         """Open positions with LIVE floating P/L priced off the current tick."""
+        await self._promote_pendings()
         if not self._positions:
             return []
         out: list[Position] = []

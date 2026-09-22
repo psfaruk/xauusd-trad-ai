@@ -1,20 +1,29 @@
-"""Backtest runner (verification harness for the D-041 M1 engine).
+"""Backtest runner (verification harness for the D-041/D-050 engine).
 
 Runs the EXACT same `engine.evaluate()` pipeline as the live engine over a
-historical base-TF series (M1 by default; bars replayed one-by-one, higher
+historical base-TF series (M5 by default; bars replayed one-by-one, higher
 TF context derived with `closed_asof` to prevent lookahead), then simulates
 the SPEC §8.4 tracker:
 
-- SL/TP from bar highs/lows; when a bar touches BOTH, SL wins (pessimistic),
-- expiry after `expiry_bars` base closes -> result_r from the closing price,
+- D-050 PENDING stage: limit-entry signals start as PENDING orders; a
+  BUY limit fills when a later bar's LOW trades down to the entry, a SELL
+  limit when a bar's HIGH trades up to it (fill at the limit price);
+  `pending_expiry_bars` bars without a fill -> expired UNFILLED (result_r
+  None — a missed trade, never a loss);
+- SL/TP from bar highs/lows; when a bar touches BOTH, SL wins (pessimistic);
+- expiry after `expiry_bars` base closes -> result_r from the closing price;
 - spread applied as an entry cost via `spread_cost_r` (optional, default 0).
 
 Sources of data:
 - `--source mock`  deterministic MockDataSource history (default seed),
-- `--csv file.csv` OHLCV bars (time_utc, o, h, l, c, v) e.g. MT5 export.
+  auto-resampled to the engine timeframe (M1 history -> M5 bars),
+- `--csv file.csv` OHLCV bars ALREADY on the engine timeframe
+  (time_utc, o, h, l, c, v) e.g. MT5 export.
 
-CLI: python -m app.engine.backtest [--bars N] [--csv path] [--inject-every N]
-                                    [--json out.json] [--csv-out out.csv]
+CLI: python -m app.engine.backtest [--bars N] [--csv path] [--tf M5]
+                                    [--entry-mode poi_limit|market]
+                                    [--inject-every N] [--json out.json]
+                                    [--csv-out out.csv]
 Prints a human-readable report and writes machine-readable artifacts.
 """
 
@@ -50,6 +59,15 @@ class BacktestSignal:
     status: str = "active"
     result_r: float | None = None
     exit_ts: datetime | None = None
+    # D-050 — pending-limit order fields
+    entry_type: str = "market"  # "market" | "limit"
+    market_ref: float | None = None  # market price at signal time
+    filled: bool = True  # market signals are born filled
+    fill_ts: datetime | None = None
+
+    @property
+    def is_pending(self) -> bool:
+        return self.entry_type == "limit" and not self.filled
 
 
 @dataclass
@@ -61,10 +79,14 @@ class BacktestResult:
     signals: list[BacktestSignal] = field(default_factory=list)
 
     def stats(self) -> dict:
-        closed = [s for s in self.signals if s.status != "active"]
+        closed = [s for s in self.signals if s.status != "active" and s.status != "pending"]
         won = [s for s in closed if s.status == "won"]
         lost = [s for s in closed if s.status == "lost"]
         expired = [s for s in closed if s.status == "expired"]
+        # D-050 — expired pendings that never filled: missed trades, not losses
+        unfilled = [s for s in expired if s.entry_type == "limit" and not s.filled]
+        limit_signals = [s for s in self.signals if s.entry_type == "limit"]
+        filled_sigs = [s for s in self.signals if s.filled]
         rs = [s.result_r for s in closed if s.result_r is not None]
         gains = sum(r for r in rs if r > 0)
         pains = abs(sum(r for r in rs if r < 0))
@@ -101,6 +123,12 @@ class BacktestResult:
             "won": len(won),
             "lost": len(lost),
             "expired": len(expired),
+            "unfilled": len(unfilled),  # D-050 — missed fills (no trade taken)
+            "filled": len(filled_sigs),
+            "fill_rate": (
+                round(len(filled_sigs) / len(limit_signals), 4)
+                if limit_signals else 1.0
+            ),
             "active": len(self.signals) - len(closed),
             "win_rate": round(len(won) / (len(won) + len(lost)), 4) if (won or lost) else None,
             "avg_r": round(sum(rs) / len(rs), 4) if rs else None,
@@ -138,24 +166,36 @@ def resample_ohlc(base: pd.DataFrame, dst_min: int, src_min: int = 1) -> pd.Data
 
 
 class _SimTracker:
-    """Bar-based §8.4 simulation (SL-first pessimism, D-042 multi-entry).
+    """Bar-based §8.4 simulation (SL-first pessimism, D-042 multi-entry,
+    D-050 pending limit orders).
 
-    Holds up to cfg.max_positions concurrent open signals — mirrors the
-    live engine's concurrent-signal budget exactly.
+    Holds up to cfg.max_positions FILLED signals plus a separate budget of
+    cfg.max_pending_signals PENDING limit orders — mirroring the live
+    engine's split budget exactly (unfilled pendings must never block new
+    signals).
     """
 
     def __init__(self, cfg: EngineConfig) -> None:
         self.cfg = cfg
         self.open_sigs: list[BacktestSignal] = []
-        self._held: dict[int, int] = {}  # id(sig) -> bars held
+        self._held: dict[int, int] = {}  # id(sig) -> bars held (after fill)
+        self._pbars: dict[int, int] = {}  # id(sig) -> bars pending (D-050)
 
     @property
     def full(self) -> bool:
-        return len(self.open_sigs) >= max(1, self.cfg.max_positions)
+        """D-050 — BOTH budgets checked: filled positions AND pendings."""
+        filled = [s for s in self.open_sigs if s.filled]
+        pending = [s for s in self.open_sigs if not s.filled and s.status == "pending"]
+        return (
+            len(filled) >= max(1, self.cfg.max_positions)
+            or len(pending) >= max(1, self.cfg.max_pending_signals)
+        )
 
     def add(self, sig: BacktestSignal) -> None:
+        sig.status = "pending" if sig.is_pending else "active"
         self.open_sigs.append(sig)
         self._held[id(sig)] = 0
+        self._pbars[id(sig)] = 0
 
     def step(self, bar: pd.Series) -> list[BacktestSignal]:
         """Advance one base-TF bar; return signals that closed this bar."""
@@ -163,16 +203,44 @@ class _SimTracker:
             return []
         closed: list[BacktestSignal] = []
         for sig in list(self.open_sigs):
-            self._held[id(sig)] += 1
             if self._step_one(sig, bar):
                 self.open_sigs.remove(sig)
                 self._held.pop(id(sig), None)
+                self._pbars.pop(id(sig), None)
                 closed.append(sig)
         return closed
 
     def _step_one(self, sig: BacktestSignal, bar: pd.Series) -> bool:
         """True when the signal resolved on this bar (SL-first pessimism)."""
         high, low, close = float(bar["h"]), float(bar["l"]), float(bar["c"])
+
+        # D-050 — PENDING stage: wait for the market to retrace to the limit
+        if sig.status == "pending":
+            self._pbars[id(sig)] += 1
+            buy_touch = sig.direction == "BUY" and low <= sig.entry
+            sell_touch = sig.direction == "SELL" and high >= sig.entry
+            if buy_touch or sell_touch:
+                sig.filled = True
+                sig.fill_ts = bar["time_utc"].to_pydatetime() \
+                    if hasattr(bar["time_utc"], "to_pydatetime") else bar["time_utc"]
+                sig.status = "active"
+                # same-bar pessimism: the fill happened somewhere in the
+                # bar — if the bar also swept the SL, SL wins
+                if sig.direction == "BUY" and low <= sig.sl:
+                    sig.status, sig.result_r = "lost", -1.0
+                    return self._exit(sig, bar)
+                if sig.direction == "SELL" and high >= sig.sl:
+                    sig.status, sig.result_r = "lost", -1.0
+                    return self._exit(sig, bar)
+                return False
+            if self._pbars[id(sig)] >= self.cfg.pending_expiry_bars:
+                sig.status = "expired"
+                sig.result_r = None  # never filled — missed trade, no R
+                return self._exit(sig, bar)
+            return False
+
+        # ACTIVE stage (market-born signals start here; limit signals after fill)
+        self._held[id(sig)] += 1
         if sig.direction == "BUY":
             if low <= sig.sl:
                 sig.status, sig.result_r = "lost", -1.0
@@ -199,6 +267,10 @@ class _SimTracker:
                 sig.result_r = round((sig.entry - close) / (sig.sl - sig.entry), 4)
             else:
                 return False
+        return self._exit(sig, bar)
+
+    @staticmethod
+    def _exit(sig: BacktestSignal, bar: pd.Series) -> bool:
         bar_time = bar["time_utc"]
         sig.exit_ts = (
             bar_time.to_pydatetime() if hasattr(bar_time, "to_pydatetime") else bar_time
@@ -214,9 +286,11 @@ def run_backtest(
 ) -> BacktestResult:
     """Replay the base-TF series through the live evaluate() pipeline.
 
-    D-041: the base TF is cfg.timeframe (M1 by default); every confirm/trend
+    The base TF is cfg.timeframe (M5 by default, D-050); every confirm/trend
     TF frame is resampled from the SAME series and sliced with closed_asof
     so no evaluation ever sees a higher-TF bar that had not closed yet.
+    Pass an ALREADY-base-TF series (mock history is resampled by the CLI
+    loader; CSVs are expected on the engine TF).
     """
     cfg = cfg or EngineConfig()
     tf_min = TIMEFRAME_MINUTES[cfg.timeframe]
@@ -284,6 +358,7 @@ def run_backtest(
         if ev.signal is None:
             continue
         p = ev.signal
+        entry_type = p.get("entry_type", "market")
         sig = BacktestSignal(
             ts=bar["time_utc"].to_pydatetime(),
             direction=p["direction"],
@@ -293,19 +368,23 @@ def run_backtest(
             confidence=p["confidence"],
             session=p["session"],
             trigger=p.get("trigger", "sfp"),
+            entry_type=entry_type,
+            market_ref=p.get("market_ref"),
+            filled=entry_type != "limit",  # D-050 — pendings wait for a fill
         )
         result.signals.append(sig)
         sim.add(sig)
         cooldown_until = i + cfg.cooldown_bars + 1
 
-    # D-041 — honest spread cost: a BUY fills at the ask and exits at the bid,
-    # so every trade pays one spread. Deduct it from the realized R using the
+    # D-041/D-050 — honest spread cost: a BUY fills at the ask and exits at
+    # the bid, so every FILLED trade pays one spread. Unfilled pendings
+    # never traded — no cost. Deducted from the realized R using the
     # signal's own risk distance (XAUUSD point = 0.01).
     if spread_points and spread_points > 0:
         cost = spread_points * 0.01
         for s in result.signals:
             risk = abs(s.entry - s.sl)
-            if risk > 0 and s.result_r is not None:
+            if risk > 0 and s.filled and s.result_r is not None:
                 s.result_r = round(s.result_r - cost / risk, 4)
 
     return result
@@ -529,13 +608,14 @@ def format_report(res: BacktestResult, label: str) -> str:
     s = res.stats()
     lines = [
         "=" * 64,
-        f" M1 MTF ENGINE BACKTEST — {label}",
+        f" M5 MTF ENGINE BACKTEST — {label}",
         "=" * 64,
         f" period        : {s['date_from']} -> {s['date_to']} UTC",
         f" base bars     : {s['bars_tested']} ({res.cfg.timeframe})",
         f" signals       : {s['total_signals']} ({s['signals_per_hour']}/h)"
-        f" (won {s['won']} / lost {s['lost']} / expired {s['expired']}"
-        f" / active {s['active']})",
+        f" (won {s['won']} / lost {s['lost']} / expired {s['expired']}",
+        f"                 unfilled {s['unfilled']} / active {s['active']})"
+        f" — fill_rate {s['fill_rate']}",
         f" win rate      : {s['win_rate']}",
         f" total R       : {s['total_r']}",
         f" expectancy    : {s['expectancy']} R per signal",
@@ -549,9 +629,17 @@ def format_report(res: BacktestResult, label: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="M1 MTF engine backtest")
+    p = argparse.ArgumentParser(description="M5 MTF engine backtest (D-050)")
     p.add_argument("--bars", type=int, default=5000, help="M1 bars from mock history")
-    p.add_argument("--csv", type=str, default=None, help="OHLCV csv (time_utc,o,h,l,c,v)")
+    p.add_argument(
+        "--csv", type=str, default=None,
+        help="OHLCV csv on the engine TF (time_utc,o,h,l,c,v)",
+    )
+    p.add_argument("--tf", type=str, default=None,
+                   help="override the engine timeframe (default: the config's, M5)")
+    p.add_argument("--entry-mode", type=str, default=None,
+                   choices=("poi_limit", "market"),
+                   help="override the entry mode (default: the config's)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--inject-every", type=int, default=0,
                    help="overlay a crafted SFP sweep every N bars (engine sanity mode)")
@@ -563,17 +651,30 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--csv-out", type=str, default=None, help="write signals CSV here")
     args = p.parse_args(argv)
 
+    cfg = EngineConfig()
+    if args.tf:
+        cfg = cfg.model_copy(update={"timeframe": args.tf})
+    if args.entry_mode:
+        cfg = cfg.model_copy(update={"entry_mode": args.entry_mode})
+
     if args.csv:
         base = load_csv(args.csv)
         label = f"CSV {args.csv}"
     else:
         base = load_mock_history(args.bars, seed=args.seed)
         label = f"mock seed={args.seed} bars={len(base)}"
+        # D-050 — the mock generates M1; the engine TF may be M5/M15 —
+        # resample the base series up-front so the replay is honest.
+        tf_min = TIMEFRAME_MINUTES[cfg.timeframe]
+        if tf_min > 1:
+            base = resample_ohlc(base, tf_min, src_min=1)
+            label += f" -> {cfg.timeframe}"
     if args.inject_every:
         base = inject_sweep_series(base, args.inject_every, seed=args.seed)
         label += f" +injected-sweep-every-{args.inject_every}"
 
-    res = run_backtest(base, spread_points=args.spread)
+    label += f" entry={cfg.entry_mode}"
+    res = run_backtest(base, cfg=cfg, spread_points=args.spread)
     print(format_report(res, label))
     risk = simulate_risk(res, start_equity=args.start_equity)
     print(format_risk_report(risk))
@@ -595,6 +696,10 @@ def main(argv: list[str] | None = None) -> int:
                     "confidence": s.confidence,
                     "session": s.session,
                     "trigger": s.trigger,
+                    "entry_type": s.entry_type,
+                    "market_ref": s.market_ref,
+                    "filled": s.filled,
+                    "fill_ts": s.fill_ts.isoformat() if s.fill_ts else None,
                     "status": s.status,
                     "result_r": s.result_r,
                     "exit_ts": s.exit_ts.isoformat() if s.exit_ts else None,
@@ -611,7 +716,8 @@ def main(argv: list[str] | None = None) -> int:
                     "ts": s.ts, "direction": s.direction, "entry": s.entry,
                     "sl": s.sl, "tp": s.tp, "confidence": s.confidence,
                     "session": s.session, "trigger": s.trigger,
-                    "status": s.status, "result_r": s.result_r,
+                    "entry_type": s.entry_type, "market_ref": s.market_ref,
+                    "filled": s.filled, "status": s.status, "result_r": s.result_r,
                 }
                 for s in res.signals
             ]

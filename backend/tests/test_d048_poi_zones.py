@@ -282,7 +282,8 @@ def test_evaluate_zone_trigger_bypasses_confluence_count() -> None:
     df = _demand_zone_frame()
     htf = _uptrend_htf()
     close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-    cfg = EngineConfig(min_confluence=6)  # sfp/pullback can never pass this
+    # count gate impossible; D-050 legacy-entry fixture
+    cfg = EngineConfig(min_confluence=6, entry_mode="market")
     ev = evaluate(df, htf, close_time, cfg, spread_points=20)
     assert ev.signal is not None, ev.trace["checks"]
     assert ev.signal["trigger"] == "zone"
@@ -322,7 +323,7 @@ def test_evaluate_zone_fires_without_mtf_agreement() -> None:
         ]
         htf[tf] = pd.DataFrame(rows, columns=["time_utc", "o", "h", "l", "c", "v"])
     close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-    cfg = EngineConfig()
+    cfg = EngineConfig(entry_mode="market")  # D-050 — zone/MTF arbitration on the legacy entry
     ev = evaluate(df, htf, close_time, cfg, spread_points=20)
     assert ev.signal is not None, ev.trace["checks"]
     assert ev.signal["trigger"] == "zone"
@@ -337,14 +338,14 @@ def test_evaluate_sfp_still_wins_arbitration() -> None:
     # already below -> SFP fires (wick 0.65 >= 0.35*ATR), zone also fires
     htf = _uptrend_htf()
     close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-    cfg = EngineConfig(min_confluence=6)  # sfp/pullback can never pass this
+    cfg = EngineConfig(min_confluence=6, entry_mode="market")  # D-050 fixture
     ev = evaluate(df, htf, close_time, cfg, spread_points=20)
     # even if an SFP fired on this bar, the impossible count gates it out
     # and the zone path takes over — a signal still exists
     assert ev.signal is not None
     assert ev.signal["trigger"] == "zone"
     # -> now open the count gate fully: the strongest available trigger wins
-    cfg2 = EngineConfig(min_confluence=0)
+    cfg2 = EngineConfig(min_confluence=0, entry_mode="market")
     ev2 = evaluate(df, htf, close_time, cfg2, spread_points=20)
     assert ev2.signal is not None
     assert ev2.signal["trigger"] in ("sfp", "zone")
@@ -384,9 +385,19 @@ def test_config_d048_defaults() -> None:
     assert DEFAULT_CONFIG.tp_min_rr == 1.2
     assert DEFAULT_CONFIG.tp_max_r == 3.0
     assert DEFAULT_CONFIG.rr == 1.6
-    assert DEFAULT_CONFIG.expiry_bars == 45
+    assert DEFAULT_CONFIG.expiry_bars == 36  # D-050: 3h on the M5 base TF
     assert DEFAULT_CONFIG.max_spread_to_risk == 0.30
     assert DEFAULT_CONFIG.max_trades_per_day == 6
+    # D-050 — M5 short-term profile + POI pending entries
+    assert DEFAULT_CONFIG.timeframe == "M5"
+    assert DEFAULT_CONFIG.confirm_tfs == ["M15"]
+    assert DEFAULT_CONFIG.min_atr == 0.25
+    assert DEFAULT_CONFIG.entry_mode == "poi_limit"
+    assert DEFAULT_CONFIG.entry_offset_atr == 0.35
+    assert DEFAULT_CONFIG.pending_offset_atr == 0.8
+    assert DEFAULT_CONFIG.pending_max_atr == 10.0
+    assert DEFAULT_CONFIG.pending_expiry_bars == 24
+    assert DEFAULT_CONFIG.max_pending_signals == 6
     # bounds enforced
     try:
         EngineConfig(min_zone_quality=1.5)

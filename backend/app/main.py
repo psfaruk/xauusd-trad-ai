@@ -172,33 +172,42 @@ async def lifespan(app: FastAPI):
     if not any(isinstance(h, DBLogHandler) for h in root.handlers):
         root.addHandler(DBLogHandler(lambda: app.state.db_engine))
 
-    # --- D-018/D-030/D-033: mock + live auto-connect / mt5 stored-credential
+    # --- D-018/D-030/D-033/D-050: mock + live auto-connect / mt5 stored-credential
     # restore. Live connect waits for the first REAL tick (WS or REST) — on
     # total outage it raises, the status shows the no-feed state, and the
     # ConnectionManager heartbeat retries connect() forever. NO demo data.
+    # D-050 — "অটো ট্রেড ওপেন থাকুক বা না থাকুক সিগন্যাল আসবে": the signal
+    # engine must NEVER depend on the boot instant (or on broker/auto-trade
+    # state). When the auto-connect fails at boot the heartbeat keeps
+    # retrying the stored credentials every ~5s, so the engine runtime —
+    # and with it SIGNALS — start the moment a provider answers.
     if effective_data_source in ("mock", "live"):
+        boot_creds = (
+            {"server": "LiveMarket", "login": "REALTIME", "password": "none"}
+            if effective_data_source == "live"
+            else {"server": "MockServer", "login": "10000000", "password": "mock"}
+        )
         try:
             if effective_data_source == "live":
-                st = await app.state.mt5.connect(
-                    {"server": "LiveMarket", "login": "REALTIME", "password": "none"}
-                )
+                st = await app.state.mt5.connect(boot_creds)
                 feed = st.get("feed") or {}
                 logger.info(
                     "live source auto-connected (D-030) — provider=%s price=%s",
                     feed.get("provider", "?"), feed.get("last_price", "?"),
                 )
             else:
-                await app.state.mt5.connect(
-                    {"server": "MockServer", "login": "10000000", "password": "mock"}
-                )
+                await app.state.mt5.connect(boot_creds)
                 logger.info("mock source auto-connected (D-018) — dashboard streams now")
         except Exception:  # noqa: BLE001 — never block boot
             logger.exception(
                 "%s auto-connect failed — status shows NO FEED until a "
                 "provider answers (no demo fallback, D-033); heartbeat "
-                "retries every ~5s",
+                "retries every ~5s (D-050)",
                 effective_data_source,
             )
+            # D-050 — start the retry loop NOW (creds are stored pre-attempt
+            # inside connect()); signals resume without a restart.
+            app.state.mt5.ensure_heartbeat()
     else:
         asyncio.create_task(app.state.mt5.try_restore())
 

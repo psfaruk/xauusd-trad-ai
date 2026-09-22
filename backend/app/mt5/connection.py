@@ -113,10 +113,18 @@ class ConnectionManager:
 
         `owner` scopes the persisted credential row (multi-user Phase 4);
         None = the platform/admin plane.
+
+        D-050: `self._creds` is stored BEFORE the source connect attempt —
+        when the first connect fails at boot (live feed not yet answering)
+        the heartbeat loop still has the credentials to retry every ~5s,
+        so the engine (and therefore SIGNALS) always come back once a
+        provider answers. The old code stored creds only after success,
+        which left a failed boot permanently engine-less — the exact
+        "সিগন্যাল আসে না" report that started this rework.
         """
         async with self._connecting:
+            self._creds = dict(creds)  # D-050 — retryable from the first beat
             info = await self._source.connect(creds)
-            self._creds = dict(creds)
             self.state.status = "connected"
             self.state.login = str(info.get("login", creds.get("login")))
             self.state.server = str(info.get("server", creds.get("server", "")))
@@ -357,6 +365,13 @@ class ConnectionManager:
 
     # -------------------------------------------------------------- heartbeat
 
+    def ensure_heartbeat(self) -> None:
+        """D-050 — public boot hook: start the heartbeat even when the very
+        first connect failed. The loop retries the stored credentials
+        forever, so the engine runtime (and signals) start the moment a
+        provider answers — no manual re-deploy/restart needed."""
+        self._ensure_heartbeat()
+
     def _ensure_heartbeat(self) -> None:
         if self._heartbeat_task is None or self._heartbeat_task.done():
             self._stop.clear()
@@ -373,8 +388,13 @@ class ConnectionManager:
     async def _heartbeat_loop(self) -> None:
         """Monitor + auto-reconnect (SPEC Phase 2: reconnect within 10s).
 
-        While connected it also rebroadcasts the status every ~15s so every
-        client's live-feed badge (provider, price age) stays fresh (D-030).
+        D-050: a boot-time connect failure now ALSO recovers — the loop
+        re-runs `connect()` with the stored credentials until it sticks
+        (the live feed may take minutes to answer on a cold start; the
+        engine runtime and its signals must not depend on the boot
+        instant). While connected it also rebroadcasts the status every
+        ~15s so every client's live-feed badge (provider, price age) stays
+        fresh (D-030).
         """
         offset_checked = time_mod.monotonic()
         status_broadcast = 0.0
@@ -382,6 +402,19 @@ class ConnectionManager:
             while not self._stop.is_set():
                 await asyncio.sleep(HEARTBEAT_S)
                 if self.state.status == "disconnected":
+                    # D-050 — boot connect failed: keep retrying (the creds
+                    # are stored pre-attempt now); signals flow as soon as a
+                    # provider answers, broker/arm state irrelevant.
+                    if self._creds is None:
+                        continue
+                    try:
+                        await self.connect(self._creds)
+                        logger.info(
+                            "connect recovered by heartbeat — engine runtime"
+                            " restarted, signals flowing"
+                        )
+                    except Exception as exc:  # noqa: BLE001 — retry next beat
+                        logger.info("boot reconnect attempt failed: %s", exc)
                     continue
                 ok = await self._source.is_connected()
                 if ok:

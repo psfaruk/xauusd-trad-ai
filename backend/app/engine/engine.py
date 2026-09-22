@@ -51,6 +51,7 @@ from app.engine.filters import (
     check_session,
     rsi_position,
 )
+from app.engine.indicators import atr as atr_calc
 from app.engine.sfp import (
     PullbackSignal,
     SfpSignal,
@@ -67,6 +68,7 @@ from app.engine.zones import (
     build_levels_zone,
     check_rsi_zone,
     detect_zone_retest,
+    poi_pending_entry,
     zone_retest_note,
     zone_trigger_quality,
 )
@@ -162,7 +164,7 @@ def evaluate(
     # sfp-beats-zone-always rule let a weak sweep shadow a strong zone
     # retest and then die at the confluence gate: signal lost).
     zones: list[dict] = []
-    if cfg.zone_trigger_enabled or cfg.smc_enabled:
+    if cfg.zone_trigger_enabled or cfg.smc_enabled or cfg.entry_mode == "poi_limit":
         from app.analysis.poi import poi_zones
 
         zones = poi_zones(base, htf)
@@ -329,6 +331,32 @@ def evaluate(
         trigger_quality = pullback_quality(sig_pb)
         trigger_tag = sig_pb
 
+    # D-050 — POI pending entry (user directive): the entry stops being
+    # the trigger close (a market order that fills wherever the noise
+    # happens to be) and becomes a PENDING LIMIT anchored at a structural
+    # POI level BEYOND the market — BUY limits below the demand/support
+    # zone, SELL limits above the supply/resistance zone. The distance
+    # between market and entry is the margin the old mode lacked; SL/TP
+    # are then re-derived from the (deeper) pending entry by the same
+    # smart_targets pass below.
+    market_ref = entry  # trigger close = the market price at signal time
+    entry_type = "market"
+    entry_note = "market entry at trigger close"
+    if cfg.entry_mode == "poi_limit":
+        atr_val = atr_calc(base, cfg.atr_period) or 1e-9
+        point = point_size if point_size > 0 else 0.01
+        pending, entry_note = poi_pending_entry(
+            trigger_tag.direction, market_ref, zones, atr_val, cfg,
+            spread_price=spread_points * point,
+        )
+        entry, entry_type = pending, "limit"
+        trace.add(
+            "entry_mode", True,
+            f"pending {entry_type} @ {entry:.2f} "
+            f"({market_ref - entry:+.2f} from market {market_ref:.2f}) — "
+            f"{entry_note}",
+        )
+
     # D-042/D-047/D-049 — structure-aware exits: SL beyond the structural
     # invalidation, floored at 2.5x spread AND min_sl_atr ATRs, capped at
     # max_sl_atr, anchored past the NEAREST strong TPO level; TP predicted
@@ -423,6 +451,9 @@ def evaluate(
         "target_note": target_note,
         "confidence": round(min(max(confidence, 0.0), 1.0), 3),
         "trigger": trigger,
+        "entry_type": entry_type,  # D-050 — "market" | "limit"
+        "market_ref": round(market_ref, 2),  # market at signal time
+        "entry_note": entry_note,  # D-050 — the POI anchor description
         "trace": trace_dict,
         "bar_time": base["time_utc"].iloc[-1],
         "session": session_name,
@@ -513,12 +544,21 @@ class SignalEngine:
 
         # Rule 7a — state: cooldown + concurrent-signal budget (D-042
         # multi-entry: up to cfg.max_positions tracked signals at once).
+        # D-050 — the budget SPLITS: FILLED/active signals count against
+        # max_positions, PENDING (unfilled limit) signals count against
+        # max_pending_signals. Unfilled pendings must never clog the flow
+        # (user directive: "অটো ট্রেড ওপেন থাকুক বা না থাকুক সিগন্যাল আসবে" —
+        # signals keep coming regardless).
         if self._in_cooldown(cfg, bar_open):
             return
         active_now = tracker.active
         if callable(active_now):  # duck-typed fakes may expose a method
             active_now = active_now()
-        if len(active_now) >= max(int(cfg.max_positions), 1):
+        filled = [s for s in active_now if getattr(s, "status", "active") != "pending"]
+        pending = [s for s in active_now if getattr(s, "status", "") == "pending"]
+        if len(filled) >= max(int(cfg.max_positions), 1):
+            return
+        if len(pending) >= max(int(cfg.max_pending_signals), 1):
             return
 
         try:
@@ -608,6 +648,8 @@ class SignalEngine:
                 trace=payload["trace"],
                 bar_time=bar_open,
                 signal_id=signal_id,
+                entry_type=payload.get("entry_type", "market"),
+                market_ref=payload.get("market_ref"),
             )
         )
 

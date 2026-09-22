@@ -119,7 +119,13 @@ class EngineRuntime:
             close_time = datetime.fromtimestamp(bar["t"], tz=UTC) + timedelta(
                 minutes=TIMEFRAME_MINUTES[tf]
             )
-            await self.tracker.on_bar_close(cfg.expiry_bars, close_time, bar["c"])
+            # D-050 — pending-fill fallback (bar low/high) + the separate
+            # pending-expiry budget for unfilled limit orders
+            await self.tracker.on_bar_close(
+                cfg.expiry_bars, close_time, bar["c"],
+                pending_expiry_bars=cfg.pending_expiry_bars,
+                bar_low=bar.get("l"), bar_high=bar.get("h"),
+            )
 
     async def _on_signal_status(self, sig: TrackedSignal) -> None:
         from app.engine.repo import SignalRepo  # noqa: F401 — type hint only

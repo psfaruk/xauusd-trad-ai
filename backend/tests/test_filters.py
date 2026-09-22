@@ -28,6 +28,10 @@ from app.engine.filters import (
 from app.engine.trace import Trace
 
 CFG = EngineConfig()
+# D-048-era MTF/ATR fixture config: the shipped default moved to M5 with a
+# single M15 confirm (D-050), but these tests exercise the MTF LOGIC on a
+# two-frame set — so they pin their own engine profile (M1 + M5/M15 confirms).
+MTF_CFG = EngineConfig(timeframe="M1", confirm_tfs=["M5", "M15"], min_atr=0.15)
 
 
 def frame(closes, start="2025-01-06 07:00"):
@@ -173,10 +177,10 @@ class TestConfidenceParts:
         assert rsi_position(40.0, CFG, "BUY") == pytest.approx(0.0)
 
     def test_atr_strength_double_full(self):
-        assert atr_strength(0.3, CFG) == pytest.approx(1.0)  # 2x min_atr (0.15)
+        assert atr_strength(CFG.min_atr * 2, CFG) == pytest.approx(1.0)  # 2x floor
 
     def test_atr_strength_below_min_zero(self):
-        assert atr_strength(0.075, CFG) == pytest.approx(0.25)
+        assert atr_strength(CFG.min_atr * 0.5, CFG) == pytest.approx(0.25)
 
 
 class TestMtfConfirm:
@@ -184,13 +188,13 @@ class TestMtfConfirm:
         up = frame([100 + i for i in range(60)])
         trace = Trace()
         trace.direction = "BUY"
-        assert check_mtf({"M5": up, "M15": up}, "BUY", CFG, trace) == 2
+        assert check_mtf({"M5": up, "M15": up}, "BUY", MTF_CFG, trace) == 2
 
     def test_conflict_reduces_agreement(self):
         up = frame([100 + i for i in range(60)])
         down = frame([160 - i for i in range(60)])
         trace = Trace()
-        agreed = check_mtf({"M5": up, "M15": down}, "BUY", CFG, trace)
+        agreed = check_mtf({"M5": up, "M15": down}, "BUY", MTF_CFG, trace)
         assert agreed == 1
 
     def test_insufficient_history_counts_against(self):

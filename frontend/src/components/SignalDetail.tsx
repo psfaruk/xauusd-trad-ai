@@ -7,11 +7,12 @@
 import type { Signal, SignalStatus } from "../types";
 import { Badge, Card } from "./ui";
 
-export function statusTone(status: SignalStatus): "green" | "red" | "amber" | "gold" | "zinc" {
+export function statusTone(status: SignalStatus): "green" | "red" | "amber" | "gold" | "blue" | "zinc" {
   if (status === "won") return "green";
   if (status === "lost") return "red";
   if (status === "expired") return "amber";
   if (status === "active") return "gold";
+  if (status === "pending") return "blue"; // D-050 — waiting for the limit fill
   return "zinc";
 }
 
@@ -51,6 +52,8 @@ function prettyCheck(name: string): string {
     killzone: "ICT Kill Zone",
     whale_bias: "Whale Bias",
     confluence: "ICT Confluence",
+    // D-050 pending-entry stage
+    entry_mode: "Pending Entry (POI)",
   };
   return map[name] ?? name;
 }
@@ -131,6 +134,10 @@ export function SignalDetail({ signal }: { signal: Signal }) {
         </span>
         <Badge tone="zinc">{signal.symbol} · {signal.tf}</Badge>
         <Badge tone={statusTone(signal.status)}>{signal.status}</Badge>
+        {/* D-050 — POI pending limit entry badge */}
+        {signal.entry_type === "limit" && (
+          <Badge tone="blue">PENDING LIMIT</Badge>
+        )}
         <Badge tone="blue">
           {trigger === "sfp"
             ? "Liquidity Sweep"
@@ -144,10 +151,17 @@ export function SignalDetail({ signal }: { signal: Signal }) {
       {/* entry geometry */}
       <div className="grid grid-cols-3 gap-2">
         <div className="rounded-xl border border-gold/25 bg-gold/5 px-3 py-2">
-          <p className="text-[10px] font-semibold uppercase tracking-wider text-gold/80">Entry</p>
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-gold/80">
+            {signal.entry_type === "limit" ? "Entry (Limit)" : "Entry"}
+          </p>
           <p className="truncate font-mono text-sm font-semibold text-zinc-100 tabular-nums">
             {signal.entry.toFixed(2)}
           </p>
+          {signal.entry_type === "limit" && signal.market_ref != null && (
+            <p className="truncate font-mono text-[10px] text-zinc-500">
+              market {signal.market_ref.toFixed(2)}
+            </p>
+          )}
         </div>
         <div className="rounded-xl border border-red-500/25 bg-red-500/5 px-3 py-2">
           <p className="text-[10px] font-semibold uppercase tracking-wider text-red-400/80">
@@ -172,6 +186,15 @@ export function SignalDetail({ signal }: { signal: Signal }) {
         <p className="rounded-lg border border-zinc-700/60 bg-zinc-800/40 px-3 py-1.5 text-[10px] leading-relaxed text-zinc-400">
           <span className="font-semibold text-zinc-300">TP predicted at</span>{" "}
           {signal.target_note}
+        </p>
+      )}
+
+      {/* D-050 — the POI anchor the pending limit sits at */}
+      {signal.entry_type === "limit" && signal.entry_note && (
+        <p className="rounded-lg border border-blue-500/25 bg-blue-500/5 px-3 py-1.5 text-[10px] leading-relaxed text-zinc-400">
+          <span className="font-semibold text-blue-300">Pending entry at</span>{" "}
+          {signal.entry_note}
+          {signal.filled_at ? ` — filled ${fmtTime(signal.filled_at)}` : " — waiting for the market to retrace"}
         </p>
       )}
 

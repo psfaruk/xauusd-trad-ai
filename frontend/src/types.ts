@@ -8,7 +8,13 @@ export const TIMEFRAMES: Timeframe[] = ["M1", "M5", "M15", "M30", "H1", "H4", "D
 
 export type SignalDirection = "BUY" | "SELL";
 
-export type SignalStatus = "active" | "won" | "lost" | "expired" | "cancelled";
+export type SignalStatus =
+  | "pending"
+  | "active"
+  | "won"
+  | "lost"
+  | "expired"
+  | "cancelled";
 
 export interface HealthInfo {
   status: string;
@@ -84,6 +90,14 @@ export interface Signal {
   status: SignalStatus;
   result_r: number | null;
   closed_at: string | null;
+  /** D-050 — POI pending (limit) order fields: the entry is a PENDING
+   * limit anchored at a POI zone level beyond the market (BUY below the
+   * demand zone / SELL above the supply zone) until the market retraces
+   * to it and fills. */
+  entry_type?: "market" | "limit";
+  market_ref?: number | null;
+  entry_note?: string | null;
+  filled_at?: string | null;
 }
 
 /** Live-feed transparency (D-030): active provider + price freshness. */

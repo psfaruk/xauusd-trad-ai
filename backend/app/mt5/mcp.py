@@ -389,6 +389,35 @@ class MT5TerminalClient:
             raise MCPError(res)
         return res
 
+    def pending_order(self, symbol: str, order_type: str, volume: float,
+                      price: float, sl: float | None = None,
+                      tp: float | None = None,
+                      comment: str = "") -> dict[str, Any]:
+        """D-050 — place a PENDING limit order on the real terminal.
+
+        `order_type`: "buy_limit" | "sell_limit" (an entry BELOW the market
+        for a BUY / ABOVE it for a SELL — the POI zone pending entry). SL/TP
+        ride with the order so the exit stays server-side (Exness executes
+        them even if the platform goes down, same guarantee market orders
+        have). The fill happens when the market retraces to `price`.
+        """
+        args: dict[str, Any] = {
+            "symbol": symbol,
+            "order_type": order_type,
+            "volume": volume,
+            "price": price,
+        }
+        if sl:
+            args["sl"] = sl
+        if tp:
+            args["tp"] = tp
+        if comment:
+            args["comment"] = comment[:31]
+        res = self._call("trade_send_pending_order", args, timeout=120)
+        if isinstance(res, str):
+            raise MCPError(res)
+        return res
+
     def close_position(self, symbol: str, ticket: int) -> dict[str, Any]:
         res = self._call("trade_close_single_position",
                          {"symbol": symbol, "position_ticket": ticket}, timeout=120)

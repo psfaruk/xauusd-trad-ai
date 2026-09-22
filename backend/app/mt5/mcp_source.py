@@ -245,15 +245,29 @@ class McpTradingSource(DataSource):
     async def place_order(self, order: Order) -> OrderResult:
         broker = self.broker_symbol(order.symbol) or order.symbol
         try:
-            res = await asyncio.to_thread(
-                self._client.market_order,
-                broker,
-                order.side.lower(),
-                order.volume,
-                order.sl,
-                order.tp,
-                order.comment,
-            )
+            # D-050 — pending limit orders ride their own terminal tool;
+            # SL/TP are attached server-side exactly like market orders.
+            if order.order_type in ("buy_limit", "sell_limit") and order.price:
+                res = await asyncio.to_thread(
+                    self._client.pending_order,
+                    broker,
+                    order.order_type,
+                    order.volume,
+                    order.price,
+                    order.sl,
+                    order.tp,
+                    order.comment,
+                )
+            else:
+                res = await asyncio.to_thread(
+                    self._client.market_order,
+                    broker,
+                    order.side.lower(),
+                    order.volume,
+                    order.sl,
+                    order.tp,
+                    order.comment,
+                )
         except (MCPError, OSError) as exc:
             logger.warning("terminal order failed: %s", exc)
             # D-040: the terminal-side permission refusal carries the fix hint
@@ -269,7 +283,7 @@ class McpTradingSource(DataSource):
         return OrderResult(
             ok=ok,
             ticket=int(ticket) if ticket else None,
-            price=float(res["price"]) if res.get("price") else None,
+            price=float(res["price"]) if res.get("price") else order.price,
             retcode=int(retcode) if retcode is not None else None,
             comment=str(res.get("retcode_details") or ""),
             volume=float(res["volume"]) if res.get("volume") else None,
