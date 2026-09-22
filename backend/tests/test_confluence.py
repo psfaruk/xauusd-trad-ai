@@ -237,18 +237,19 @@ class TestConfluence:
 
     def test_smart_targets_floor_cap_and_snap(self):
         m1 = bullish_ict_m1()
-        entry, sl, tp = smart_targets(
+        entry, sl, tp, note = smart_targets(
             m1, "BUY", 108.2, 106.8, rr=1.1, min_sl_atr=1.3, max_sl_atr=3.5,
         )
         a = ind.atr(m1, 14)
         assert entry == 108.2
         assert 108.2 - 3.5 * a - 1e-9 <= sl <= 108.2 - 1.3 * a + 1e-9
-        assert tp > entry  # BUY target above
+        assert tp is None or tp > entry  # BUY target above (or skipped)
+        assert isinstance(note, str) and note
 
     def test_smart_targets_caps_risk(self):
         m1 = bullish_ict_m1()
         # absurd structural SL far below -> capped at max_sl_atr
-        _, sl, _ = smart_targets(
+        _, sl, _, _ = smart_targets(
             m1, "BUY", 108.2, 80.0, rr=1.0, min_sl_atr=1.3, max_sl_atr=1.5,
         )
         a = ind.atr(m1, 14)

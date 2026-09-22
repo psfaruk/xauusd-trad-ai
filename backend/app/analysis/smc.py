@@ -64,7 +64,41 @@ def detect_structure(df: pd.DataFrame, left: int = 2, right: int = 2,
       events: [{t, level, kind: "BOS"|"CHoCH", dir: "up"|"down"}],
       last_event: {...} | None,
     }
+
+    D-049: memoized — the bias vote and the confluence panel both call
+    this on the SAME (mostly-unchanging) HTF frames every bar close;
+    H1/M15/H4 structures only change at their own bar closes, so the
+    memo turns ~6 full scans per M1 close into ~2.
     """
+    if df is None or len(df) < 10:
+        return {"trend": "balanced", "swings": [], "events": [],
+                "last_event": None}
+    try:
+        mkey = (
+            str(pd.Timestamp(df["time_utc"].iloc[-1])), int(len(df)),
+            round(float(df["c"].iloc[0]), 4),  # symbol fingerprint — a
+            # same-timestamp frame of ANOTHER symbol must never hit
+            int(left), int(right), int(max_events),
+        )
+    except Exception:  # noqa: BLE001 — memo must never break analysis
+        mkey = None
+    if mkey is not None:
+        hit = _STRUCT_MEMO.get(mkey)
+        if hit is not None:
+            return hit
+    out = _detect_structure_impl(df, left, right, max_events)
+    if mkey is not None:
+        if len(_STRUCT_MEMO) > 16:
+            _STRUCT_MEMO.clear()
+        _STRUCT_MEMO[mkey] = out
+    return out
+
+
+_STRUCT_MEMO: dict[tuple, dict] = {}
+
+
+def _detect_structure_impl(df: pd.DataFrame, left: int = 2, right: int = 2,
+                           max_events: int = 6) -> dict:
     pts = swings(df, left, right)
     out: dict[str, Any] = {
         "trend": "balanced",
@@ -267,7 +301,36 @@ def detect_liquidity(df: pd.DataFrame, tol_atr: float = 0.15,
     Returns {levels: [{kind: "BSL"|"SSL", price, t, hits}], sweeps: [...]}.
     BSL = buy-side liquidity (resting buys above equal highs); SSL =
     sell-side liquidity (resting sells below equal lows).
+
+    D-049: memoized — the confluence panel (factor 5) and the TP target
+    ladder both scan the SAME 160-bar slice every bar close.
     """
+    if df is None or len(df) < 20:
+        return {"levels": [], "sweeps": []}
+    try:
+        mkey = (
+            str(pd.Timestamp(df["time_utc"].iloc[-1])), int(len(df)),
+            round(float(df["c"].iloc[0]), 4), float(tol_atr), int(max_levels),
+        )
+    except Exception:  # noqa: BLE001 — memo must never break analysis
+        mkey = None
+    if mkey is not None:
+        hit = _LIQ_MEMO.get(mkey)
+        if hit is not None:
+            return hit
+    out = _detect_liquidity_impl(df, tol_atr, max_levels)
+    if mkey is not None:
+        if len(_LIQ_MEMO) > 16:
+            _LIQ_MEMO.clear()
+        _LIQ_MEMO[mkey] = out
+    return out
+
+
+_LIQ_MEMO: dict[tuple, dict] = {}
+
+
+def _detect_liquidity_impl(df: pd.DataFrame, tol_atr: float = 0.15,
+                           max_levels: int = 6) -> dict:
     a = atr_last(df, 14)
     out: dict[str, Any] = {"levels": [], "sweeps": []}
     if len(df) < 20:

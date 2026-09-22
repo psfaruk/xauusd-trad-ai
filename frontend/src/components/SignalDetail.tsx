@@ -159,13 +159,21 @@ export function SignalDetail({ signal }: { signal: Signal }) {
         </div>
         <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/5 px-3 py-2">
           <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-400/80">
-            Take Profit
+            Take Profit{signal.rr ? ` · ${signal.rr.toFixed(1)}R` : ""}
           </p>
           <p className="truncate font-mono text-sm font-semibold text-zinc-100 tabular-nums">
             {signal.tp.toFixed(2)}
           </p>
         </div>
       </div>
+
+      {/* D-049 — where the TP is predicted to sit (structure target) */}
+      {signal.target_note && (
+        <p className="rounded-lg border border-zinc-700/60 bg-zinc-800/40 px-3 py-1.5 text-[10px] leading-relaxed text-zinc-400">
+          <span className="font-semibold text-zinc-300">TP predicted at</span>{" "}
+          {signal.target_note}
+        </p>
+      )}
 
       {/* confidence */}
       <div className="min-w-0">

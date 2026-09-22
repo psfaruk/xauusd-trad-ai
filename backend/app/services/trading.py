@@ -47,10 +47,13 @@ DEMO_START_BALANCE = 10_000.0
 
 #: D-044 — per-user money-management settings (persisted in
 #: user_accounts.settings, merged over the global engine config so every
-#: user's risk profile is their own).
+#: user's risk profile is their own). D-049 — max_trades_per_day added:
+#: the user controls balance / risk / daily trade count; the app controls
+#: entries, SL and TP (user directive).
 USER_SETTING_FIELDS = (
     "risk_mode", "risk_percent", "fixed_lot", "max_positions",
-    "daily_max_loss_pct", "rr", "min_sl_atr", "max_spread_points",
+    "daily_max_loss_pct", "max_trades_per_day", "rr", "min_sl_atr",
+    "max_spread_points",
 )
 
 #: D-046 — upsert of the user's settings row. NOTE: the jsonb cast MUST be
@@ -671,6 +674,7 @@ class UserTradingManager:
             "fixed_lot": (0.01, 100.0),
             "max_positions": (1, 50),
             "daily_max_loss_pct": (0.5, 100.0),
+            "max_trades_per_day": (1, 100),
             "rr": (0.5, 10.0),
             "min_sl_atr": (0.3, 6.0),
             "max_spread_points": (5, 500),
@@ -690,7 +694,10 @@ class UserTradingManager:
             lo, hi = numeric_bounds.get(k, (0.0, 1e9))
             if not lo <= num <= hi:
                 raise ValueError(f"{k} out of range ({lo}..{hi})")
-            clean[k] = int(num) if k in ("max_positions", "max_spread_points") else num
+            clean[k] = (
+                int(num) if k in ("max_positions", "max_spread_points",
+                                  "max_trades_per_day") else num
+            )
         if self._db is None:
             return clean
         import json

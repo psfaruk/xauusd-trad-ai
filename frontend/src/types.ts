@@ -77,6 +77,8 @@ export interface Signal {
   entry: number;
   sl: number;
   tp: number;
+  rr?: number | null;
+  target_note?: string | null;
   confidence: number;
   trace: SignalTrace | null;
   status: SignalStatus;
@@ -587,6 +589,7 @@ export interface UserSettings {
   fixed_lot: number;
   max_positions: number;
   daily_max_loss_pct: number;
+  max_trades_per_day: number;
   rr: number;
   min_sl_atr: number;
   max_spread_points: number;

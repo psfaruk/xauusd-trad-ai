@@ -83,8 +83,12 @@ class EngineConfig(BaseModel):
     sfp_lookback: int = Field(20, ge=2)
     sfp_wick_atr_ratio: float = Field(0.35, gt=0)
     sl_buffer_atr: float = Field(0.2, ge=0)
-    rr: float = Field(1.1, gt=0)         # D-042 backtest-verified on 30d real M1
-    expiry_bars: int = Field(20, ge=1)  # 20 M1 bars = 20 minutes
+    rr: float = Field(1.6, gt=0,         # D-049: fallback TP multiple when
+        description="TP multiple used ONLY when no structural target "
+                    "sits within tp_max_r — the primary TP is predicted "
+                    "from the nearest opposing zone/liquidity/TPO level")
+    expiry_bars: int = Field(45, ge=1)  # D-049: 20 -> 45 — structure TPs
+    # need room to be HIT, not expire into the spread mid-flight
     cooldown_bars: int = Field(4, ge=0)
     # -------------------------------------------------- D-041 pullback trigger
     pullback_enabled: bool = True
@@ -95,8 +99,10 @@ class EngineConfig(BaseModel):
     # -------------------------------------------------- D-041 risk geometry
     min_sl_atr: float = Field(1.5, ge=0,
         description="SL at least this many ATRs from entry (spread/noise floor)")
-    max_spread_to_risk: float = Field(0.5, gt=0,
-        description="skip when spread > this fraction of the SL distance")
+    max_spread_to_risk: float = Field(0.30, gt=0,
+        description="skip when spread > this fraction of the SL distance "
+                    "(D-049: 0.5 -> 0.30 — at 0.5 the spread alone could "
+                    "eat half the risk before the trade even started)")
     sessions: list[SessionRule] = Field(
         default_factory=lambda: [
             # D-047 — Tokyo added: the old london+newyork pair silently
@@ -117,6 +123,13 @@ class EngineConfig(BaseModel):
     fixed_lot: float = Field(0.01, gt=0)
     max_positions: int = Field(3, ge=1)
     daily_max_loss_pct: float = Field(3.0, gt=0)
+    max_trades_per_day: int = Field(
+        6, ge=1, le=100,
+        description="D-049 — user-directed daily auto-trade budget: how "
+                    "many orders the executor may place per UTC day "
+                    "(the user controls balance / risk / trade count; "
+                    "the app controls entries, SL and TP)",
+    )
     magic: int = Field(234000, ge=0)
     # -------------------------------------------------- D-042 ICT/SMC block
     smc_enabled: bool = Field(
@@ -128,11 +141,12 @@ class EngineConfig(BaseModel):
         description="extra HTF frames whose STRUCTURE must bias the trade",
     )
     min_confluence: int = Field(
-        2, ge=0, le=6,
+        3, ge=0, le=6,
         description="how many of the 6 ICT gating factors must confirm "
-        "(D-048: 3 -> 2 — user directive for more signals + honest smc "
-        "indexing; backtest on real 31d M1: c2 beats c3 on BOTH frequency "
-        "(40/d vs 23/d) and expectancy (expR -0.087 vs -0.107))",
+        "(D-049: 2 -> 3 — on the honest 1500-bar window the premium gate "
+        "measures BETTER (expR +0.023 vs +0.010, PF 1.039 vs 1.016) at "
+        "nearly the same volume; the POI zone trigger ignores this gate "
+        "entirely)",
     )
     max_zone_atr: float = Field(
         0.9, gt=0,
@@ -145,6 +159,17 @@ class EngineConfig(BaseModel):
     max_sl_atr: float = Field(
         3.5, gt=0,
         description="SL at most this many ATRs from entry (risk cap)",
+    )
+    # -------------------------------------------------- D-049 target block
+    tp_min_rr: float = Field(
+        1.2, ge=0.5, le=5.0,
+        description="minimum realized reward:risk — when the nearest "
+                    "structural barrier stands closer than this, the "
+                    "trade is SKIPPED (predicted to hit the barrier first)",
+    )
+    tp_max_r: float = Field(
+        3.0, ge=1.0, le=10.0,
+        description="targets further than this many R fall back to rr",
     )
     # -------------------------------------------------- D-048 POI zone block
     zone_trigger_enabled: bool = Field(
@@ -159,8 +184,11 @@ class EngineConfig(BaseModel):
         description="POI quality gate for a WITH-TREND zone retest signal",
     )
     counter_trend_quality: float = Field(
-        0.70, ge=0.0, le=1.0,
-        description="higher POI quality a COUNTER-TREND zone reversal needs",
+        0.58, ge=0.0, le=1.0,
+        description="higher POI quality a COUNTER-TREND zone reversal needs "
+                    "(D-049: 0.70 -> 0.58 — the old gate was practically "
+                    "unreachable, which froze BUY signals during H1 "
+                    "downtrends: the engine could only sell)",
     )
     zone_retest_window: int = Field(
         2, ge=1, le=5,
@@ -241,18 +269,18 @@ _LEGACY_STRATEGY_DEFAULTS = {
     "min_tf_agree": 1,
     "min_atr": 0.15,
     "sfp_wick_atr_ratio": 0.35,
-    "rr": 1.1,
-    "expiry_bars": 20,
+    "rr": 1.6,
+    "expiry_bars": 45,
     "cooldown_bars": 4,
     "pullback_enabled": True,
     "pullback_min_range_atr": 0.35,
     "pullback_wick_ratio": 0.45,
     "min_sl_atr": 1.5,
-    "max_spread_to_risk": 0.5,
+    "max_spread_to_risk": 0.30,
     # D-042 ICT block
     "smc_enabled": True,
     "bias_tfs": ["H4"],
-    "min_confluence": 2,
+    "min_confluence": 3,
     "max_zone_atr": 0.9,
     "vol_z_min": 0.8,
     "max_sl_atr": 3.5,
@@ -282,21 +310,53 @@ _D047_SESSIONS = [{"name": "tokyo", "utc": [0, 7]},
                   {"name": "london", "utc": [7, 16]},
                   {"name": "newyork", "utc": [13, 20]}]
 
-#: D-048 — 3 was the shipped D-043..D-047 default for min_confluence, so a
-#: row still sitting on it was never user-customized; it moves to the new
-#: default 2 (honest smc indexing + zone trigger make 2 the measured
-#: better gate). Rows on any OTHER value (4, 5, a user's 1…) stay put.
-_LEGACY_MIN_CONFLUENCE = 3
+#: D-048 shipped 3 -> 2; D-049 (honest 1500-bar window + structural TP)
+#: measured 3 back on top (expR +0.023 vs +0.010) — rows still sitting on
+#: the D-048-era default 2 were auto-set by the D-048 upgrade (the user
+#: never chose them: the field is admin-config only), so they move to 3.
+#: Rows on any OTHER value (a user's 1, 4, 5…) stay put.
+_LEGACY_MIN_CONFLUENCE_D048 = 2
+_LEGACY_MIN_CONFLUENCE_NOW = 3
+
+#: D-049 — field-by-field one-time upgrades for rows still sitting on a
+#: pre-D-049 shipped default. The rule is unchanged from D-047/D-048:
+#: a row still carrying the EXACT old default was never customized by
+#: the user, so it moves to the new default; anything else stays put.
+_LEGACY_D049_FIELDS: dict[str, tuple[float, float]] = {
+    # field: (old shipped default, new default)
+    "rr": (1.1, 1.6),
+    "expiry_bars": (20, 45),
+    "max_spread_to_risk": (0.5, 0.30),
+    "counter_trend_quality": (0.70, 0.58),
+}
+
+
+def upgrade_legacy_d049(raw: dict) -> tuple[dict, list[str]]:
+    """D-049 — move untouched old-default rows to the recalibrated set.
+
+    Returns (payload, moved_fields). Only fields still on the exact old
+    shipped default move; user-customized values are preserved forever.
+    """
+    if not isinstance(raw, dict):
+        return raw, []
+    moved: list[str] = []
+    out = dict(raw)
+    for field, (old, new) in _LEGACY_D049_FIELDS.items():
+        val = out.get(field)
+        if val is not None and abs(float(val) - old) < 1e-9:
+            out[field] = new
+            moved.append(field)
+    return out, moved
 
 
 def upgrade_legacy_confluence(raw: dict) -> tuple[dict, bool]:
-    """D-048 — move untouched old-default rows (min_confluence == 3) to 2."""
+    """D-049 — move untouched D-048-era rows (min_confluence == 2) to 3."""
     if not isinstance(raw, dict):
         return raw, False
-    if raw.get("min_confluence") != _LEGACY_MIN_CONFLUENCE:
+    if raw.get("min_confluence") != _LEGACY_MIN_CONFLUENCE_D048:
         return raw, False
     out = dict(raw)
-    out["min_confluence"] = 2
+    out["min_confluence"] = _LEGACY_MIN_CONFLUENCE_NOW
     return out, True
 
 
@@ -360,19 +420,25 @@ class ConfigRepo:
                 logger.warning("engine_config.config has unexpected type %s — defaults",
                                type(raw).__name__)
                 return self._mem_config, self._mem_auto_trade
-            raw, upgraded = upgrade_legacy_payload(raw)
+            raw, upgraded_strategy = upgrade_legacy_payload(raw)
             raw, upgraded_sessions = upgrade_legacy_sessions(raw)
             raw, upgraded_confluence = upgrade_legacy_confluence(raw)
-            upgraded = upgraded or upgraded_sessions or upgraded_confluence
+            raw, moved_d049 = upgrade_legacy_d049(raw)
+            upgraded = (
+                upgraded_strategy or upgraded_sessions
+                or upgraded_confluence or bool(moved_d049)
+            )
             cfg = EngineConfig.model_validate(raw)
             if upgraded:
                 why = []
-                if upgraded:  # pre-D-042 row: full strategy block moved
+                if upgraded_strategy:  # pre-D-042 row: strategy block moved
                     why.append("strategy")
                 if upgraded_sessions:
                     why.append("sessions")
                 if upgraded_confluence:
                     why.append("confluence")
+                if moved_d049:
+                    why.append("d049:" + "+".join(moved_d049))
                 logger.info(
                     "engine config upgraded (%s) — persisting",
                     "+".join(why) or "strategy",

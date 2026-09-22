@@ -34,6 +34,7 @@ from app.analysis.context import (
     confluence_score,
     smart_targets,
 )
+from app.engine.bias import direction_bias
 from app.engine.config import EngineConfig
 from app.engine.filters import (
     W_ATR,
@@ -48,7 +49,6 @@ from app.engine.filters import (
     check_mtf,
     check_rsi,
     check_session,
-    check_trend,
     rsi_position,
 )
 from app.engine.sfp import (
@@ -125,6 +125,11 @@ def evaluate(
 
     `htf` frames must contain only bars closed at/before `bar_close_time`
     (see closed_asof — prevents lookahead in backtests).
+
+    D-049: the direction comes from the multi-source bias vote (EMA +
+    M15/H1/H4 structure + momentum) instead of a single H1 EMA cross;
+    triggers arbitrate by QUALITY (best setup fires, not a fixed
+    priority); SL/TP are predicted from structure (smart_targets v2).
     """
     trace = Trace(
         params={
@@ -138,37 +143,62 @@ def evaluate(
         }
     )
 
+    # D-049 — multi-source direction bias (replaces the single-EMA gate:
+    # while gold sat under H1 EMA50 the old gate locked the engine into
+    # SELL-only mode — the exact complaint that started this rework).
     trend_frame = htf.get(cfg.trend_tf)
-    if trend_frame is None or not check_trend(trend_frame, cfg, trace):
+    if trend_frame is None:
         return Evaluation(None, trace.to_dict(), near_miss=False)
+    bias_verdict, _bias_score, _notes = direction_bias(htf, cfg, trace)
+    if bias_verdict == "NEUTRAL":
+        trace.direction = None  # zone entries only — both sides live
+    else:
+        trace.direction = bias_verdict
 
-    # D-048 — trigger ARBITRATION (user directive: "সব গুলো স্ট্রাটেজি
-    # একই সময় AGREE নাও থাকতে পারে"): every candidate setup is gathered
-    # first (all need only the H1 direction), then each trigger passes
-    # ITS OWN gates — the BEST available strategy fires on its own merit
-    # instead of waiting for the whole panel to agree.
-    sig_sfp = detect_sfp(base, cfg, trace)
-    sig_zone: ZoneRetestSignal | None = None
-    if cfg.zone_trigger_enabled:
+    # D-048/D-049 — trigger ARBITRATION by QUALITY (user directive:
+    # "সব গুলো স্ট্রাটেজি একই সময় AGREE নাও থাকতে পারে" + "best strategy"):
+    # every candidate setup is gathered first, each scored on its own
+    # merit, and the BEST one fires — no fixed priority (the old
+    # sfp-beats-zone-always rule let a weak sweep shadow a strong zone
+    # retest and then die at the confluence gate: signal lost).
+    zones: list[dict] = []
+    if cfg.zone_trigger_enabled or cfg.smc_enabled:
         from app.analysis.poi import poi_zones
 
         zones = poi_zones(base, htf)
-        sig_zone = detect_zone_retest(base, zones, cfg, trace.direction)
+
+    sig_sfp = detect_sfp(base, cfg, trace) if trace.direction else None
+    sig_zone: ZoneRetestSignal | None = None
+    if cfg.zone_trigger_enabled:
+        sig_zone = detect_zone_retest(base, zones, cfg, bias_verdict)
     sig_pb: PullbackSignal | None = None
-    trigger: str
-    if sig_sfp is not None:
-        trigger = "sfp"  # sweep reversal — rarest, strongest pattern
-    elif sig_zone is not None:
-        trigger = "zone"  # D-048 — POI zone retest (location + rejection)
+
+    trigger: str | None = None
+    trigger_quality = -1.0
+    if sig_sfp is not None and sfp_quality(sig_sfp, cfg) > trigger_quality:
+        trigger, trigger_quality = "sfp", sfp_quality(sig_sfp, cfg)
+    if sig_zone is not None and zone_trigger_quality(sig_zone) > trigger_quality:
+        trigger, trigger_quality = "zone", zone_trigger_quality(sig_zone)
+    if (
+        trigger != "zone"
+        and cfg.pullback_enabled
+        and trace.direction
+        and sig_pb is None
+    ):
+        sig_pb = detect_pullback(base, cfg, trace)
+        if sig_pb is not None and pullback_quality(sig_pb) > trigger_quality:
+            trigger, trigger_quality = "pullback", pullback_quality(sig_pb)
+
+    if trigger is None:
+        return Evaluation(None, trace.to_dict(), near_miss=False)
+    if trigger == "zone":
+        assert sig_zone is not None
         trace.direction = sig_zone.direction  # signal direction wins downstream
         trace.add("zone_retest", True, zone_retest_note(sig_zone))
-    elif cfg.pullback_enabled:
-        sig_pb = detect_pullback(base, cfg, trace)
-        if sig_pb is None:
-            return Evaluation(None, trace.to_dict(), near_miss=False)
-        trigger = "pullback"
+    elif trigger == "sfp":
+        assert sig_sfp is not None and trace.direction is not None
     else:
-        return Evaluation(None, trace.to_dict(), near_miss=False)
+        assert sig_pb is not None and trace.direction is not None
 
     # After a trigger fired, every later failure is a NEAR MISS (worth a log).
     #
@@ -181,9 +211,22 @@ def evaluate(
     mtf_score: float
     if trigger in ("sfp", "pullback"):
         agreed = check_mtf(htf, trace.direction, cfg, trace)
-        if agreed < cfg.min_tf_agree:
-            return Evaluation(None, trace.to_dict(), near_miss=False)
         mtf_score = agreed / max(len(cfg.confirm_tfs), 1)
+        if agreed < cfg.min_tf_agree:
+            if sig_zone is not None:
+                # D-049 — the premium setup's MTF gate failed, but a VALID
+                # zone retest sits right here (it passed its own gates):
+                # the zone fires on its own merit instead of the bar dying
+                # with nothing (user directive: POI signals must not miss).
+                trigger = "zone"
+                trace.direction = sig_zone.direction
+                trace.add(
+                    "zone_retest", True,
+                    zone_retest_note(sig_zone)
+                    + " (fallback — MTF failed for the primary setup)",
+                )
+            else:
+                return Evaluation(None, trace.to_dict(), near_miss=False)
     else:
         # informational posture vs the SIGNAL direction — never gates
         agreed = check_mtf(htf, trace.direction, cfg, trace)
@@ -213,17 +256,30 @@ def evaluate(
         else:
             confluence_ok = votes >= cfg.min_confluence
             if not confluence_ok:
+                if sig_zone is not None:
+                    # D-049 — same fallback as the MTF gate: a valid zone
+                    # retest fires instead of losing the bar entirely.
+                    trigger = "zone"
+                    trace.direction = sig_zone.direction
+                    trace.add(
+                        "zone_retest", True,
+                        zone_retest_note(sig_zone)
+                        + " (fallback — ICT count failed for the primary"
+                          " setup)",
+                    )
+                else:
+                    trace.add(
+                        "confluence", False,
+                        f"{votes}/{n_gate} ICT factors confirm"
+                        f" (need {cfg.min_confluence})",
+                    )
+                    return Evaluation(None, trace.to_dict(), near_miss=True)
+            else:
                 trace.add(
-                    "confluence", False,
-                    f"{votes}/{n_gate} ICT factors confirm"
-                    f" (need {cfg.min_confluence})",
+                    "confluence", True,
+                    f"{votes} ICT factors confirm (need {cfg.min_confluence})"
+                    f" + {bonus_score(factors)} bonus",
                 )
-                return Evaluation(None, trace.to_dict(), near_miss=True)
-            trace.add(
-                "confluence", True,
-                f"{votes} ICT factors confirm (need {cfg.min_confluence})"
-                f" + {bonus_score(factors)} bonus",
-            )
 
     if trigger == "zone":
         rsi_ok, rsi_value = check_rsi_zone(base, cfg, trace)
@@ -253,14 +309,17 @@ def evaluate(
     if not spread_ok:
         return Evaluation(None, trace.to_dict(), near_miss=True)
 
-    if sig_sfp is not None:
+    if trigger == "sfp":
+        assert sig_sfp is not None
         entry, sl_base, _ = build_levels(sig_sfp, cfg)
         trigger_quality = sfp_quality(sig_sfp, cfg)
         trigger_tag: SfpSignal | PullbackSignal | ZoneRetestSignal = sig_sfp
-    elif sig_zone is not None:
-        # D-048 — zone retest: SL beyond the zone's far edge, then the
-        # same smart_targets pass (ATR floor/cap + TPO anchor + liquidity
-        # TP snap) every other trigger uses.
+    elif trigger == "zone":
+        # D-048/D-049 — zone retest: SL beyond the zone's far edge (or the
+        # sweep extreme on a sweep+reclaim), then the same smart_targets
+        # pass (spread floor + ATR floor/cap + TPO anchor + PREDICTED
+        # structural TP) every other trigger uses.
+        assert sig_zone is not None
         entry, sl_base = build_levels_zone(sig_zone, cfg)
         trigger_quality = zone_trigger_quality(sig_zone)
         trigger_tag = sig_zone
@@ -270,30 +329,39 @@ def evaluate(
         trigger_quality = pullback_quality(sig_pb)
         trigger_tag = sig_pb
 
-    # D-042 — zone-aware exits: SL beyond the structural invalidation,
-    # floored/capped in ATRs; TP snapped toward opposing liquidity.
-    # D-047 — TPO levels from the last day of M1 bars: strong time-at-price
-    # nodes extend the stop just past the level (never past max_sl_atr).
+    # D-042/D-047/D-049 — structure-aware exits: SL beyond the structural
+    # invalidation, floored at 2.5x spread AND min_sl_atr ATRs, capped at
+    # max_sl_atr, anchored past the NEAREST strong TPO level; TP predicted
+    # from the nearest opposing zone/liquidity/TPO target (tp=None means
+    # a barrier stands before min_rr — the geometry itself rejects it).
     tpo_levels: list[dict] = []
     try:
-        from app.analysis.tpo import tpo_profile
+        from app.analysis.tpo import tpo_profile_cached
 
-        tpo_levels = tpo_profile(
+        tpo_levels = tpo_profile_cached(
             base, lookback_minutes=cfg.tpo_lookback_min
         )["levels"]
     except Exception:  # noqa: BLE001 — anchoring is best-effort
         tpo_levels = []
-    entry, sl, tp = smart_targets(
-        base, trigger_tag.direction, entry, sl_base, cfg.rr,
-        cfg.min_sl_atr, cfg.max_sl_atr, tpo_levels=tpo_levels,
-    )
-
-    # D-041 — spread vs risk: entering at ask/exiting at bid costs one spread;
-    # when that cost exceeds `max_spread_to_risk` of the stop distance the
-    # trade is structurally unprofitable (noise-level stop).
-    risk = abs(entry - sl)
     point = point_size if point_size > 0 else 0.01
     spread_price = spread_points * point
+    entry, sl, tp, target_note = smart_targets(
+        base, trigger_tag.direction, entry, sl_base, cfg.rr,
+        cfg.min_sl_atr, cfg.max_sl_atr, tpo_levels=tpo_levels,
+        zones=zones, spread_price=spread_price,
+        min_rr=cfg.tp_min_rr, max_tp_r=cfg.tp_max_r,
+    )
+    if tp is None:
+        # poor geometry — the nearest opposing structure sits closer than
+        # min_rr x risk: the market is predicted to hit the barrier first
+        trace.add("targets", False, target_note)
+        return Evaluation(None, trace.to_dict(), near_miss=True)
+    realized_rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+
+    # D-041 — spread vs risk: entering at ask/exiting at bid costs one
+    # spread; when that cost exceeds `max_spread_to_risk` of the stop
+    # distance the trade is structurally unprofitable (noise-level stop).
+    risk = abs(entry - sl)
     spread_risk_ok = risk > 0 and spread_price <= cfg.max_spread_to_risk * risk
     trace.add(
         "spread_risk",
@@ -303,6 +371,11 @@ def evaluate(
     )
     if not spread_risk_ok:
         return Evaluation(None, trace.to_dict(), near_miss=True)
+
+    trace.add(
+        "targets", True,
+        f"TP predicted at {target_note} — realized rr {realized_rr:.2f}",
+    )
 
     base_confidence = (
         1.0 * W_TREND
@@ -346,6 +419,8 @@ def evaluate(
         "entry": round(entry, 2),
         "sl": round(sl, 2),
         "tp": round(tp, 2),
+        "rr": round(realized_rr, 2),
+        "target_note": target_note,
         "confidence": round(min(max(confidence, 0.0), 1.0), 3),
         "trigger": trigger,
         "trace": trace_dict,
@@ -447,8 +522,14 @@ class SignalEngine:
             return
 
         try:
+            # D-049 — 1500 bars (24h of M1): the old 200-bar fetch starved
+            # every depth-dependent feature — the TPO profile saw 3.3h
+            # instead of 24h, PDH/PDL liquidity levels never existed, and
+            # zone origins lived in a 2.7h window — which forced the TP
+            # onto the fixed rr multiple ("SL/TP always the same ratio").
             base = await source.get_rates(
-                symbol, cfg.timeframe, max(200, cfg.sfp_lookback + 5)
+                symbol, cfg.timeframe,
+                max(1500, cfg.sfp_lookback + 5, cfg.tpo_lookback_min + 10),
             )
         except Exception:  # noqa: BLE001 — data hiccup: skip this close
             logger.exception("get_rates failed at bar close %s", bar_close_time)

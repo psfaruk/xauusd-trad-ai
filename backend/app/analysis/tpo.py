@@ -163,3 +163,39 @@ def nearest_level(
         if d <= best_d:
             best, best_d = lv, d
     return best
+
+
+#: D-049 — one-entry memo for the profile of the newest closed window.
+#: evaluate() calls tpo_profile (directly or via poi_zones/build_confluence)
+#: THREE times per bar close on the same frame; the vectorized build is
+#: fast but not free, and the backtest replays ~29k bars.
+_TPO_MEMO: dict[tuple, dict[str, Any]] = {}
+
+
+def tpo_profile_cached(
+    df: pd.DataFrame, lookback_minutes: int = DEFAULT_LOOKBACK_MIN,
+    bucket: float = DEFAULT_BUCKET,
+) -> dict[str, Any]:
+    """Memoized tpo_profile for the newest closed window.
+
+    Keyed by (last bar time, bar count, lookback, bucket) — safe for the
+    engine's append-only frames (a new close changes the last timestamp).
+    Falls back to a direct compute on any mismatch.
+    """
+    if df is None or len(df) < 5:
+        return tpo_profile(df, lookback_minutes, bucket)
+    try:
+        key = (
+            str(pd.Timestamp(df["time_utc"].iloc[-1])),
+            int(len(df)), int(lookback_minutes), float(bucket),
+        )
+    except Exception:  # noqa: BLE001 — memo must never break the pipeline
+        return tpo_profile(df, lookback_minutes, bucket)
+    hit = _TPO_MEMO.get(key)
+    if hit is not None:
+        return hit
+    prof = tpo_profile(df, lookback_minutes, bucket)
+    if len(_TPO_MEMO) > 8:
+        _TPO_MEMO.clear()
+    _TPO_MEMO[key] = prof
+    return prof

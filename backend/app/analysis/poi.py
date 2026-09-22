@@ -34,10 +34,12 @@ import pandas as pd
 
 from app.analysis import smc
 from app.analysis.indicators import atr as atr_last
-from app.analysis.tpo import tpo_profile
+from app.analysis.tpo import tpo_profile_cached
 
-#: base-TF bars scanned for zone origins (mirrors the confluence window)
-POI_WINDOW = 160
+#: base-TF bars scanned for zone origins (D-049: 160 -> 480 — 8 hours
+#: of zone formation on M1; the old 160-bar window only saw 2.7h and
+#: starved the ranked list of anything but the freshest zones)
+POI_WINDOW = 480
 #: zone age (minutes) up to which quality stays full
 AGE_FULL_MIN = 240.0
 #: zone age (minutes) at which the age component bottoms out (24h)
@@ -162,10 +164,20 @@ def _broken(
     return bool((seg > hi + tol).any())
 
 
-def _origin_index(frame: pd.DataFrame, t: Any) -> int:
-    """Bar index of the zone origin (+2: the move needs the next bar)."""
-    idx = frame.index.get_indexer([pd.Timestamp(t)])
-    return int(idx[0]) + 2 if idx[0] >= 0 else 0
+def _origin_index(t_arr: np.ndarray, t: Any) -> int:
+    """Row position of the zone origin (+2: the move needs the next bar).
+
+    D-049 bug fix: the old `frame.index.get_indexer([Timestamp])` ran
+    against the RESET (integer) index and ALWAYS returned -1 — every
+    zone's broken-scan silently started at row 2, not at its origin.
+    D-049 perf: `t_arr` is the frame's time column converted ONCE per
+    poi_zones call (the per-zone to_numpy conversion this replaced was
+    31% of the whole backtest runtime).
+    """
+    i = int(np.searchsorted(t_arr, t))
+    if i < len(t_arr) and t_arr[i] == t:
+        return i + 2
+    return 2  # not found (never expected) — conservative early start
 
 
 def poi_zones(
@@ -188,14 +200,19 @@ def poi_zones(
     atr_val = atr_last(frame, 14) or 1e-9
     last_t = frame["time_utc"].iloc[-1]
     closes_np = frame["c"].to_numpy(dtype=float)
+    # ONE datetime-array conversion per call — _origin_index used to
+    # re-convert the whole column for EVERY candidate zone (31% of the
+    # backtest runtime lived here)
+    t_np = frame["time_utc"].to_numpy()
     broken_tol = BROKEN_TOL_ATR * atr_val
     # the "first touch" window: a mitigation in the last 3 bars is the
     # retest happening RIGHT NOW (the classic zone entry)
     recent_from = frame["time_utc"].iloc[-3] if len(frame) >= 3 else last_t
 
     # TPO profile once — reinforcement minutes for every zone band
+    # (D-049: memoized — evaluate/confluence/POI share ONE profile per bar)
     try:
-        prof = tpo_profile(base, lookback_minutes=1440)
+        prof = tpo_profile_cached(base, lookback_minutes=1440)
         tpo_levels: list[dict] = prof.get("levels", [])
     except Exception:  # noqa: BLE001 — reinforcement is best-effort
         tpo_levels = []
@@ -214,7 +231,7 @@ def poi_zones(
         fill_t: Any = None,
     ) -> None:
         if _broken(closes_np, side, float(lo), float(hi), broken_tol,
-                   _origin_index(frame, t)):
+                   _origin_index(t_np, t)):
             return
         zone = {
             "side": side,
@@ -238,17 +255,18 @@ def poi_zones(
         )
         out.append(zone)
 
-    # --- 1/2. base-TF supply/demand zones + order blocks
-    for z in smc.detect_supply_demand(frame):
+    # --- 1/2. base-TF supply/demand zones + order blocks (D-049: caps
+    # raised so the deeper 480-bar window actually contributes zones)
+    for z in smc.detect_supply_demand(frame, max_zones=8):
         _add(z["side"], "sd", z["t"], z["lo"], z["hi"],
              z.get("impulse"), False)
-    for ob in smc.detect_order_blocks(frame):
+    for ob in smc.detect_order_blocks(frame, max_zones=8):
         side = "demand" if ob["side"] == "bullish" else "supply"
         _add(side, "ob", ob["t"], ob["lo"], ob["hi"],
              ob.get("impulse"), False, ob["mitigated"], ob.get("mit_t"))
 
     # --- 3. fair value gaps: unfilled or FRESHLY filled only
-    for g in smc.detect_fvg(frame):
+    for g in smc.detect_fvg(frame, max_gaps=10):
         if g["filled"]:
             fill_t = g.get("fill_t")
             try:
@@ -288,18 +306,19 @@ def poi_zones(
     if m15 is not None and len(m15) >= 30:
         htf_frame = m15.iloc[-POI_WINDOW:].reset_index(drop=True)
         htf_closes = htf_frame["c"].to_numpy(dtype=float)
+        htf_t_np = htf_frame["time_utc"].to_numpy()
         htf_atr = atr_last(htf_frame, 14) or atr_val
         htf_tol = BROKEN_TOL_ATR * htf_atr
-        for z in smc.detect_supply_demand(htf_frame):
+        for z in smc.detect_supply_demand(htf_frame, max_zones=8):
             if _broken(htf_closes, z["side"], float(z["lo"]), float(z["hi"]),
-                       htf_tol, _origin_index(htf_frame, z["t"])):
+                       htf_tol, _origin_index(htf_t_np, z["t"])):
                 continue
             _add(z["side"], "sd", z["t"], z["lo"], z["hi"],
                  z.get("impulse"), True)
-        for ob in smc.detect_order_blocks(htf_frame):
+        for ob in smc.detect_order_blocks(htf_frame, max_zones=8):
             side = "demand" if ob["side"] == "bullish" else "supply"
             if _broken(htf_closes, side, float(ob["lo"]), float(ob["hi"]),
-                       htf_tol, _origin_index(htf_frame, ob["t"])):
+                       htf_tol, _origin_index(htf_t_np, ob["t"])):
                 continue
             _add(side, "ob", ob["t"], ob["lo"], ob["hi"],
                  ob.get("impulse"), True, ob["mitigated"], ob.get("mit_t"))

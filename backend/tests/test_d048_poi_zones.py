@@ -36,12 +36,13 @@ def _demand_zone_frame(
     dip_at: int = 55,
     trigger: tuple | None = None,
 ) -> pd.DataFrame:
-    """Quiet 4300 tape -> down base -> 3-ATR up impulse -> rally above the
-    zone -> pullback INTO the zone -> rejection trigger bar (BUY setup).
+    """Quiet 4300 tape -> down base -> 3-ATR up impulse -> rally to 4305
+    -> GRADUAL overlapping descent (no bearish FVG/OB minted right above
+    the entry — D-049's geometry check would rightly refuse such a trade)
+    -> rejection trigger bar dipping INTO the zone (BUY setup).
 
-    Zone (detect_supply_demand): base bar at index n_tail-50 —
-    lo/hi = its low/high; impulse body >= 1.5 ATR. Trigger default:
-    long lower wick + close back above the zone high.
+    Zone (detect_supply_demand): base bar at index 50 — lo/hi = its
+    low/high; impulse body >= 1.5 ATR.
     """
     t0 = datetime(2026, 9, 22, 9, 0, tzinfo=UTC)  # london session
     rows = []
@@ -50,25 +51,30 @@ def _demand_zone_frame(
         t = t0 + timedelta(minutes=i)
         c = 4300.0 + 0.05 * (i % 3)
         rows.append(_bar(t, c - 0.05, c + 0.15, c - 0.20, c))
-    # 2) down base bar at 50 (the future demand zone: 4299.7..4300.2)
+    # 2) down base bar at 50 (the future demand zone: 4299.7..4300.35)
     t = t0 + timedelta(minutes=50)
     rows.append(_bar(t, 4300.3, 4300.35, 4299.75, 4299.9))
     # 3) up impulse: body ~3.0 (>= 1.5 ATR), closes 4303
     t = t0 + timedelta(minutes=51)
     rows.append(_bar(t, 4299.9, 4303.1, 4299.85, 4303.0))
-    # 4) rally away, never closing below the zone low
-    for k in range(52, dip_at):
+    # 4) rally to 4305.4 (6 small up bars)
+    p = 4303.0
+    for k in range(52, 58):
         t = t0 + timedelta(minutes=k)
-        c = 4303.0 + 0.08 * (k - 52)
-        rows.append(_bar(t, c - 0.06, c + 0.15, c - 0.18, c))
-    # 5) pullback bar that DIPS INTO the zone (low 4300.4 < zone hi 4300.35?
-    #     no -> inside: 4300.2)
+        rows.append(_bar(t, p, p + 0.5, p - 0.1, p + 0.4))
+        p += 0.4
+    # 5) gradual overlapping descent to ~4301.4 (6 bars; wide ranges so
+    #    no 3-candle bearish FVG forms: bar[k].low <= bar[k+2].high)
+    for k in range(58, 64):
+        t = t0 + timedelta(minutes=k)
+        rows.append(_bar(t, p, p + 0.10, p - 1.42, p - 0.667))
+        p -= 0.667
+    # 6) the trigger bar: dips INTO the zone, rejects with a lower wick
+    #    (high 4301.6 overlaps the last descent low so no hairline
+    #    bearish FVG mints right above the entry)
     if trigger is None:
-        trigger = (4300.8, 4302.0, 4300.15, 4301.8)  # o, h, low, c
-    t = t0 + timedelta(minutes=dip_at)
-    rows.append(_bar(t, 4302.2, 4302.4, 4300.4, 4300.6))
-    # 6) the trigger bar: entered the zone, closed back above with a wick
-    t = t0 + timedelta(minutes=dip_at + 1)
+        trigger = (4301.2, 4301.6, 4300.15, 4300.75)  # o, h, low, c
+    t = t0 + timedelta(minutes=64)
     o, h, low, c = trigger
     rows.append(_bar(t, o, h, low, c, v=250))
     return pd.DataFrame(rows, columns=["time_utc", "o", "h", "l", "c", "v"])
@@ -163,6 +169,47 @@ def test_zone_retest_fires_buy_at_demand() -> None:
     entry, sl_base = build_levels_zone(sig, cfg)
     assert entry == df["c"].iloc[-1]
     assert sl_base < sig.zone["lo"]
+
+
+def test_zone_retest_sweep_reclaim_is_strongest() -> None:
+    """D-049 — a trigger bar that wicks THROUGH the zone low and closes
+    back above the zone high is the stop-hunt reversal: rejection forced
+    to >= 0.90 and the SL anchors beyond the sweep extreme."""
+    # trigger: sweeps to 4299.4 (under zone lo 4299.75), closes 4301.6
+    df = _demand_zone_frame(trigger=(4300.6, 4301.8, 4299.40, 4301.6))
+    cfg = EngineConfig()
+    sig = detect_zone_retest(df, poi_zones(df), cfg, "BUY")
+    assert sig is not None
+    assert sig.sweep_reclaim is True
+    assert sig.rejection >= 0.90
+    assert sig.sweep_extreme == pytest.approx(4299.40)
+    entry, sl_base = build_levels_zone(sig, cfg)
+    # SL beyond the sweep extreme (the actual invalidation)
+    assert sl_base < 4299.40
+
+
+def test_zone_retest_late_window_entry_rejected() -> None:
+    """D-049 — the dip happened earlier and the close already ran away:
+    a MISSED entry must not become a late chase."""
+    t0 = datetime(2026, 9, 22, 9, 0, tzinfo=UTC)
+    rows = []
+    for i in range(50):
+        c = 4300.0 + 0.05 * (i % 3)
+        rows.append(_bar(t0 + timedelta(minutes=i), c - 0.05, c + 0.15,
+                         c - 0.20, c))
+    rows.append(_bar(t0 + timedelta(minutes=50), 4300.3, 4300.35, 4299.75, 4299.9))
+    rows.append(_bar(t0 + timedelta(minutes=51), 4299.9, 4303.1, 4299.85, 4303.0))
+    for k in range(52, 57):
+        c = 4303.0 + 0.08 * (k - 52)
+        rows.append(_bar(t0 + timedelta(minutes=k), c - 0.06, c + 0.15,
+                         c - 0.18, c))
+    # dip bar into the zone (window hit) ... then the market rallied far
+    rows.append(_bar(t0 + timedelta(minutes=57), 4303.4, 4303.6, 4300.30, 4300.5))
+    # ... and the trigger bar is 3+ ATR above the zone, nowhere near it
+    rows.append(_bar(t0 + timedelta(minutes=58), 4304.0, 4304.4, 4303.8, 4304.2))
+    df = pd.DataFrame(rows, columns=["time_utc", "o", "h", "l", "c", "v"])
+    cfg = EngineConfig()
+    assert detect_zone_retest(df, poi_zones(df), cfg, "BUY") is None
 
 
 def test_zone_retest_window_reaches_back() -> None:
@@ -316,10 +363,10 @@ def test_check_rsi_zone_window_wider_than_classic() -> None:
     tr = Trace()
     tr.direction = "BUY"
     ok, val = check_rsi_zone(df, EngineConfig(), tr)
-    # the window used must be the widened zone window (25-65), not the
+    # the window used must be the widened zone window (20-70), not the
     # classic (40-65) — and the pass decision matches THAT window
-    assert "zone window 25-65" in tr.checks[-1].value
-    assert ok == (25.0 <= val <= 65.0)
+    assert "zone window 20-70" in tr.checks[-1].value
+    assert ok == (20.0 <= val <= 70.0)
 
 
 # ----------------------------------------------------------------- config
@@ -327,10 +374,19 @@ def test_check_rsi_zone_window_wider_than_classic() -> None:
 def test_config_d048_defaults() -> None:
     assert DEFAULT_CONFIG.zone_trigger_enabled is True
     assert DEFAULT_CONFIG.min_zone_quality == 0.45
-    assert DEFAULT_CONFIG.counter_trend_quality == 0.70
+    # D-049 — 0.70 -> 0.58: the old gate was practically unreachable,
+    # freezing BUY signals during H1 downtrends (sell-only bias)
+    assert DEFAULT_CONFIG.counter_trend_quality == 0.58
     assert DEFAULT_CONFIG.zone_retest_window == 2
-    # D-048 — honest indexing made c2 the measured better count gate
-    assert DEFAULT_CONFIG.min_confluence == 2
+    # D-049 — honest 1500-bar window measured 3 back on top of 2
+    assert DEFAULT_CONFIG.min_confluence == 3
+    # D-049 target block
+    assert DEFAULT_CONFIG.tp_min_rr == 1.2
+    assert DEFAULT_CONFIG.tp_max_r == 3.0
+    assert DEFAULT_CONFIG.rr == 1.6
+    assert DEFAULT_CONFIG.expiry_bars == 45
+    assert DEFAULT_CONFIG.max_spread_to_risk == 0.30
+    assert DEFAULT_CONFIG.max_trades_per_day == 6
     # bounds enforced
     try:
         EngineConfig(min_zone_quality=1.5)
@@ -339,12 +395,37 @@ def test_config_d048_defaults() -> None:
         pass
 
 
+def test_legacy_d049_upgrade() -> None:
+    """Stored rows still on pre-D-049 shipped defaults move to the new
+    set; customized values are NEVER touched."""
+    from app.engine.config import upgrade_legacy_d049
+
+    raw = {"rr": 1.1, "expiry_bars": 20, "max_spread_to_risk": 0.5,
+           "counter_trend_quality": 0.70, "min_confluence": 2}
+    out, moved = upgrade_legacy_d049(raw)
+    assert moved == ["rr", "expiry_bars", "max_spread_to_risk",
+                     "counter_trend_quality"]
+    assert out["rr"] == 1.6 and out["expiry_bars"] == 45
+    assert out["max_spread_to_risk"] == 0.30
+    assert out["counter_trend_quality"] == 0.58
+    # untouched fields survive
+    assert out["min_confluence"] == 2
+    # customized values stay put
+    raw2 = {"rr": 2.5, "expiry_bars": 30, "max_spread_to_risk": 0.4,
+            "counter_trend_quality": 0.65}
+    out2, moved2 = upgrade_legacy_d049(raw2)
+    assert moved2 == []
+    assert out2["rr"] == 2.5 and out2["counter_trend_quality"] == 0.65
+
+
 def test_legacy_confluence_upgrade() -> None:
-    """Stored rows still on the old shipped default (3) move to 2."""
+    """D-049 — stored rows still on the D-048-era default (2) move to 3
+    (the honest 1500-bar window remeasured 3 on top); customized values
+    are NEVER touched."""
     from app.engine.config import upgrade_legacy_confluence
 
-    out, changed = upgrade_legacy_confluence({"min_confluence": 3})
-    assert changed is True and out["min_confluence"] == 2
+    out, changed = upgrade_legacy_confluence({"min_confluence": 2})
+    assert changed is True and out["min_confluence"] == 3
     # customized values are NEVER touched
     out, changed = upgrade_legacy_confluence({"min_confluence": 4})
     assert changed is False and out["min_confluence"] == 4

@@ -75,7 +75,6 @@ class TestEngineE2E:
         # so injected buckets close inside the london window.
         src.advance_minutes(10 * 60)
 
-        from app.engine.indicators import ema
         from app.mt5.mock_source import SweepScenario
 
         hub = EventHub()
@@ -83,15 +82,32 @@ class TestEngineE2E:
         engine = SignalEngine(EngineConfig(smc_enabled=False), hub, repo)
         tracker = SignalTracker()
 
+        async def _bias_direction() -> str | None:
+            """D-049 — the multi-source bias verdict (None = NEUTRAL: the
+            sfp/pullback triggers need a DIRECTIONAL verdict; injecting a
+            sweep against a neutral tape can never fire)."""
+            from app.engine.bias import direction_bias
+            from app.engine.engine import closed_asof
+            from app.engine.trace import Trace
+
+            htf: dict = {}
+            for tf, _m in (("H1", 60), ("M15", 15), ("M5", 5), ("H4", 240)):
+                frame = await src.get_rates(symbol, tf, 100)
+                htf[tf] = closed_asof(frame, tf, src._vnow())
+            verdict, _score, _notes = direction_bias(
+                htf, EngineConfig(), Trace()
+            )
+            return None if verdict == "NEUTRAL" else verdict
+
         fired = None
         direction = None
-        for _attempt in range(10):
-            h1_full = await src.get_rates(symbol, "H1", 100)
-            direction = (
-                "BUY"
-                if float(h1_full["c"].iloc[-1]) > float(ema(h1_full["c"], 50).iloc[-1])
-                else "SELL"
-            )
+        for _attempt in range(30):
+            direction = await _bias_direction()
+            if direction is None:
+                # neutral tape — let the walk move, then re-read the bias
+                src.advance_minutes(45)
+                engine.invalidate_frames()
+                continue
             scenario = src.inject_sweep(
                 SweepScenario(direction=direction, tf="M1")
             )
@@ -113,8 +129,9 @@ class TestEngineE2E:
                 break
             # let the random walk RECOVER (the crafted sweep drags M1 RSI deep
             # below the buy window; without recovery every later sweep inherits
-            # the depressed RSI and can never pass)
-            src.advance_minutes(25)
+            # the depressed RSI and can never pass — 45 min lets RSI(14)
+            # fully rotate past the sweep bar)
+            src.advance_minutes(45)
             # the frame cache is wall-clock TTL'd; the mock's virtual clock
             # runs faster than real time, so drop it explicitly between attempts
             engine.invalidate_frames()
@@ -126,26 +143,37 @@ class TestEngineE2E:
         assert sig["direction"] == direction
         assert sig["status"] == "active"
         assert sig["tf"] == "M1"
-        # complete D-041 trace: trend + MTF + trigger + filters + risk gates
+        # complete D-041/D-049 trace: bias + MTF + trigger + filters + gates
         names = [c["name"] for c in sig["trace"]["checks"]]
         for expected in (
-            "trend_h1", "mtf_m5", "mtf_m15", "sfp_sweep", "rsi", "atr",
-            "session", "news", "spread", "spread_risk",
+            "direction_bias", "mtf_m5", "mtf_m15", "sfp_sweep", "rsi",
+            "atr", "session", "news", "spread", "spread_risk", "targets",
         ):
             assert expected in names, f"missing check {expected}: {names}"
-        assert all(c["pass"] for c in sig["trace"]["checks"])
+        # every GATING check passes. The MTF lines are informational for a
+        # zone signal (D-049: the POI location + rejection carry the setup;
+        # the zone path is exactly the fallback that fires when the sweep's
+        # own MTF gate fails — a signal instead of nothing).
+        trigger = sig["trace"]["trigger"]
+        gating = [
+            c for c in sig["trace"]["checks"]
+            if not (trigger == "zone" and c["name"].startswith("mtf_"))
+        ]
+        assert all(c["pass"] for c in gating), [
+            c["name"] for c in gating if not c["pass"]
+        ]
         # levels math per §8.2 + D-041 floor
         if sig["direction"] == "BUY":
             assert sig["sl"] < sig["entry"] < sig["tp"]
         else:
             assert sig["sl"] > sig["entry"] > sig["tp"]
         risk = abs(sig["entry"] - sig["sl"])
-        # D-042: TP = rr * risk OR snapped just in front of an opposing
-        # liquidity pool inside [0.75, 1.6]x risk — never outside that band
+        # D-049: TP is PREDICTED at a structural target (or the rr
+        # fallback) — between min_rr and tp_max_r multiples of risk
         tp_dist = abs(sig["tp"] - sig["entry"])
-        assert 0.70 * risk <= tp_dist <= 1.65 * risk
+        assert 1.05 * risk <= tp_dist <= 3.0 * risk + 1e-9
         assert 0.0 < sig["confidence"] <= 1.0
-        assert sig["trace"]["trigger"] in ("sfp", "pullback")
+        assert sig["trace"]["trigger"] in ("sfp", "pullback", "zone")
         # WS signal event broadcast
         assert any(t == "signal" for t, _ in hub.events)
         # tracker holds it active
@@ -314,7 +342,10 @@ class TestEvaluatePure:
             rows.append([t, o, max(o, c) + 0.4, min(o, c) - 0.4, c, 10])
             prev_c = c
         t = base + pd.Timedelta(minutes=60)
-        rows.append([t, 99.8, 100.8, 98.6, 100.4, 30])  # sweep: low 98.6 < prior min 99.4
+        # sweep: low 98.6 < prior min 99.4, close 100.9 BREAKS ABOVE the
+        # equal-highs wall (100.6) so no BSL pool sits in front of the
+        # trade (D-049 geometry would rightly refuse that setup)
+        rows.append([t, 99.8, 101.4, 98.6, 100.9, 30])
         m1 = pd.DataFrame(rows, columns=["time_utc", "o", "h", "l", "c", "v"])
 
         def trend_frame(tf_min: int):
@@ -362,8 +393,9 @@ class TestEvaluatePure:
             o = prev_c
             rows.append([t, o, max(o, c) + 0.10, min(o, c) - 0.10, c, 10])
             prev_c = c
-        # sweep bar: dips under the prior min low (~99.85), closes back above
-        rows.append([base + pd.Timedelta(minutes=60), 100.0, 100.15, 99.78, 100.05, 30])
+        # sweep bar: dips under the prior min low (~99.85), closes back
+        # above AND through the equal-highs wall (100.15)
+        rows.append([base + pd.Timedelta(minutes=60), 100.0, 100.35, 99.78, 100.25, 30])
         m1 = pd.DataFrame(rows, columns=["time_utc", "o", "h", "l", "c", "v"])
 
         def trend_frame(tf_min: int):
@@ -396,11 +428,17 @@ class TestEvaluatePure:
         m1, htf = self._frames()
         close_time = m1["time_utc"].iloc[-1] + pd.Timedelta(minutes=1)
         # both confirms fight the H1 trend -> min_tf_agree=1 fails
+        # (zone trigger disabled: this test verifies the SFP path's MTF
+        # gate — a valid zone retest would fire as a D-049 fallback)
         down = htf["H1"].copy()
         for col in ("o", "h", "l", "c"):
             down[col] = 300.0 - down[col]
         htf_bad = {"H1": htf["H1"], "M5": down, "M15": down}
-        ev = evaluate(m1, htf_bad, close_time, EngineConfig(smc_enabled=False), spread_points=20)
+        ev = evaluate(
+            m1, htf_bad, close_time,
+            EngineConfig(smc_enabled=False, zone_trigger_enabled=False),
+            spread_points=20,
+        )
         assert ev.signal is None
         assert ev.trace["checks"][-1]["name"] == "mtf_m15"
 

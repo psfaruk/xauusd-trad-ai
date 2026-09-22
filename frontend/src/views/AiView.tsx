@@ -121,7 +121,8 @@ function MoneyManagementModal({
         fixed_lot: parseFloat(String(form.fixed_lot)) || 0.01,
         max_positions: parseInt(String(form.max_positions), 10) || 3,
         daily_max_loss_pct: parseFloat(String(form.daily_max_loss_pct)) || 3,
-        rr: parseFloat(String(form.rr)) || 1.1,
+        max_trades_per_day: parseInt(String(form.max_trades_per_day), 10) || 6,
+        rr: parseFloat(String(form.rr)) || 1.6,
         min_sl_atr: parseFloat(String(form.min_sl_atr)) || 1.5,
         max_spread_points: parseInt(String(form.max_spread_points), 10) || 35,
       });
@@ -221,6 +222,14 @@ function MoneyManagementModal({
                     inputMode="numeric"
                   />
                 </Field>
+                <Field label="Trades per day" hint="Auto orders allowed per UTC day">
+                  <input
+                    className={inputCls}
+                    value={String(form.max_trades_per_day)}
+                    onChange={(e) => set("max_trades_per_day", e.target.value)}
+                    inputMode="numeric"
+                  />
+                </Field>
                 <Field label="Daily loss limit (%)">
                   <input
                     className={inputCls}
@@ -229,7 +238,10 @@ function MoneyManagementModal({
                     inputMode="decimal"
                   />
                 </Field>
-                <Field label="Reward : Risk" hint="Take-profit multiple of the stop distance">
+                <Field
+                  label="Fallback R:R"
+                  hint="TP multiple when no zone/liquidity target is near — targets are otherwise predicted from market structure"
+                >
                   <input
                     className={inputCls}
                     value={String(form.rr)}

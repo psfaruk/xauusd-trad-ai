@@ -237,10 +237,11 @@ def run_backtest(
         htf_close_ts[tf] = (frame["time_utc"] + pd.Timedelta(minutes=dst_min)).values
 
     # Windowed history depth — mirrors what the LIVE engine fetches through
-    # get_rates (max(200, lookback+5) bars): the backtest sees exactly the
-    # same information the live pipeline sees, no more. Indicators are fully
-    # converged at this depth (Wilder/EMA decay << window).
-    hist_window = max(260, cfg.sfp_lookback + 10)
+    # get_rates (D-049: max(1500, lookback+5, tpo+10) bars — 24h of M1).
+    # The old 260-bar mirror starved the TPO profile (3.3h instead of
+    # 24h) and left PDH/PDL liquidity undefined, so backtest TP behavior
+    # degenerated to the fixed rr multiple exactly like live did.
+    hist_window = max(1500, cfg.sfp_lookback + 10, cfg.tpo_lookback_min + 60)
 
     # Warmup: enough base bars for the trend EMA on the LARGEST TF to be
     # defined, plus the base-level indicator needs.

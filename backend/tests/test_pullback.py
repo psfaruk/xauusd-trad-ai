@@ -133,9 +133,11 @@ class TestLegacyConfigUpgrade:
         assert changed is True
         assert up["timeframe"] == "M1"
         assert up["confirm_tfs"] == ["M5", "M15"]
-        assert up["rr"] == 1.1
+        assert up["rr"] == 1.6                     # D-049 fallback TP multiple
+        assert up["expiry_bars"] == 45             # D-049 structure-TP room
+        assert up["max_spread_to_risk"] == 0.30    # D-049 spread-vs-risk gate
         assert up["min_sl_atr"] == 1.5
-        assert up["min_confluence"] == 2          # D-048: honest smc indexing gate
+        assert up["min_confluence"] == 3          # D-049: premium gate remeasured on top
         assert up["max_positions"] == 3           # D-042 multi-entry default
         # user-customized risk/session values survive
         assert up["risk_percent"] == 1.0

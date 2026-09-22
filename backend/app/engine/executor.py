@@ -350,6 +350,11 @@ class OrderExecutor:
         self._lock = asyncio.Lock()
         self.auto_trade = False  # armed by the owner of the plane
         self.last_skip_reason: str | None = None  # D-036 — surfaced to the UI
+        # D-049 — daily auto-trade budget (user-directed control: balance /
+        # risk / trades-per-day belong to the user; entries, SL and TP to
+        # the app). Resets at the UTC day rollover.
+        self._day_key: str | None = None
+        self._day_trades = 0
 
     async def apply_config(self, cfg: EngineConfig) -> None:
         self._cfg = cfg
@@ -374,13 +379,27 @@ class OrderExecutor:
             if info:
                 self._day_start_equity = float(info.get("equity", 0.0))
 
+    def _register_daily_trade(self) -> bool:
+        """D-049 — count the order against today's budget; False when full.
+
+        Called AFTER all other guards pass and immediately BEFORE the
+        order is sent, so skips never consume the budget.
+        """
+        today = datetime.now(tz=UTC).strftime("%Y-%m-%d")
+        if self._day_key != today:
+            self._day_key, self._day_trades = today, 0
+        if self._day_trades >= max(int(self._cfg.max_trades_per_day), 1):
+            return False
+        self._day_trades += 1
+        return True
+
     async def execute_signal(
         self, signal: dict, symbol: str, point_size: float
     ) -> OrderResult | None:
         """Send one market order for `signal` after all §9 guards.
 
-        Returns None when skipped (kill switch / cooldown / duplicate);
-        logs the reason via engine_log + the logs table.
+        Returns None when skipped (kill switch / cooldown / duplicate /
+        daily budget); logs the reason via engine_log + the logs table.
         """
         async with self._lock:
             if not self.auto_trade:
@@ -406,6 +425,18 @@ class OrderExecutor:
                     await self._emergency_stop()
                 else:
                     await self._notify(verdict)
+                return None
+
+            if not self._register_daily_trade():
+                self.last_skip_reason = (
+                    f"daily trade budget reached "
+                    f"({self._cfg.max_trades_per_day}/day)"
+                )
+                await self._log(
+                    "info",
+                    f"order skipped: {self.last_skip_reason} — "
+                    f"auto-trade resumes next UTC day",
+                )
                 return None
 
             info = self._source.account_info()

@@ -309,7 +309,7 @@ def build_confluence(
     # support under a BUY, resistance over a SELL. Levels the market kept
     # returning to are where professionals expect a reaction.
     try:
-        prof = tpo.tpo_profile(base, lookback_minutes=1440)
+        prof = tpo.tpo_profile_cached(base, lookback_minutes=1440)
         want_side = "support" if want_bull else "resistance"
         side_levels = [lv for lv in prof["levels"] if lv["side"] == want_side]
         near = tpo.nearest_level(side_levels, entry, max_dist=0.5 * a)
@@ -336,6 +336,15 @@ CONFLUENCE_GATE = ("structure_m1", "htf_structure", "ob_retest",
 CONFLUENCE_BONUS = ("volume", "killzone", "whale_bias", "delta_confirms",
                     "flow_active", "at_tpo_level")
 
+#: D-049 — the stop must survive at least this many spreads of noise
+SPREAD_FLOOR_MULT = 2.5
+
+#: D-049 — structural levels within this many ATRs of the ENTRY are the
+#: market's CURRENT location, not barriers/targets (a zone minted by the
+#: trigger's own move sits right on the entry and was vetoing sweeps at
+#: 0.05R — the noise floor ignores it)
+NOISE_FLOOR_ATR = 0.35
+
 
 def confluence_score(factors: list[dict]) -> int:
     """How many GATING factors passed (0..6)."""
@@ -349,74 +358,159 @@ def bonus_score(factors: list[dict]) -> int:
                if f["name"] in CONFLUENCE_BONUS and f["ok"])
 
 
+def _target_ladder(
+    base: pd.DataFrame,
+    direction: str,
+    entry: float,
+    risk: float,
+    zones: list[dict] | None,
+    tpo_levels: list[dict] | None,
+) -> list[tuple[float, str]]:
+    """Ordered (target_price, source) ladder ABOVE a BUY / BELOW a SELL.
+
+    D-049 — every structural object the engine already computes becomes a
+    take-profit candidate: opposing POI zones (near edge), buy/sell-side
+    liquidity pools (equal highs/lows + PDH/PDL) and opposing TPO
+    time-at-price levels. The market is drawn to these — the TP belongs
+    just IN FRONT of the nearest one, not at an arbitrary fixed multiple.
+
+    Levels the market is ALREADY trading at (within NOISE_FLOOR_ATR of
+    the entry) are dropped: a zone minted by the trigger's own move sits
+    right on top of the entry — it is the current location, not a
+    barrier (the sweep's breakdown origin was vetoing every sweep setup
+    at 0.05R).
+    """
+    ladder: list[tuple[float, str]] = []
+    want_bull = direction == "BUY"
+    noise = NOISE_FLOOR_ATR * (ind.atr(base, 14) or 1e-9)
+
+    # opposing POI zones — the near edge is where reaction starts
+    for z in zones or []:
+        if want_bull and z.get("side") == "supply":
+            ladder.append((float(z["lo"]), f"supply zone {z['lo']:.2f}"))
+        elif not want_bull and z.get("side") == "demand":
+            ladder.append((float(z["hi"]), f"demand zone {z['hi']:.2f}"))
+
+    # liquidity pools the trade runs toward (BSL above for BUY, SSL below)
+    liq = smc.detect_liquidity(base.iloc[-160:])
+    for lv in liq.get("levels", []):
+        if want_bull and lv["kind"] == "BSL":
+            tag = lv.get("tag") or "BSL"
+            ladder.append((float(lv["price"]), f"{tag} liquidity"))
+        elif not want_bull and lv["kind"] == "SSL":
+            tag = lv.get("tag") or "SSL"
+            ladder.append((float(lv["price"]), f"{tag} liquidity"))
+
+    # opposing TPO time-at-price levels
+    for lv in tpo_levels or []:
+        p = float(lv.get("price", 0.0))
+        side = lv.get("side")
+        if want_bull and side == "resistance":
+            ladder.append((p, f"TPO resistance {p:.2f}"))
+        elif not want_bull and side == "support":
+            ladder.append((p, f"TPO support {p:.2f}"))
+
+    # keep only targets genuinely in the trade's direction (and beyond
+    # the noise floor around the entry)
+    fwd = [t for t in ladder
+           if (t[0] > entry if want_bull else t[0] < entry)
+           and abs(t[0] - entry) > noise]
+    fwd.sort(key=lambda t: abs(t[0] - entry))
+    return fwd
+
+
 def smart_targets(
     base: pd.DataFrame,
     direction: str,
     entry: float,
     sl_base: float,          # structural SL candidate (beyond sweep/swing)
-    rr: float,
+    rr: float,               # fallback TP multiple when no target is found
     min_sl_atr: float,
     max_sl_atr: float,
     tpo_levels: list[dict] | None = None,  # D-047 time-at-price levels
-) -> tuple[float, float, float]:
-    """Zone-aware (entry, sl, tp) — app-controlled exits (user directive).
+    zones: list[dict] | None = None,  # D-049 ranked POI zones (TP ladder)
+    spread_price: float = 0.0,  # D-049 current spread in price units
+    min_rr: float = 1.2,    # D-049 geometry floor — skip worse trades
+    max_tp_r: float = 3.0,  # D-049 beyond the furthest useful target
+) -> tuple[float, float, float | None, str]:
+    """Structure-aware (entry, sl, tp, note) — app-controlled exits.
+
+    D-049 user directive: "SL ও TP সমান রেশিও দিচ্ছে কেনো? ... হিসাব করে
+    প্রেডিকশন করতে হবে, মার্কেট এই প্রাইস লেভেল এ গেলে SL অথবা TP হিট
+    করবে" — exits are PREDICTED from the market structure, not fixed:
 
     SL: the structural invalidation (sweep extreme / swing / zone edge),
-    floored at min_sl_atr*ATR and capped at max_sl_atr*ATR from entry.
+    floored at min_sl_atr*ATR and at 2.5x the current spread (a stop the
+    spread can eat half of is not a stop), capped at max_sl_atr*ATR.
     D-047: when a STRONG time-at-price level sits beyond the structural
-    SL, the stop is extended JUST PAST it (a stop resting in front of a
-    price the market kept returning to gets swept) — never wider than
-    max_sl_atr.
-    TP: rr * risk, snapped just in front of the nearest opposing
-    liquidity pool when one sits inside [0.75, 1.6]x risk (ICT: price
-    is drawn to liquidity).
+    SL the stop extends JUST PAST the NEAREST one (D-049 bug fix — the
+    old code anchored past the FURTHEST level, ballooning the stop).
+    TP: the nearest structural target (opposing POI zone edge, liquidity
+    pool, TPO level) at >= min_rr x risk, parked 0.10 ATR in front of
+    it; rr x risk when no target exists inside max_tp_r. When the
+    nearest structure stands BEFORE min_rr x risk the trade has no room
+    — tp=None tells the caller to SKIP (poor geometry, predicted to lose
+    the race between the barrier and the profit).
     """
     a = ind.atr(base, 14) or 1e-9
     want_bull = direction == "BUY"
-    # --- stop loss: structural, floored and capped
+    # --- stop loss: structural, spread-floored, ATR-floored and capped
+    spread_floor = SPREAD_FLOOR_MULT * max(spread_price, 0.0)
+    min_risk = max(min_sl_atr * a, spread_floor)
     if want_bull:
-        sl = min(sl_base, entry - min_sl_atr * a)
+        sl = min(sl_base, entry - min_risk)
         sl = max(sl, entry - max_sl_atr * a)      # cap: never risk more
         risk = entry - sl
     else:
-        sl = max(sl_base, entry + min_sl_atr * a)
+        sl = max(sl_base, entry + min_risk)
         sl = min(sl, entry + max_sl_atr * a)
         risk = sl - entry
     if risk <= 0:  # pathological (cap below floor) — fall back to floor
-        sl = entry - min_sl_atr * a if want_bull else entry + min_sl_atr * a
-        risk = min_sl_atr * a
+        sl = entry - min_risk if want_bull else entry + min_risk
+        risk = min_risk
 
-    # --- D-047 TPO anchoring: extend the stop past a strong level that
-    # sits beyond it (BUY: supports below sl; SELL: resistances above sl)
+    # --- D-047/D-049 TPO anchoring: extend the stop just past the
+    # NEAREST strong level that sits beyond it (BUY: supports below sl)
     if tpo_levels:
         strong = [lv for lv in tpo_levels if float(lv.get("strength", 0)) >= 0.5]
         pad = 0.15 * a
         if want_bull:
             below = [float(lv["price"]) for lv in strong if lv["price"] < sl]
             if below:
-                cand = min(below) - pad
+                cand = max(below) - pad  # NEAREST level under the stop
                 if entry - cand <= max_sl_atr * a:
                     sl = cand
                     risk = entry - sl
         else:
             above = [float(lv["price"]) for lv in strong if lv["price"] > sl]
             if above:
-                cand = max(above) + pad
+                cand = min(above) + pad  # NEAREST level over the stop
                 if cand - entry <= max_sl_atr * a:
                     sl = cand
                     risk = sl - entry
 
-    # --- take profit: rr * risk, liquidity-snapped
-    tp = entry + rr * risk if want_bull else entry - rr * risk
-    liq = smc.detect_liquidity(base.iloc[-160:])
-    opposing = [
-        lv["price"] for lv in liq.get("levels", [])
-        if (lv["kind"] == "BSL" and want_bull) or (lv["kind"] == "SSL" and not want_bull)
-    ]
-    for target in sorted(opposing, key=lambda p: abs(p - entry)):
-        dist = (target - entry) if want_bull else (entry - target)
-        if 0.75 * risk <= dist <= 1.6 * risk:
-            # park the TP just in front of the pool (avoid the shave)
-            tp = target - 0.05 * risk if want_bull else target + 0.05 * risk
-            break
-    return entry, float(sl), float(tp)
+    # --- take profit: PREDICTED from the structure (D-049)
+    ladder = _target_ladder(base, direction, entry, risk, zones, tpo_levels)
+    park = 0.10 * a  # park just in front of the level (avoid the shave)
+    tp: float | None = None
+    note = ""
+    if ladder:
+        nearest_dist = abs(ladder[0][0] - entry)
+        if nearest_dist < min_rr * risk:
+            # a structural barrier stands before the profit can develop —
+            # the market is predicted to hit the barrier first: skip
+            return entry, float(sl), None, (
+                f"poor geometry — {ladder[0][1]} at "
+                f"{nearest_dist / risk:.2f}R (< {min_rr:.1f}R min)"
+            )
+        for target, src in ladder:
+            dist = (target - entry) if want_bull else (entry - target)
+            if min_rr * risk <= dist <= max_tp_r * risk:
+                tp = (target - park) if want_bull else (target + park)
+                note = f"{src} @ {target:.2f} ({dist / risk:.2f}R)"
+                break
+    if tp is None:
+        fallback = min(rr, max_tp_r)
+        tp = entry + fallback * risk if want_bull else entry - fallback * risk
+        note = f"no target within {max_tp_r:.0f}R — rr {fallback:.1f}R"
+    return entry, float(sl), float(tp), note
