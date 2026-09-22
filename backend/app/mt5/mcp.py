@@ -171,7 +171,13 @@ class MT5TerminalClient:
         }
         if self._session:
             headers["Mcp-Session-Id"] = self._session
-        path = self._conn_parts().path or "/"
+        # D-047 HOTFIX: the PUBLIC bridge URL carries a query string
+        # (…/mcp?XTransformPort=22346) — urlsplit().path DROPS it and the
+        # tunnel gateway answers 404. Rebuild path + query exactly.
+        parts = self._conn_parts()
+        path = parts.path or "/"
+        if parts.query:
+            path = f"{path}?{parts.query}"
         data = json.dumps(payload).encode()
         body = ""
         for attempt in (1, 2):

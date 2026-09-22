@@ -168,3 +168,34 @@ def test_connect_failure_is_fast(bridge: str) -> None:
         c.account()
     elapsed = time.monotonic() - t0
     assert elapsed < 20.0  # 2 connect attempts @ short budget, not 60s each
+
+
+def test_url_query_string_is_preserved(bridge: str) -> None:
+    """D-047 hotfix: bridge URLs like /mcp?XTransformPort=22346 must POST to
+    path+query — dropping the query made the tunnel gateway answer 404
+    (production incident 2026-09-22)."""
+    url = f"{bridge}?XTransformPort=22346"
+    c = MT5TerminalClient(url=url, key="test-key")
+    # the request must reach the handler (200, not 404) — the fake bridge
+    # only serves do_POST on the right path? BaseHTTPRequestHandler serves
+    # do_POST for ANY path, so assert via a monkeypatched captured path.
+    captured: list[str] = []
+
+    orig_request = http.client.HTTPConnection.request
+
+    def spy_request(self, method, url_, body=None, headers=None, **kw):
+        captured.append(url_)
+        return orig_request(self, method, url_, body=body, headers=headers, **kw)
+
+    import contextlib
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            __import__("unittest.mock", fromlist=["patch"]).patch(
+                "http.client.HTTPConnection.request", new=spy_request
+            )
+        )
+        assert c.account() == {"ok": "get_trading_account_info"}
+    assert captured, "no request went out"
+    assert captured[0].startswith("/mcp?"), f"query string lost: {captured[0]}"
+    assert "XTransformPort=22346" in captured[0]
