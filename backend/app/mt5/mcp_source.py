@@ -33,6 +33,8 @@ from app.mt5.base import (
     empty_rates,
 )
 from app.mt5.mcp import (
+    RET_DONE,
+    RET_PLACED,
     TRADING_NOT_PERMITTED_HINT,
     MCPError,
     MT5TerminalClient,
@@ -55,8 +57,10 @@ FALLBACK_SPECS: dict[str, SymbolInfo] = {
 }
 
 SYMBOLS_TTL_S = 600.0  # Market Watch discovery cache
-RET_DONE = 10009  # TRADE_RETCODE_DONE
 RET_MARKET_CLOSED = 10018
+#: D-055 — ok retcodes for a PENDING placement: DONE (request completed)
+#: or PLACED (the order is registered and waiting for its trigger price).
+_PEND_OK = frozenset({RET_DONE, RET_PLACED})
 
 
 def _parse_time(s: Any) -> Any:
@@ -214,6 +218,105 @@ class McpTradingSource(DataSource):
                 logger.warning("skipping malformed terminal position: %r", p)
         return out
 
+    # ------------------------------------------------- D-055 pending book
+
+    async def pending_orders(self) -> list[dict]:
+        """The terminal's WAITING limit orders — D-054 contract parity.
+
+        The admin AI tab + trading_account broadcast only ever saw the PAPER
+        planes' pending book; the institution executor's live waiting orders
+        were invisible. The terminal exposes them in the SAME
+        get_trading_open_positions response (orders array) — the field
+        mapping is tolerant because the terminal serializes orders with
+        its own names (order_ticket | ticket | order, type | order_type,
+        price_open | price ...).
+        """
+        try:
+            res = await asyncio.to_thread(self._client.positions)
+        except (MCPError, OSError) as exc:
+            logger.warning("terminal pending orders failed: %s", exc)
+            return []
+        return self._parse_pending(res)
+
+    def _parse_pending(self, res: dict) -> list[dict]:
+        out: list[dict] = []
+        for o in res.get("orders", []) or []:
+            if not isinstance(o, dict):
+                continue
+            try:
+                ticket = next(
+                    int(o[k]) for k in ("order_ticket", "ticket", "order", "order_id")
+                    if o.get(k) is not None
+                )
+            except (TypeError, ValueError, StopIteration):
+                logger.warning("skipping malformed terminal order: %r", o)
+                continue
+            raw_type = str(
+                o.get("order_type") or o.get("type") or o.get("action") or ""
+            ).lower()
+            side = "BUY" if "buy" in raw_type else "SELL"
+            price = next(
+                (
+                    o.get(k) for k in ("price_open", "price", "open_price")
+                    if o.get(k) is not None
+                ),
+                None,
+            )
+            volume = next(
+                (
+                    o.get(k) for k in ("volume_current", "volume", "volume_initial")
+                    if o.get(k) is not None
+                ),
+                None,
+            )
+            out.append(
+                {
+                    "ticket": ticket,
+                    "symbol": str(o.get("symbol", "")),
+                    "side": side,
+                    "order_type": raw_type or "pending",
+                    "volume": float(volume) if volume is not None else None,
+                    "price": float(price) if price is not None else None,
+                    "sl": o.get("stop_loss") or o.get("sl") or None,
+                    "tp": o.get("take_profit") or o.get("tp") or None,
+                }
+            )
+        return out
+
+    async def delete_pending_order(self, ticket: int) -> OrderResult:
+        """D-055 — cancel a WAITING terminal order (signal expiry path)."""
+        try:
+            res = await asyncio.to_thread(self._client.delete_order, ticket)
+        except (MCPError, OSError) as exc:
+            comment = (
+                TRADING_NOT_PERMITTED_HINT
+                if "not permitted" in str(exc)
+                else f"terminal: {exc}"
+            )
+            return OrderResult(ok=False, retcode=None, comment=comment)
+        retcode = res.get("retcode")
+        return OrderResult(
+            ok=retcode in _PEND_OK,
+            retcode=int(retcode) if retcode is not None else None,
+            comment=str(res.get("retcode_details") or ""),
+        )
+
+    async def cancel_all_pending(self) -> list[OrderResult]:
+        """D-055 — kill-switch hygiene: remove every WAITING order.
+
+        Daily-loss/profit stop used to close POSITIONS only; live limit
+        orders survived the kill switch and could fill afterwards — silent
+        re-exposure AFTER the safety limit fired.
+        """
+        pendings = await self.pending_orders()
+        results: list[OrderResult] = []
+        for o in pendings:
+            try:
+                results.append(await self.delete_pending_order(int(o["ticket"])))
+            except (TypeError, ValueError):
+                continue
+        return results
+
     def symbol_info(self, symbol: str) -> SymbolInfo | None:
         """Real terminal spec (contract size, volume limits) — cached."""
         plat = self._platform_for(symbol)
@@ -244,10 +347,11 @@ class McpTradingSource(DataSource):
 
     async def place_order(self, order: Order) -> OrderResult:
         broker = self.broker_symbol(order.symbol) or order.symbol
+        is_pending = order.order_type in ("buy_limit", "sell_limit") and order.price
         try:
-            # D-050 — pending limit orders ride their own terminal tool;
+            # D-050/D-055 — pending limit orders ride their own terminal tool;
             # SL/TP are attached server-side exactly like market orders.
-            if order.order_type in ("buy_limit", "sell_limit") and order.price:
+            if is_pending:
                 res = await asyncio.to_thread(
                     self._client.pending_order,
                     broker,
@@ -278,7 +382,11 @@ class McpTradingSource(DataSource):
             )
             return OrderResult(ok=False, retcode=None, comment=comment)
         retcode = res.get("retcode")
-        ok = retcode == RET_DONE
+        # D-055 — a pending order is successfully REGISTERED with either
+        # 10009 DONE or 10008 PLACED ("order placed", the classic pending
+        # acceptance). Treating 10008 as failure made the executor retry a
+        # LIVE order -> duplicate pending exposure on the real account.
+        ok = retcode in (_PEND_OK if is_pending else {RET_DONE})
         ticket = res.get("order") or res.get("deal")
         return OrderResult(
             ok=ok,
@@ -290,30 +398,41 @@ class McpTradingSource(DataSource):
         )
 
     async def close_position(self, ticket: int, deviation: int = 30) -> OrderResult:  # noqa: ARG002
-        """Close by ticket — the symbol is resolved from live positions."""
+        """Close by ticket — D-055 dispatch:
+
+        1. ticket is an OPEN POSITION  -> trade_close_single_position;
+        2. ticket is a WAITING ORDER  -> trade_delete_order (cancel);
+        3. neither                      -> already closed broker-side (fine).
+
+        The expiry path used to only check positions: a waiting limit order
+        was "already closed"-ok and stayed live on the account forever.
+        """
         positions = await self.get_positions()
         pos = next((p for p in positions if p.ticket == ticket), None)
-        if pos is None:  # already closed broker-side (SL/TP) — fine
-            return OrderResult(ok=True, retcode=RET_DONE,
-                               comment="already closed")
-        try:
-            res = await asyncio.to_thread(
-                self._client.close_position, pos.symbol, ticket
+        if pos is not None:
+            try:
+                res = await asyncio.to_thread(
+                    self._client.close_position, pos.symbol, ticket
+                )
+            except (MCPError, OSError) as exc:
+                comment = (
+                    TRADING_NOT_PERMITTED_HINT
+                    if "not permitted" in str(exc)
+                    else f"terminal: {exc}"
+                )
+                return OrderResult(ok=False, retcode=None, comment=comment)
+            retcode = res.get("retcode")
+            return OrderResult(
+                ok=retcode == RET_DONE,
+                retcode=int(retcode) if retcode is not None else None,
+                price=float(res["price"]) if res.get("price") else None,
+                comment=str(res.get("retcode_details") or ""),
             )
-        except (MCPError, OSError) as exc:
-            comment = (
-                TRADING_NOT_PERMITTED_HINT
-                if "not permitted" in str(exc)
-                else f"terminal: {exc}"
-            )
-            return OrderResult(ok=False, retcode=None, comment=comment)
-        retcode = res.get("retcode")
-        return OrderResult(
-            ok=retcode == RET_DONE,
-            retcode=int(retcode) if retcode is not None else None,
-            price=float(res["price"]) if res.get("price") else None,
-            comment=str(res.get("retcode_details") or ""),
-        )
+        # not an open position: a WAITING order? -> cancel it (D-055)
+        pendings = await self.pending_orders()
+        if any(o["ticket"] == ticket for o in pendings):
+            return await self.delete_pending_order(ticket)
+        return OrderResult(ok=True, retcode=RET_DONE, comment="already closed")
 
     # -------------------------------------------------- DataSource (mkt data)
 

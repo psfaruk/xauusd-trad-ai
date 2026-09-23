@@ -29,6 +29,14 @@ from typing import Any
 DEFAULT_URL = "http://127.0.0.1:22346/mcp"
 DEFAULT_KEY_FILE = "/home/z/mt5stack/mcp_key.txt"
 _TIMEOUT = 60  # order ops can take a few seconds; info ops are fast
+
+#: D-055 — MT5 return codes. A pending order is ACCEPTED by the terminal
+#: with TRADE_RETCODE_PLACED (10008, "order placed") just as often as with
+#: TRADE_RETCODE_DONE (10009) depending on server/bridge; treating 10008 as
+#: failure used to make the executor RETRY a live pending order (duplicate
+#: exposure) and log the placement as rejected.
+RET_DONE = 10009
+RET_PLACED = 10008
 #: D-047 — TLS handshake / connect budget. The PUBLIC bridge (HTTPS tunnel)
 #: occasionally stalls a fresh handshake for the FULL socket timeout, which
 #: used to freeze tick polling for 60s+ ("candles stop updating"). Connecting
@@ -297,6 +305,56 @@ class MT5TerminalClient:
         # notification (202, empty body is fine)
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
+    # ------------------------------------------------------ D-055 capability
+
+    def tools_list(self, refresh: bool = False) -> list[dict[str, Any]]:
+        """tools/list — the terminal's OWN tool descriptors (name + schema).
+
+        The pending-order contract was written blind in D-050 (never
+        live-verified: field `order_type`, no filling_type). Instead of
+        guessing again, D-055 NEGOTIATES: read the actual inputSchema of
+        every tool from the terminal and adapt the arguments to it.
+        """
+        with self._lock:
+            if self._session is None:
+                self._connect_locked()
+            self._id += 1
+            resp = self._post(
+                {"jsonrpc": "2.0", "id": self._id, "method": "tools/list"},
+                timeout=15,
+            )
+        if "error" in resp:
+            raise MCPError(str(resp["error"].get("message", resp["error"])))
+        result = resp.get("result", {})
+        tools = result.get("tools", []) if isinstance(result, dict) else []
+        if isinstance(tools, list):
+            self._tools_schema = {str(t.get("name")): t for t in tools if isinstance(t, dict)}
+        return tools
+
+    def tool_schema(self, name: str) -> dict[str, Any] | None:
+        """inputSchema of one tool (cached; None = unknown tool)."""
+        cached = getattr(self, "_tools_schema", None)
+        if cached is None:
+            try:
+                self.tools_list()
+            except (MCPError, OSError):
+                return None
+            cached = self._tools_schema
+        t = (cached or {}).get(name)
+        if not isinstance(t, dict):
+            return None
+        schema = t.get("inputSchema") or t.get("input_schema")
+        return schema if isinstance(schema, dict) else None
+
+    @staticmethod
+    def _schema_props(schema: dict[str, Any] | None) -> set[str]:
+        if not isinstance(schema, dict):
+            return set()
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            return {str(k) for k in props}
+        return set()
+
     @staticmethod
     def _content(result: dict[str, Any]) -> Any:
         content = result.get("content", [])
@@ -393,27 +451,67 @@ class MT5TerminalClient:
                       price: float, sl: float | None = None,
                       tp: float | None = None,
                       comment: str = "") -> dict[str, Any]:
-        """D-050 — place a PENDING limit order on the real terminal.
+        """D-050/D-055 — place a PENDING limit order on the real terminal.
 
         `order_type`: "buy_limit" | "sell_limit" (an entry BELOW the market
         for a BUY / ABOVE it for a SELL — the POI zone pending entry). SL/TP
         ride with the order so the exit stays server-side (Exness executes
         them even if the platform goes down, same guarantee market orders
         have). The fill happens when the market retraces to `price`.
+
+        D-055 — the arguments are ADAPTIVE to the terminal's own tool
+        schema (tools/list negotiation):
+        - the order-type field is sent as `type` (matching the LIVE-VERIFIED
+          market_order contract, D-034) unless the terminal's schema
+          explicitly declares `order_type` instead;
+        - `filling_type: "return"` is attached when the schema offers it —
+          pending orders on many symbols are only valid with the RETURN
+          filling policy (FOK/IOC pendings get TRADE_RETCODE_INVALID_FILL);
+          live-verified community reports on MT5 builds 5955+.
         """
+        schema = self.tool_schema("trade_send_pending_order")
+        props = self._schema_props(schema)
+        type_field = "order_type" if ("order_type" in props and "type" not in props) else "type"
         args: dict[str, Any] = {
             "symbol": symbol,
-            "order_type": order_type,
+            type_field: order_type,
             "volume": volume,
             "price": price,
         }
+        if "filling_type" in props:
+            args["filling_type"] = "return"
         if sl:
             args["sl"] = sl
         if tp:
             args["tp"] = tp
         if comment:
             args["comment"] = comment[:31]
+        if type_field != "type":
+            log.info(
+                "terminal pending tool uses field %r (schema-adaptive, D-055)",
+                type_field,
+            )
         res = self._call("trade_send_pending_order", args, timeout=120)
+        if isinstance(res, str):
+            raise MCPError(res)
+        return res
+
+    def delete_order(self, order_ticket: int) -> dict[str, Any]:
+        """D-055 — cancel a WAITING pending order on the real terminal.
+
+        Signal expiry used to call close_position() which only searches OPEN
+        POSITIONS: a still-waiting limit order was reported "already closed"
+        and left LIVE on the account — it could fill hours later with no
+        signal linkage (untracked real-money exposure). This tool
+        (trade_delete_order) actually removes the waiting order.
+        """
+        schema = self.tool_schema("trade_delete_order")
+        props = self._schema_props(schema)
+        ticket_field = next(
+            (k for k in ("order_ticket", "ticket", "order", "order_id") if k in props),
+            "order_ticket",
+        )
+        res = self._call("trade_delete_order", {ticket_field: order_ticket}, timeout=120)
         if isinstance(res, str):
             raise MCPError(res)
         return res

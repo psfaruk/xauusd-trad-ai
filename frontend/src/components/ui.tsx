@@ -296,7 +296,7 @@ export function NumberField({
       autoComplete="off"
       onFocus={(e) => e.currentTarget.select()}
       onChange={(e) => setDraft(e.target.value)}
-      onBlur={(e) => commit(draft)}
+      onBlur={() => commit(draft)}
       onKeyDown={(e) => {
         if (e.key === "Enter") {
           e.preventDefault();

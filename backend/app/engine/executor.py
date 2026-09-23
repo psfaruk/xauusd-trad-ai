@@ -557,18 +557,44 @@ class OrderExecutor:
             return result
 
     async def _place_with_retry(self, order: Order) -> OrderResult:
-        """Send; failed orders retried max 1x (SPEC §9)."""
+        """Send; failed orders retried max 1x (SPEC §9).
+
+        D-055 — the retry is now CONDITIONAL on the failure mode:
+        - retcode present = the terminal REJECTED the order (invalid price,
+          no money, market closed...): the order is definitely NOT live, so
+          one retry is safe and may succeed after a re-quote;
+        - retcode ABSENT = transport failure (bridge unreachable mid-send):
+          the request MAY have reached the terminal and the order MAY be
+          live. Retrying was a DOUBLE-FIRE: two identical pending orders on
+          the real account, both filling later. The original mcp.py ladder
+          already refuses response-phase retries for order tools — this
+          closes the last blind-retry hole at the executor level.
+        """
         result = await self._source.place_order(order)
         if not result.ok:
+            if result.retcode is None:
+                logger.warning(
+                    "order transport failed (no retcode — it may be live on"
+                    " the terminal); NOT retrying to avoid a duplicate order:"
+                    " %s",
+                    result.comment,
+                )
+                return result
             logger.warning(
-                "order failed (retcode=%s) — retrying once", result.retcode
+                "order rejected (retcode=%s) — retrying once", result.retcode
             )
             result = await self._source.place_order(order)
         return result
 
     async def _emergency_stop(self) -> None:
-        """Daily-loss kill switch: close all positions, disarm, CRITICAL log."""
+        """Daily-loss kill switch: close all positions, disarm, CRITICAL log.
+
+        D-055 — waiting PENDING orders are cancelled too: they would survive
+        the stop and fill later, silently re-exposing the account after the
+        safety limit already fired.
+        """
         logger.critical("DAILY LOSS KILL SWITCH — closing all positions, disarming auto-trade")
+        await self._cancel_waiting_pendings()
         positions = await self._source.get_positions()
         for p in positions:
             try:
@@ -585,10 +611,15 @@ class OrderExecutor:
     async def _profit_lock_stop(self) -> None:
         """D-052 — daily target profit reached: lock the profit in (close
         everything) and turn auto-trade OFF (the user's daily mission is
-        complete — no more risk today)."""
+        complete — no more risk today).
+
+        D-055 — waiting pendings are cancelled too (they are future risk,
+        not locked profit).
+        """
         logger.info(
             "DAILY PROFIT TARGET REACHED — locking profit, auto-trade OFF"
         )
+        await self._cancel_waiting_pendings()
         positions = await self._source.get_positions()
         for p in positions:
             try:
@@ -601,6 +632,28 @@ class OrderExecutor:
             "auto-trade turned OFF",
         )
         self.arm(False)
+
+    async def _cancel_waiting_pendings(self) -> None:
+        """D-055 — best-effort cancel of the source's WAITING orders.
+
+        Only real terminals expose the tool (paper planes fill/cancel on
+        their own book); the probe keeps every DataSource working unchanged.
+        """
+        cancel = getattr(self._source, "cancel_all_pending", None)
+        if not callable(cancel):
+            return
+        try:
+            results = cancel()
+            if asyncio.iscoroutine(results):
+                results = await results
+            removed = sum(1 for r in results or [] if getattr(r, "ok", False))
+            if removed:
+                await self._log(
+                    "info",
+                    f"{removed} waiting pending order(s) cancelled (kill switch)",
+                )
+        except Exception:  # noqa: BLE001 — hygiene must never block the stop
+            logger.exception("pending cancel failed during kill switch")
 
     async def _notify(self, verdict: KillSwitchVerdict) -> None:
         level = "critical" if verdict.kill_daily_loss else "info"

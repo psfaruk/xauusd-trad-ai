@@ -699,6 +699,19 @@ export interface Mt5AutoTradeStatus {
     min_sl_atr?: number;
     timeframe?: string;
   };
+  /** D-055 — the institution terminal's WAITING limit orders (admin scope):
+   *  live pending book so the AI tab can prove real orders sit on Exness. */
+  pending_orders?: {
+    ticket: number;
+    symbol: string;
+    side: string;
+    order_type: string;
+    volume: number | null;
+    price: number | null;
+    sl: number | null;
+    tp: number | null;
+  }[];
+  pending_count?: number;
   last_skip_reason: string | null;
 }
 

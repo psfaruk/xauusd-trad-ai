@@ -26,6 +26,7 @@ Safety properties (user-visible honesty, never silent):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -295,10 +296,14 @@ class McpAutoTrader:
     # ------------------------------------------------------------ exit sync
 
     async def notify_signal_status(self, signal_id: str, status: str) -> None:
-        """Tracker outcome -> keep the linked REAL position in step.
+        """Tracker outcome -> keep the linked REAL order/position in step.
 
         won/lost : the broker SL/TP already closed it — reconcile the record.
-        expired  : §8 expiry — CLOSE the terminal position now.
+        expired  : §8 expiry — the position CLOSES; a still-WAITING pending
+                   order is CANCELLED on the terminal (D-055: it used to be
+                   reported "already closed" and left live, filling hours
+                   later with no signal linkage — untracked real exposure).
+        cancelled: same cleanup as expired (user-voided signal).
         """
         if status not in CLOSED_STATUSES:
             return
@@ -310,19 +315,23 @@ class McpAutoTrader:
             return  # signal traded virtually only (not auto-executed)
         ticket = trade.get("ticket")
 
-        if status == "expired" and ticket:
+        if status in ("expired", "cancelled") and ticket:
             res = await self._source.close_position(int(ticket))
             await self._repo.mark_closed(
                 signal_id, self._owner, price_close=res.price
             )
+            note = "expired" if status == "expired" else "cancelled"
             await self._emit(
                 "info" if res.ok else "warning",
-                f"signal {signal_id[:8]} expired — terminal position #{ticket} "
-                + (f"closed @ {res.price}" if res.ok else f"close FAILED: {res.comment}"),
+                f"signal {signal_id[:8]} {note} — terminal ticket #{ticket} "
+                + (
+                    f"closed @ {res.price}" if res.price
+                    else ("waiting order cancelled" if res.ok else f"cleanup FAILED: {res.comment}")
+                ),
                 {"event": "close", "ok": res.ok, "signal_id": signal_id,
-                 "ticket": ticket, "price": res.price, "reason": "signal expired"},
+                 "ticket": ticket, "price": res.price, "reason": f"signal {note}"},
             )
-        elif status in ("won", "lost"):
+        elif status == "won" or status == "lost":
             # broker-side SL/TP executed the exit
             await self._repo.mark_closed(signal_id, self._owner)
             await self._emit(
@@ -339,6 +348,19 @@ class McpAutoTrader:
         info = await self._source.account_info()
         cfg = self._cfg
         balance = info.get("balance") if info else None
+
+        # D-055 — the terminal's WAITING limit orders (live pending book;
+        # best-effort: bridge down -> empty list, status stays honest)
+        pending: list[dict] = []
+        try:
+            probe = getattr(self._source, "pending_orders", None)
+            if callable(probe):
+                res = probe()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                pending = list(res or [])
+        except Exception:  # noqa: BLE001 — visibility must never break status
+            pending = []
 
         # D-039: per-symbol broker market state (forex weekend/holiday logic)
         markets: dict[str, dict] = {}
@@ -409,6 +431,8 @@ class McpAutoTrader:
                 "equity": info.get("equity") if info else None,
                 "currency": info.get("currency") if info else None,
             },
+            "pending_orders": pending,
+            "pending_count": len(pending),
             "markets": markets,
             "why": why,
             "risk": {

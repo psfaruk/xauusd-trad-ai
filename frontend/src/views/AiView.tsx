@@ -471,6 +471,25 @@ function ArmCard({
               ))}
             </div>
           )}
+          {/* D-055 — live pending book: the institution terminal's WAITING
+              limit orders (admin scope) so real Exness orders are provable,
+              not just the paper plane's book */}
+          {isAdminScope && (status.pending_count ?? 0) > 0 && (
+            <div className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2">
+              <p className="text-[10px] font-semibold text-amber-200/90">
+                {status.pending_count} waiting order{status.pending_count === 1 ? "" : "s"} on the terminal
+              </p>
+              <div className="mt-1 flex flex-col gap-0.5">
+                {(status.pending_orders ?? []).slice(0, 4).map((o) => (
+                  <p key={o.ticket} className="text-[10px] leading-relaxed text-zinc-400">
+                    #{o.ticket} · {o.symbol} · {o.order_type} ·{" "}
+                    {o.volume != null ? `${o.volume.toFixed(2)} lots` : "—"} @{" "}
+                    {o.price != null ? o.price.toFixed(2) : "—"}
+                  </p>
+                ))}
+              </div>
+            </div>
+          )}
           {status.last_skip_reason && (
             <p className="mt-2 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-[10px] leading-relaxed text-zinc-500">
               last skip: {status.last_skip_reason}
