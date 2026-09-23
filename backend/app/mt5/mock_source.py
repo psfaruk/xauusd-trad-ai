@@ -368,6 +368,22 @@ class MockDataSource(PaperPlaneMixin, DataSource):
     async def is_connected(self) -> bool:
         return self._connected
 
+    async def pending_orders(self) -> list[dict]:
+        """D-054 — the waiting limit orders (ticket, price, SL/TP) for the UI."""
+        return [
+            {
+                "ticket": ticket,
+                "symbol": order.symbol,
+                "side": order.side,
+                "order_type": order.order_type,
+                "volume": order.volume,
+                "price": float(order.price) if order.price else None,
+                "sl": order.sl,
+                "tp": order.tp,
+            }
+            for ticket, order in self._pending_orders
+        ]
+
     async def get_rates(self, symbol: str, tf: str, count: int) -> pd.DataFrame:
         return self._rates_sync(tf, count)
 

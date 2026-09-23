@@ -89,7 +89,14 @@ async def trading_status(request: Request, user: CurrentUser) -> dict:
 
 @router.get("/positions")
 async def trading_positions(request: Request, user: CurrentUser) -> dict:
-    return {"positions": await _manager(request).positions(user["id"])}
+    """Open positions + D-054 the plane's WAITING pending limit orders
+    (so the UI can prove a pending order WAS created and sits at its fill
+    price)."""
+    manager = _manager(request)
+    return {
+        "positions": await manager.positions(user["id"]),
+        "pending": await manager.pending_orders(user["id"]),
+    }
 
 
 @router.post("/order")

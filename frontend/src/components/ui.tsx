@@ -4,7 +4,7 @@
  * truncate, tabular numbers) so NOTHING ever renders outside the viewport.
  */
 
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
 /* ------------------------------------------------------------------ card */
 
@@ -221,6 +221,96 @@ export function Field({
 
 export const inputCls =
   "w-full min-w-0 rounded-xl border border-zinc-700/80 bg-zinc-900 px-3 py-2 font-mono text-sm text-zinc-100 tabular-nums placeholder:text-zinc-600 focus:border-gold/60 focus:outline-none focus:ring-1 focus:ring-gold/30";
+
+/* --------------------------------------------------- D-054 numeric input */
+
+/**
+ * NumberField — the editable numeric input the app needed from day one.
+ *
+ * The old fields were fully controlled inputs whose onChange ran
+ * parseFloat on EVERY keystroke: clearing a field ("" -> NaN) snapped the
+ * old value straight back, "2." collapsed to "2", and the only way to
+ * change a number was to append the new digits FIRST and delete the old
+ * ones after (exactly the user's Bengali complaint). This component keeps
+ * a free-form local draft while focused, selects the whole value on
+ * focus (type-to-replace), and commits ONE parsed/clamped number on blur
+ * or Enter. Escape reverts. Cleared fields commit 0 when `emptyCommitsZero`
+ * (money-management gate needs "missing") and revert when not.
+ */
+export function NumberField({
+  value,
+  onCommit,
+  min,
+  max,
+  disabled = false,
+  placeholder,
+  emptyCommitsZero = false,
+  className,
+}: {
+  value: number | null | undefined;
+  onCommit: (v: number) => void;
+  min?: number;
+  max?: number;
+  disabled?: boolean;
+  placeholder?: string;
+  /** true: blur-on-empty commits 0 (missing-field gate); false: revert. */
+  emptyCommitsZero?: boolean;
+  className?: string;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+
+  const commit = (raw: string | null) => {
+    setDraft(null);
+    if (raw === null) return; // not editing — nothing to do
+    const trimmed = raw.trim();
+    if (trimmed === "" || trimmed === "-" || trimmed === "." || trimmed === "-.") {
+      if (emptyCommitsZero) onCommit(0);
+      return;
+    }
+    const parsed = parseFloat(trimmed);
+    if (!Number.isFinite(parsed)) {
+      if (emptyCommitsZero) onCommit(0);
+      return;
+    }
+    let out = parsed;
+    if (min !== undefined) out = Math.max(min, out);
+    if (max !== undefined) out = Math.min(max, out);
+    onCommit(out);
+  };
+
+  const shown =
+    draft !== null
+      ? draft
+      : value === null || value === undefined || Number.isNaN(value)
+        ? ""
+        : String(value);
+
+  return (
+    <input
+      className={className ?? inputCls}
+      value={shown}
+      inputMode="decimal"
+      disabled={disabled}
+      placeholder={placeholder}
+      spellCheck={false}
+      autoComplete="off"
+      onFocus={(e) => e.currentTarget.select()}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={(e) => commit(draft)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          commit(draft);
+          e.currentTarget.blur();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          setDraft(null);
+          e.currentTarget.blur();
+        }
+      }}
+    />
+  );
+}
 
 /* ---------------------------------------------------------------- toggle */
 

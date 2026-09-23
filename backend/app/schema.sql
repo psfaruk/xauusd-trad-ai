@@ -58,6 +58,13 @@ create table if not exists signals (
 );
 create index if not exists signals_ts_idx on signals (ts desc);
 
+-- D-054 — pending-limit signals carry their entry contract through REST so
+-- the UI can show "PENDING LIMIT · waiting for fill price" after a refetch
+-- (the in-memory tracker owns the live pending -> active/expired lifecycle).
+alter table signals add column if not exists entry_type text not null default 'market';
+alter table signals add column if not exists market_ref double precision;
+alter table signals add column if not exists entry_note text;
+
 create table if not exists trades (
   id uuid primary key default gen_random_uuid(),
   signal_id uuid references signals(id),

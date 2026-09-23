@@ -13,7 +13,7 @@ import {
 import type {
   BrokerConnection, EngineConfig, LogEntry, Mt5Status, TradingStatus,
 } from "../types";
-import { Badge, Btn, Card, Dot, EmptyState, Field, SectionTitle, Stat, inputCls } from "../components/ui";
+import { Badge, Btn, Card, Dot, EmptyState, Field, NumberField, SectionTitle, Stat, inputCls } from "../components/ui";
 import { useAuth } from "../lib/auth";
 
 interface Props {
@@ -295,15 +295,15 @@ function EngineCard({ token, isAdmin }: { token: string; isAdmin: boolean }) {
       <div className="grid grid-cols-2 gap-2">
         {ENGINE_NUM_FIELDS.map((f) => (
           <Field key={String(f.key)} label={f.label} hint={f.hint}>
-            <input
-              className={inputCls}
-              value={String(cfg[f.key] ?? "")}
-              inputMode="decimal"
+            {/* D-054 — NumberField: select-all on focus + commit on blur.
+            The old controlled input parsed on every keystroke, so the old
+            number could not be cleared or edited in place (Bengali bug
+            report: "পাশে আরেক টা লিখে তারপর মুছতে হচ্ছে"). */}
+            <NumberField
+              value={cfg[f.key] as number | undefined}
+              onCommit={(v) => patch({ [f.key]: v } as Partial<EngineConfig>)}
               disabled={!isAdmin}
-              onChange={(e) => {
-                const v = parseFloat(e.target.value);
-                if (!Number.isNaN(v)) patch({ [f.key]: v } as Partial<EngineConfig>);
-              }}
+              placeholder={f.step}
             />
           </Field>
         ))}

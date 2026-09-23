@@ -261,6 +261,19 @@ async def lifespan(app: FastAPI):
                 "LIVE MT5 AUTO-TRADE armed from persisted state — AI signals"
                 " will place REAL orders"
             )
+            # D-054 — re-apply the arming admin's money-management window
+            # (persisted user settings) so a restart can not silently drop
+            # the USD stop-loss / target / lot that governed the arm.
+            try:
+                armed_by = app.state.mt5_auto.owner
+                if armed_by:
+                    settings = await app.state.trading.user_settings(str(armed_by))
+                    await app.state.mt5_auto.apply_money_window(settings)
+                    logger.info(
+                        "admin money window re-applied after boot restore"
+                    )
+            except Exception:  # noqa: BLE001 — window is best-effort
+                logger.exception("admin money window boot restore failed")
         restored = await app.state.trading.try_restore_planes()
         if restored:
             logger.info("restored %d user trading plane(s)", restored)

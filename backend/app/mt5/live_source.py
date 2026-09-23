@@ -1136,6 +1136,22 @@ class LiveDataSource(PaperPlaneMixin, DataSource):
                 return True
         return await self._mt5_bars_alive()
 
+    async def pending_orders(self) -> list[dict]:
+        """D-054 — the waiting limit orders (ticket, price, SL/TP) for the UI."""
+        return [
+            {
+                "ticket": ticket,
+                "symbol": order.symbol,
+                "side": order.side,
+                "order_type": order.order_type,
+                "volume": order.volume,
+                "price": float(order.price) if order.price else None,
+                "sl": order.sl,
+                "tp": order.tp,
+            }
+            for ticket, order in self._pending_orders
+        ]
+
     async def _mt5_bars_alive(self) -> bool:
         """Does the terminal still answer chart history? (closed-market OK)"""
         mcp = getattr(self.market, "mcp", None)

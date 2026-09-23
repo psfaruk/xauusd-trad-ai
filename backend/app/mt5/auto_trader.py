@@ -74,6 +74,10 @@ class McpAutoTrader:
         )
         self._owner: str | None = None  # arming admin (trades-table linkage)
         self._armed_at: str | None = None
+        # D-054 — the arming admin's money-management window, merged over
+        # the global config on every apply_config (survives PUT /api/config
+        # and the boot restore). None = institution runs on global defaults.
+        self._money_window: dict | None = None
 
     # ------------------------------------------------------------------ arm
 
@@ -86,7 +90,15 @@ class McpAutoTrader:
         return self._owner
 
     async def arm(self, enabled: bool, owner: str | None = None) -> dict:
-        """Arm/disarm live auto-execution (admin action, typed-confirmed)."""
+        """Arm/disarm live auto-execution (admin action, typed-confirmed).
+
+        D-054 — arming anchors the USD money window on the terminal's REAL
+        equity (the typed day_start_balance is a prefill hint only): the old
+        path never anchored, so `_ensure_day_anchor` fell back to
+        first-order equity — correct — but with the GLOBAL config's window
+        values (0 = off) unless apply_money_window ran, the admin's window
+        was a placebo that never guarded the institution executor.
+        """
         if enabled:
             info = await self._source.account_info()
             if info is None:
@@ -101,8 +113,11 @@ class McpAutoTrader:
                 )
             self._owner = owner
             self._armed_at = datetime.now(tz=UTC).isoformat()
+            equity = float(info.get("equity", 0.0))
+            self._executor.arm(True, day_start_equity=equity or None)
+        else:
+            self._executor.arm(False)
         self._executor.set_owner(self._owner)
-        self._executor.arm(enabled)
         if self._config_repo is not None:
             await self._config_repo.save_auto_live(
                 self._db, enabled, owner if enabled else None
@@ -117,6 +132,46 @@ class McpAutoTrader:
         await self._emit(level, msg, {"event": "armed" if enabled else "disarmed",
                                       "armed": enabled})
         return {"armed": enabled, "owner": owner}
+
+    async def apply_money_window(self, settings: dict) -> None:
+        """D-054 — the arming ADMIN's money window governs this executor.
+
+        The money-management modal used to save into user settings while
+        this arm path bound the institution executor to the GLOBAL config
+        (daily_loss_usd / daily_profit_usd / fixed_lot at their defaults) —
+        the admin's typed limits never reached the executor that actually
+        trades. This merges the admin's window over the global cfg and
+        re-anchors the day on the terminal's real equity.
+        """
+        window = {
+            k: settings[k]
+            for k in (
+                "risk_mode", "fixed_lot", "max_positions",
+                "max_trades_per_day", "daily_loss_usd", "daily_profit_usd",
+                "day_start_balance",
+            )
+            if settings.get(k) is not None
+        }
+        self._money_window = window or None
+        await self._apply_window_to_executor()
+
+    async def _apply_window_to_executor(self) -> None:
+        if self._money_window:
+            data = self._cfg.model_dump()
+            data.update(self._money_window)
+            try:
+                cfg = EngineConfig(**data)
+            except Exception as exc:  # noqa: BLE001 — bad values: keep global
+                logger.warning("admin money window invalid: %s", exc)
+                return
+            await self._executor.apply_config(cfg)
+            # re-anchor the day on real equity (fallback: typed balance)
+            info = await self._source.account_info()
+            equity = float((info or {}).get("equity", 0.0))
+            if equity <= 0:
+                equity = float(self._money_window.get("day_start_balance") or 0.0)
+            if self.armed and equity > 0:
+                self._executor.arm(True, day_start_equity=equity)
 
     async def restore(self, owner: str | None = None) -> bool:
         """Boot-time restore of the persisted arm (CRITICAL log when armed)."""
@@ -135,9 +190,15 @@ class McpAutoTrader:
         return True
 
     async def apply_config(self, cfg: EngineConfig) -> None:
-        """PUT /api/config reaches the live executor (risk params stay live)."""
+        """PUT /api/config reaches the live executor (risk params stay live).
+
+        D-054 — the admin's money window is re-merged AFTER the global
+        config lands, so a config save can no longer silently wipe the
+        USD stop-loss / target / fixed-lot the admin armed with.
+        """
         self._cfg = cfg
         await self._executor.apply_config(cfg)
+        await self._apply_window_to_executor()
 
     # -------------------------------------------------------------- signal in
 

@@ -314,6 +314,18 @@ export interface TradingPosition {
   time: string;
 }
 
+/** D-054 — a WAITING pending limit order on the user's plane. */
+export interface TradingPendingOrder {
+  ticket: number;
+  symbol: string;
+  side: SignalDirection;
+  order_type: string;
+  volume: number;
+  price: number | null;
+  sl: number | null;
+  tp: number | null;
+}
+
 export interface TradeRecord {
   signal_id: string | null;
   owner: string | null;
@@ -444,6 +456,8 @@ export interface WsTradingAccountMsg {
   currency: string;
   auto_trade: boolean;
   positions: TradingPosition[];
+  /** D-054 — waiting pending limit orders on the plane */
+  pending?: TradingPendingOrder[];
 }
 
 export interface WsTradingLogMsg {

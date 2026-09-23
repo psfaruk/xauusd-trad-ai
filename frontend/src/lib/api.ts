@@ -3,7 +3,7 @@ import type {
   ConfigResponse, EngineConfig, TradingStatus, TradingPosition, TradeRecord,
   OrderResult, ExternalSnapshot, LogEntry, Mt5Account, Mt5OpenPosition,
   Mt5HistoryPosition, Mt5Symbol, Mt5OrderResult, Mt5AutoTradeStatus,
-  AnalysisResponse, UserSettings,
+  AnalysisResponse, UserSettings, TradingPendingOrder,
 } from "../types";
 
 /**
@@ -228,8 +228,12 @@ export function postTradingDisconnect(token: string): Promise<{ connected: boole
   }, token);
 }
 
-export function getTradingPositions(token: string): Promise<{ positions: TradingPosition[] }> {
-  return request<{ positions: TradingPosition[] }>("/api/trading/positions", {}, token);
+export function getTradingPositions(
+  token: string,
+): Promise<{ positions: TradingPosition[]; pending: TradingPendingOrder[] }> {
+  return request<{ positions: TradingPosition[]; pending: TradingPendingOrder[] }>(
+    "/api/trading/positions", {}, token,
+  );
 }
 
 export function postTradingOrder(

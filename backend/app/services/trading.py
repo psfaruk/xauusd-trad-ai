@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -44,6 +45,27 @@ logger = logging.getLogger("xauusd.trading")
 
 ACCOUNT_POLL_S = 5.0
 DEMO_START_BALANCE = 10_000.0
+
+#: D-054 — how often the plane poll loop retries a DISCONNECTED practice
+#: plane source (mirrors the ConnectionManager boot heartbeat: a cold-boot
+#: race must never strand a plane at "live: not connected" forever).
+PLANE_RECONNECT_S = 30.0
+
+
+async def _source_connected(source: Any) -> bool | None:
+    """Best-effort connection probe (always resolves, never leaks a
+    coroutine). None = probe failed; callers treat None as connected
+    (legacy behavior)."""
+    probe = getattr(source, "is_connected", None)
+    if not callable(probe):
+        return True
+    try:
+        res = probe()
+        if asyncio.iscoroutine(res):
+            return bool(await res)
+        return bool(res)
+    except Exception:  # noqa: BLE001 — probe must never break status
+        return None
 
 #: D-044 — per-user money-management settings (persisted in
 #: user_accounts.settings, merged over the global engine config so every
@@ -87,6 +109,7 @@ class TradingPlane:
     symbol: str = "XAUUSDm"  # plane's own trading symbol (D-034)
     connected_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     poll_task: asyncio.Task | None = None
+    creds: dict = field(default_factory=dict)  # D-054 — reconnect payload
 
     def status(self) -> dict:
         info = self.source.account_info()
@@ -105,8 +128,11 @@ class TradingPlane:
         info = self.source.account_info()
         if asyncio.iscoroutine(info):
             info = await info
+        # D-054 — honest connection state: a disconnected practice plane
+        # must never report "connected" while every order fails.
+        conn = await _source_connected(self.source)
         return {
-            "connected": True,
+            "connected": True if conn is None else bool(conn),
             "mode": self.mode,
             "server": self.server,
             "login_masked": _mask_login(self.login),
@@ -147,6 +173,11 @@ class UserTradingManager:
         self._platform_executor: OrderExecutor | None = None
         self._live_auto: Any | None = None  # D-036 McpAutoTrader (real terminal)
         self._persist_fp: dict[str, str] = {}
+        self._plane_last_reconnect: dict[str, float] = {}  # D-054 heartbeat
+        #: D-054 — degraded (no DATABASE_URL) settings store: the money
+        #: window must still govern planes in-process instead of being
+        #: silently dropped (dev-stack parity; see set_user_settings).
+        self._settings_mem: dict[str, dict] = {}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------ admin plane
@@ -496,6 +527,8 @@ class UserTradingManager:
             plane = TradingPlane(
                 owner=owner, mode="practice", server="Institutional Feed",
                 login=owner, source=source, executor=executor, symbol=symbol,
+                creds={"server": "practice", "login": owner, "password": "none",
+                       "mode": "practice"},
             )
             self._planes[owner] = plane
             plane.poll_task = asyncio.create_task(
@@ -508,7 +541,13 @@ class UserTradingManager:
     async def _load_account(self, owner: str) -> dict | None:
         """user_accounts row for the owner (None = first ever touch)."""
         if self._db is None:
-            return None
+            # D-054 — degraded mode: settings saved this process still load
+            # (None until the first save, so fresh planes stay untouched).
+            settings = self._settings_mem.get(owner)
+            if settings is None:
+                return None
+            return {"balance": DEMO_START_BALANCE, "currency": "USD",
+                    "auto_trade": False, "settings": settings}
         try:
             from sqlalchemy import text
 
@@ -708,16 +747,21 @@ class UserTradingManager:
             if k in ("daily_loss_usd", "daily_profit_usd", "day_start_balance"):
                 clean[k] = round(num, 2)
         if self._db is None:
-            return clean
-        import json
+            # D-054 — no DATABASE_URL: the window is kept in memory so THIS
+            # process's planes still honor it. The old code returned here,
+            # silently dropping every money setting (dev stack / any no-DB
+            # deploy: fixed_lot never applied, USD limits never guarded).
+            self._settings_mem[owner] = clean
+        else:
+            import json
 
-        from sqlalchemy import text
+            from sqlalchemy import text
 
-        async with self._db.begin() as conn:
-            await conn.execute(
-                text(UPSERT_USER_SETTINGS_SQL),
-                {"o": owner, "s": json.dumps(clean)},
-            )
+            async with self._db.begin() as conn:
+                await conn.execute(
+                    text(UPSERT_USER_SETTINGS_SQL),
+                    {"o": owner, "s": json.dumps(clean)},
+                )
         # live-apply to the plane executor if it exists
         plane = self._planes.get(owner)
         if plane is not None:
@@ -852,6 +896,29 @@ class UserTradingManager:
             for p in positions
         ]
 
+    async def pending_orders(self, owner: str) -> list[dict]:
+        """D-054 — the plane's WAITING limit orders (paper pending book).
+
+        Pending entries were previously invisible everywhere: not in
+        get_positions(), not in the trades UI, not in the WS account frame —
+        so the user saw "pending order not created" while it sat waiting
+        for its fill price. They now ride /api/trading/positions and the
+        trading_account broadcast.
+        """
+        plane = self._planes.get(owner)
+        if plane is None:
+            return []
+        probe = getattr(plane.source, "pending_orders", None)
+        if not callable(probe):
+            return []
+        try:
+            res = probe()
+            if asyncio.iscoroutine(res):
+                res = await res
+            return list(res or [])
+        except Exception:  # noqa: BLE001 — display must never break trading
+            return []
+
     async def place_manual_order(
         self, owner: str, side: str, volume: float,
         sl: float | None = None, tp: float | None = None,
@@ -953,12 +1020,19 @@ class UserTradingManager:
             plane = await self.ensure_plane(owner)  # practice plane always available
         if enabled:
             cfg = await self._user_cfg(owner)
-            anchor = float(cfg.day_start_balance or 0.0)
+            # D-054 — anchor at the plane's REAL equity at arm time (the
+            # typed day_start_balance stays a prefill/display hint). The old
+            # behavior anchored on the typed balance: any drift between it
+            # and the live equity made the FIRST signal instantly hit the
+            # USD stop-loss / target verdict and disarm auto-trade before a
+            # single order was ever placed (the "auto trade never executes"
+            # report). Equity-at-arm measures the day's true P/L.
+            info = plane.source.account_info()
+            if asyncio.iscoroutine(info):
+                info = await info
+            anchor = float((info or {}).get("equity", 0.0))
             if anchor <= 0:
-                info = plane.source.account_info()
-                if asyncio.iscoroutine(info):
-                    info = await info
-                anchor = float((info or {}).get("equity", 0.0))
+                anchor = float(cfg.day_start_balance or 0.0)
             plane.executor.arm(True, day_start_equity=anchor or None)
         else:
             plane.executor.arm(False)
@@ -1024,28 +1098,79 @@ class UserTradingManager:
             logger.exception("live auto-trader exit sync failed")
 
     async def apply_config(self, cfg: EngineConfig) -> None:
-        """Live config updates reach every executor (PUT /api/config)."""
+        """Live config updates reach every executor (PUT /api/config).
+
+        D-054 — practice planes re-apply their OWN merged config (global +
+        the user's money-management overrides). The old behavior pushed the
+        bare global cfg, silently wiping every user's daily_loss_usd /
+        daily_profit_usd / fixed_lot back to the global defaults — the
+        money window stopped applying right after any engine-config save.
+        """
         if self._platform_executor is not None:
             await self._platform_executor.apply_config(cfg)
         if self._live_auto is not None:
             try:
-                await self._live_auto.apply_config(cfg)
+                await self._live_auto.apply_config(cfg)  # re-merges its money window
             except Exception:  # noqa: BLE001
                 logger.exception("live auto-trader config apply failed")
         for plane in self._planes.values():
-            await plane.executor.apply_config(cfg)
+            try:
+                await plane.executor.apply_config(await self._user_cfg(plane.owner))
+            except Exception:  # noqa: BLE001 — one plane must not block others
+                logger.exception(
+                    "plane config apply failed for %s", plane.owner[:8]
+                )
 
     # ----------------------------------------------------------------- loops
 
+    async def _reconnect_plane(self, plane: TradingPlane) -> bool:
+        """D-054 — one reconnect attempt for a disconnected practice plane.
+
+        `ensure_plane` connects exactly once and swallows failure (cold-boot
+        race with the public feed); nothing ever retried, so every later
+        order failed with "live: not connected" while status() still said
+        connected=True. The poll loop now calls this on a 30s cadence —
+        idempotent, so success is sticky and failure just waits for the
+        next heartbeat.
+        """
+        try:
+            creds = plane.creds or {
+                "server": "practice", "login": plane.owner,
+                "password": "none", "mode": "practice",
+            }
+            await plane.source.connect(creds)
+            logger.info("practice plane %s reconnected", plane.owner[:8])
+            await self._trading_log(
+                plane.owner, "info", "trading plane reconnected — orders will execute again",
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — heartbeat keeps trying
+            logger.debug(
+                "practice plane %s reconnect deferred: %s", plane.owner[:8], exc
+            )
+            return False
+
     async def _plane_poll(self, owner: str) -> None:
         """5s loop per plane: SL/TP watcher (D-044), equity/positions
-        broadcast to just this user, and change-driven DB persistence."""
+        broadcast to just this user, and change-driven DB persistence.
+
+        D-054 — also: (a) reconnect heartbeat when the plane's source dropped
+        (30s cadence), (b) PENDING limit orders ride the broadcast so the
+        UI can show waiting-for-fill entries (they were invisible before).
+        """
         try:
             while True:
                 plane = self._planes.get(owner)
                 if plane is None:
                     return
                 try:
+                    # D-054 — reconnect heartbeat for dropped plane sources
+                    conn = await _source_connected(plane.source)
+                    if conn is False:
+                        now = time.monotonic()
+                        if now - self._plane_last_reconnect.get(owner, 0.0) >= PLANE_RECONNECT_S:
+                            self._plane_last_reconnect[owner] = now
+                            await self._reconnect_plane(plane)
                     # D-044 — broker-like SL/TP execution on paper positions
                     check = getattr(plane.source, "check_stops", None)
                     if check is not None:
@@ -1062,6 +1187,7 @@ class UserTradingManager:
                     if asyncio.iscoroutine(info):
                         info = await info
                     positions = await plane.source.get_positions()
+                    pendings = await self.pending_orders(owner)
                     if info:
                         await self._hub.broadcast_user(
                             owner,
@@ -1086,6 +1212,7 @@ class UserTradingManager:
                                     }
                                     for p in positions
                                 ],
+                                "pending": pendings,
                             },
                         )
                     # D-044 — persist balance/positions on change

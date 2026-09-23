@@ -27,10 +27,10 @@ import {
 } from "../lib/api";
 import type {
   AnalysisResponse, Mt5AutoTradeStatus, OrderResult, Signal, TradeRecord,
-  TradingPosition, UserSettings, WsMt5AutoMsg,
+  TradingPendingOrder, TradingPosition, UserSettings, WsMt5AutoMsg,
 } from "../types";
 import {
-  Badge, Btn, Card, EmptyState, Field, SectionTitle, Stat, inputCls,
+  Badge, Btn, Card, EmptyState, Field, NumberField, SectionTitle, Stat, inputCls,
 } from "../components/ui";
 import { fmtTime } from "../components/SignalDetail";
 import StrategyRadar from "../components/StrategyRadar";
@@ -133,8 +133,12 @@ function MoneyManagementModal({
       .catch((e) => setError(e instanceof Error ? e.message : "failed to load"));
   }, [token, balance]);
 
-  const set = (k: MmField, v: string) =>
-    setForm((f) => (f ? { ...f, [k]: parseFloat(v) || 0 } : f));
+  // D-054 — fields commit through NumberField (draft-while-focused,
+  // select-all on focus, ONE parsed commit on blur/Enter). The old
+  // `parseFloat(v) || 0` on every keystroke made the current value
+  // impossible to clear or edit in place (ghost "0" + eaten "-").
+  const set = (k: MmField, v: number) =>
+    setForm((f) => (f ? { ...f, [k]: v } : f));
 
   const num = (k: MmField): number => {
     const v = form?.[k];
@@ -210,11 +214,10 @@ function MoneyManagementModal({
                     : "The balance all daily limits are measured from"
                 }
               >
-                <input
-                  className={inputCls}
-                  value={String(form.day_start_balance ?? "")}
-                  onChange={(e) => set("day_start_balance", e.target.value)}
-                  inputMode="decimal"
+                <NumberField
+                  value={form.day_start_balance}
+                  onCommit={(v) => set("day_start_balance", v)}
+                  emptyCommitsZero
                   placeholder="0.00"
                 />
               </Field>
@@ -222,20 +225,18 @@ function MoneyManagementModal({
               {/* 2 — stop loss / target profit (USD) */}
               <div className="grid grid-cols-2 gap-2.5">
                 <Field label="Stop Loss (USD)" hint="AI turns OFF if the day loses this much">
-                  <input
-                    className={inputCls}
-                    value={String(form.daily_loss_usd ?? "")}
-                    onChange={(e) => set("daily_loss_usd", e.target.value)}
-                    inputMode="decimal"
+                  <NumberField
+                    value={form.daily_loss_usd}
+                    onCommit={(v) => set("daily_loss_usd", v)}
+                    emptyCommitsZero
                     placeholder="0.00"
                   />
                 </Field>
                 <Field label="Target Profit (USD)" hint="AI turns OFF when profit reaches this">
-                  <input
-                    className={inputCls}
-                    value={String(form.daily_profit_usd ?? "")}
-                    onChange={(e) => set("daily_profit_usd", e.target.value)}
-                    inputMode="decimal"
+                  <NumberField
+                    value={form.daily_profit_usd}
+                    onCommit={(v) => set("daily_profit_usd", v)}
+                    emptyCommitsZero
                     placeholder="0.00"
                   />
                 </Field>
@@ -243,11 +244,12 @@ function MoneyManagementModal({
 
               {/* 3 — lot size */}
               <Field label="Lot Size" hint="Every AI order uses this volume">
-                <input
-                  className={inputCls}
-                  value={String(form.fixed_lot ?? "")}
-                  onChange={(e) => set("fixed_lot", e.target.value)}
-                  inputMode="decimal"
+                <NumberField
+                  value={form.fixed_lot}
+                  onCommit={(v) => set("fixed_lot", v)}
+                  min={0.01}
+                  max={100}
+                  emptyCommitsZero
                   placeholder="0.01"
                 />
               </Field>
@@ -255,20 +257,22 @@ function MoneyManagementModal({
               {/* 4 + 5 — signals today / trades at once */}
               <div className="grid grid-cols-2 gap-2.5">
                 <Field label="Signals AI Will Place Today" hint="Daily auto-signal budget">
-                  <input
-                    className={inputCls}
-                    value={String(form.max_trades_per_day ?? "")}
-                    onChange={(e) => set("max_trades_per_day", e.target.value)}
-                    inputMode="numeric"
+                  <NumberField
+                    value={form.max_trades_per_day}
+                    onCommit={(v) => set("max_trades_per_day", Math.round(v))}
+                    min={1}
+                    max={100}
+                    emptyCommitsZero
                     placeholder="6"
                   />
                 </Field>
                 <Field label="Trades at the Same Time" hint="Maximum open positions together">
-                  <input
-                    className={inputCls}
-                    value={String(form.max_positions ?? "")}
-                    onChange={(e) => set("max_positions", e.target.value)}
-                    inputMode="numeric"
+                  <NumberField
+                    value={form.max_positions}
+                    onCommit={(v) => set("max_positions", Math.round(v))}
+                    min={1}
+                    max={50}
+                    emptyCommitsZero
                     placeholder="3"
                   />
                 </Field>
@@ -912,13 +916,22 @@ function PositionsCard({
   onChanged: () => void;
 }) {
   const [positions, setPositions] = useState<TradingPosition[]>([]);
+  const [pending, setPending] = useState<TradingPendingOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [closing, setClosing] = useState<number | null>(null);
 
   const reload = useCallback(() => {
     getTradingPositions(token)
-      .then((r) => setPositions(r.positions ?? []))
-      .catch(() => setPositions([]))
+      .then((r) => {
+        setPositions(r.positions ?? []);
+        // D-054 — waiting limit orders now visible (they used to sit in
+        // the pending book invisible, looking like "order never created")
+        setPending(r.pending ?? []);
+      })
+      .catch(() => {
+        setPositions([]);
+        setPending([]);
+      })
       .finally(() => setLoading(false));
   }, [token]);
 
@@ -945,17 +958,47 @@ function PositionsCard({
     <Card>
       <SectionTitle
         title="Open Positions"
-        right={<Badge tone="zinc">{positions.length}</Badge>}
+        right={
+          <span className="flex items-center gap-1.5">
+            {pending.length > 0 && (
+              <Badge tone="amber">{pending.length} pending</Badge>
+            )}
+            <Badge tone="zinc">{positions.length}</Badge>
+          </span>
+        }
       />
       {loading ? (
         <div className="flex flex-col gap-2">
           <div className="h-10 animate-pulse rounded-lg bg-zinc-800/60" />
           <div className="h-10 animate-pulse rounded-lg bg-zinc-800/60" />
         </div>
-      ) : positions.length === 0 ? (
+      ) : positions.length === 0 && pending.length === 0 ? (
         <EmptyState title="No open positions" hint="AI and manual orders appear here while open." />
       ) : (
         <ul className="flex min-w-0 flex-col gap-1.5">
+          {/* D-054 — waiting pending limit entries (created, sitting at
+          their fill price until the market retraces to them) */}
+          {pending.map((p) => (
+            <li
+              key={`p-${p.ticket}`}
+              className="flex min-w-0 items-center gap-2.5 rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2.5"
+            >
+              <Badge tone="amber">{p.order_type.replace("_", " ").toUpperCase()}</Badge>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-xs font-semibold text-amber-100/90">
+                  {p.symbol} · {p.volume} lots @ {p.price != null ? p.price.toFixed(2) : "—"}
+                </span>
+                <span className="block text-[10px] text-amber-200/50">
+                  #{p.ticket} · waiting for fill price
+                  {p.sl != null && ` · SL ${p.sl.toFixed(2)}`}
+                  {p.tp != null && ` · TP ${p.tp.toFixed(2)}`}
+                </span>
+              </span>
+              <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wider text-amber-300/70">
+                pending
+              </span>
+            </li>
+          ))}
           {positions.map((p) => (
             <li
               key={p.ticket}

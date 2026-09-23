@@ -31,6 +31,7 @@ per-user auto-trade endpoints below.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -49,6 +50,8 @@ from app.mt5.mcp import (
 )
 
 router = APIRouter(prefix="/api/mt5", tags=["mt5"])
+
+logger = logging.getLogger("xauusd.routes.mt5")
 
 
 class ConnectBody(BaseModel):
@@ -344,12 +347,16 @@ async def _user_auto_status(request: Request, user: CurrentUser) -> dict:
         armed = plane.executor.auto_trade
         balance = float(info.get("balance")) if info else None
         skip = plane.executor.last_skip_reason
+        from app.services.trading import _source_connected
+
+        conn = await _source_connected(plane.source)
     except Exception:  # noqa: BLE001 — degraded feed/DB: fall back to stored
         account = await trading._load_account(owner)  # noqa: SLF001 — route glue
         armed = bool(account and account.get("auto_trade"))
         balance = float(account.get("balance")) if account else None
         info = None
         skip = None
+        conn = None
     markets = _markets_snapshot(request)
     if not armed:
         why = {
@@ -357,6 +364,15 @@ async def _user_auto_status(request: Request, user: CurrentUser) -> dict:
             "text": (
                 "AI auto-trade is OFF for your account — turn the switch on"
                 " in the AI Trading tab."
+            ),
+        }
+    elif conn is False:
+        why = {
+            "code": "plane_disconnected",
+            "text": (
+                "Your trading plane lost its market feed — orders would fail"
+                " right now; the app retries the connection every 30s and"
+                " will resume automatically."
             ),
         }
     elif balance is not None and balance <= 0:
@@ -392,6 +408,7 @@ async def _user_auto_status(request: Request, user: CurrentUser) -> dict:
         "scope": "account",
         "account": {
             "mode": "practice",
+            "connected": True if conn is None else bool(conn),
             "balance": balance,
             "equity": float(info.get("equity")) if info else None,
             "currency": (info or {}).get("currency", "USD"),
@@ -434,6 +451,12 @@ async def mt5_auto_trade_arm(
     D-044: non-admins arm THEIR OWN practice plane — orders execute on
     their isolated account, never on institution infrastructure. Admins
     arm the institution terminal executor (real orders).
+
+    D-054: the ADMIN's money-management window (saved just before this
+    call from the AI Trading tab modal) now governs the institution
+    executor too — before, it saved into user settings while the executor
+    kept the global defaults, so the admin's USD stop-loss / target never
+    actually guarded real orders.
     """
     if user.get("role") != "admin":
         try:
@@ -443,6 +466,12 @@ async def mt5_auto_trade_arm(
         st = await _user_auto_status(request, user)
         return {"armed": st["armed"], "account": st["account"], "scope": "account"}
     trader = _auto_trader(request)
+    if body.enabled:
+        try:
+            settings = await _trading(request).user_settings(user["id"])
+            await trader.apply_money_window(settings)
+        except Exception:  # noqa: BLE001 — window is best-effort; arm still proceeds
+            logger.exception("admin money window apply failed (arm continues)")
     try:
         await trader.arm(body.enabled, owner=user["id"])
     except ArmError as exc:

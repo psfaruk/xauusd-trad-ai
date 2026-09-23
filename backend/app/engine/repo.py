@@ -37,6 +37,11 @@ class SignalRepo:
             "status": "active",
             "result_r": None,
             "closed_at": None,
+            # D-054 — the pending-limit contract must survive a REST
+            # refetch (PENDING LIMIT badge + Entry (Limit) card)
+            "entry_type": payload.get("entry_type", "market"),
+            "market_ref": payload.get("market_ref"),
+            "entry_note": payload.get("entry_note"),
         }
         async with self._lock:
             self._mem.append(row)
@@ -49,9 +54,11 @@ class SignalRepo:
                         text(
                             """
                             insert into signals (id, ts, symbol, tf, direction,
-                                                 entry, sl, tp, confidence, trace)
+                                                 entry, sl, tp, confidence, trace,
+                                                 entry_type, market_ref, entry_note)
                             values (:id, :ts, :symbol, :tf, :direction,
-                                    :entry, :sl, :tp, :confidence, :trace)
+                                    :entry, :sl, :tp, :confidence, :trace,
+                                    :entry_type, :market_ref, :entry_note)
                             """
                         ),
                         {
@@ -67,6 +74,9 @@ class SignalRepo:
                             "tp": payload["tp"],
                             "confidence": payload["confidence"],
                             "trace": json.dumps(payload["trace"]),
+                            "entry_type": row["entry_type"],
+                            "market_ref": row["market_ref"],
+                            "entry_note": row["entry_note"],
                         },
                     )
             except Exception as exc:  # noqa: BLE001
