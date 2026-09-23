@@ -113,6 +113,21 @@ export interface SignalContext {
     judas_window: boolean;
     note: string | null;
   } | null;
+  /** D-064 — the market-structure read at signal time (leg count, phase,
+   * honest reversal odds, the REST magnets the pullback aims at). */
+  structure: {
+    run: number | null;
+    run_dir: "up" | "down" | null;
+    phase: string | null;
+    p_reversal: number | null;
+    action: string | null;
+    choch: {
+      dir: "up" | "down";
+      level: number;
+      bars_ago: number;
+    } | null;
+    magnets: { price: number; kind: string; dist_atr: number }[];
+  } | null;
   news: string | null;
 }
 
@@ -643,6 +658,33 @@ export interface WsStrategyPulseMsg {
     phase: string | null;
     reasons: string[];
   } | null;
+  /** D-064 — the market-structure ladder read (every close): leg count,
+   * run direction, phase (leg / extended / resting / reversal-confirmed),
+   * honest p(reversal), and the REST magnets for the pullback. */
+  structure?: {
+    run: number | null;
+    run_dir: "up" | "down" | null;
+    trend: string | null;
+    phase: string | null;
+    p_reversal: number | null;
+    action: string | null;
+    drivers: string[];
+    choch: {
+      dir: "up" | "down";
+      level: number;
+      bars_ago: number;
+    } | null;
+    magnets: { price: number | null; kind: string | null; dist_atr: number | null }[];
+  } | null;
+  /** D-065 — the timeframe ladder: which TF plays which role and how
+   * much history each one reads (the "কত মিনিটের টাইম ফ্রেম কত টি টাইম
+   * এনালাইসিস করে, কোন টাইম ফ্রেম এ সিগন্যাল প্রধান করেন" answer). */
+  tf_ladder?: {
+    tf: string;
+    role: string;
+    bars: number | null;
+    note: string | null;
+  }[];
 }
 
 export type WsMessage =
@@ -1172,6 +1214,51 @@ export interface AmdDrawing {
   strength_atr?: number | null;
 }
 
+/**
+ * D-064 — the market's REST anatomy (user directive: "মার্কেট কোথায়
+ * গিয়ে রেস্ট করে... বিশ্রাম নিয়ে একটু উপরের দিকে যায়, তারপর আবার
+ * ডাউন এ যায়"):
+ *  - rest: a compressed pause box where the market actually rested
+ *  - magnet: the level the market is expected to rest at next
+ *  - ladder: the live leg-count badge (LEG 3 lower · REST DUE · odds)
+ */
+export interface RestDrawing {
+  kind: "rest";
+  t0: string | null;
+  t1: string | null;
+  lo: number;
+  hi: number;
+  bars: number | null;
+  compress?: number | null;
+  label: string;
+  note?: string | null;
+  tone: DrawingTone;
+}
+
+export interface MagnetDrawing {
+  kind: "magnet";
+  price: number;
+  source: string;
+  dist_atr?: number | null;
+  side: "up" | "down";
+  label: string;
+  note?: string | null;
+  tone: DrawingTone;
+}
+
+export interface LadderDrawing {
+  kind: "ladder";
+  t: string | null;
+  price: number;
+  run: number;
+  run_dir: "up" | "down";
+  phase: string;
+  p_reversal: number | null;
+  label: string;
+  action?: string | null;
+  tone: DrawingTone;
+}
+
 export type ChartDrawing =
   | HLineDrawing
   | ZoneDrawing
@@ -1186,4 +1273,7 @@ export type ChartDrawing =
   | EmaDrawing
   | SwingDrawing
   | SessionDrawing
-  | AmdDrawing;
+  | AmdDrawing
+  | RestDrawing
+  | MagnetDrawing
+  | LadderDrawing;

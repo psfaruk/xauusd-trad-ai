@@ -52,7 +52,9 @@ logger = logging.getLogger("xauusd.drawings")
 #: marks, and every one of them is 2-4px thin on the canvas
 #: D-061 — 45: +3 for the AMD cycle set (range / manipulation /
 #: distribution) that labels the institutional trap on the chart
-MAX_DRAWINGS = 45
+#: D-064 — 48: +3 for the structure set (REST boxes, pullback magnets,
+#: the leg-count ladder badge)
+MAX_DRAWINGS = 48
 #: drawings live on the recent 80–150 candles of the ACTIVE timeframe
 DRAW_WINDOW_BARS = 150
 #: how close (in ATR units) price must be to a zone for the SETUP box
@@ -351,6 +353,111 @@ def _amd_marks(base: pd.DataFrame, tf: str) -> list[dict]:
             "tone": "bull" if disp.get("dir") == "up" else "bear",
         })
     return out[:3]
+
+
+# ----------------------------------------------------- D-064 structure set
+
+
+def _structure_marks(base: pd.DataFrame, tf: str, price: float) -> list[dict]:
+    """kind: "rest" / "magnet" / "ladder" — the market's REST anatomy.
+
+    User directive (D-064, Bengali): "মার্কেট কোথায় গিয়ে রেস্ট করে বা
+    একটু বিশ্রাম নেয়, বিশ্রাম নিয়ে একটু উপরের দিকে যায়, তার পর আবার
+    ডাউন এ যায়" — the chart now shows exactly that anatomy:
+
+    - REST boxes: the compressed pauses where the market actually rested
+      (a pro marks these — the expansion leaves from them);
+    - REST MAGNET lines: WHERE the market is expected to rest NEXT
+      (EMA 21/50, equilibrium, unfilled FVG, OTE, prior rest);
+    - the LADDER badge: the live leg count + phase + honest reversal
+      odds ("LEG 3 lower — rest due, p(reversal) 55%").
+
+    The measured facts behind the words (scripts/measure_legs.py): a
+    pause between same-direction legs is ~2.3 ATR deep and 10-16 bars
+    long inside a <=0.62-compressed range; 87% of runs end at leg 3.
+    """
+    if base is None or len(base) < 60 or tf not in (
+        "M1", "M5", "M15", "M30"
+    ):
+        return []
+    try:
+        from app.analysis.structure import LEGS_EXHAUST, structure_read
+
+        st = structure_read(base, price)
+    except Exception:  # noqa: BLE001 — structure marks must never break
+        return []
+    out: list[dict] = []
+
+    # 1. REST boxes — where the market rested (most recent first)
+    for z in (st.get("rests") or [])[:2]:
+        out.append({
+            "kind": "rest",
+            "t0": _iso(z.get("t0")),
+            "t1": _iso(z.get("t1")),
+            "lo": z.get("lo"),
+            "hi": z.get("hi"),
+            "bars": z.get("bars"),
+            "compress": z.get("compress"),
+            "label": f"REST — {z.get('bars')} bars, compressed range",
+            "note": (
+                "the market paused here; expansions leave from rests"
+            ),
+            "tone": "neutral",
+        })
+
+    # 2. REST MAGNETS — where the market is expected to rest next
+    for m in (st.get("magnets") or [])[:2]:
+        out.append({
+            "kind": "magnet",
+            "price": m.get("price"),
+            "source": m.get("kind"),
+            "dist_atr": m.get("dist_atr"),
+            "side": "up" if st.get("run_dir") == "down" else "down",
+            "label": (
+                f"REST MAGNET — {m.get('kind')} · "
+                f"{m.get('dist_atr')} ATR away"
+            ),
+            "note": m.get("note"),
+            "tone": "gold",
+        })
+
+    # 3. the LADDER badge — the live "কত বার LL/LH" count + verdict
+    run = int(st.get("run") or 0)
+    rdir = st.get("run_dir")
+    if run > 0 and rdir:
+        phase = st.get("phase") or "leg"
+        word = "lower" if rdir == "down" else "higher"
+        if phase == "reversal-confirmed":
+            badge = (
+                f"STRUCTURE SHIFT {'↑' if rdir == 'up' else '↓'} — "
+                f"reversal confirmed, new leg 1"
+            )
+            tone = "bull" if rdir == "up" else "bear"
+        elif phase == "resting":
+            badge = "RESTING — compressed range, wait for the break"
+            tone = "neutral"
+        else:
+            due = (
+                "REST DUE" if run >= LEGS_EXHAUST else "run intact"
+            )
+            badge = (
+                f"LEG {run} {word} · {due} · "
+                f"p(reversal) {round(100 * float(st.get('p_reversal') or 0))}%"
+            )
+            tone = "bear" if rdir == "down" else "bull"
+        out.append({
+            "kind": "ladder",
+            "t": _iso(base["time_utc"].iloc[-1]),
+            "price": round(float(price), 2),
+            "run": run,
+            "run_dir": rdir,
+            "phase": phase,
+            "p_reversal": st.get("p_reversal"),
+            "label": badge,
+            "action": st.get("action"),
+            "tone": tone,
+        })
+    return out[:5]
 
 
 # ----------------------------------------------------------------- hlines
@@ -998,9 +1105,12 @@ def _build(
     # 12. ICT kill-zone session bands (intraday views only)
     # 13. D-061 — the AMD cycle (accumulation range / manipulation /
     #     distribution) — the institutional trap labeled on the chart
+    # 14. D-064 — the REST anatomy: where the market rested (boxes),
+    #     where it rests next (magnets), the live leg-count ladder
     out.append(_ema_ribbon(base))
     out.extend(_swing_labels(base, atr))
     out.extend(_sessions(base, tf))
     out.extend(_amd_marks(base, tf))
+    out.extend(_structure_marks(base, tf, price))
 
     return [d for d in out if d is not None][:MAX_DRAWINGS]

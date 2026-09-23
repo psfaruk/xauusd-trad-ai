@@ -343,20 +343,30 @@ class MarketStream:
         every real tick the terminal saw is inside it, so display-fill
         noise can never survive into closed history. The tick-built bar
         is the fallback when the terminal fetch fails.
+
+        D-064 flake fix: the fetch takes a small WINDOW (not just the
+        last row) and matches the bar by its own timestamp — under
+        event-loop load the close processing can run after the virtual
+        clock already rolled into the NEXT bucket (or the terminal
+        already has a newer closed bar), and the old last-row-only
+        fetch then mismatched `t`, silently falling back to the
+        tick-built (interpolated) OHLC that failed reconciliation.
         """
         bar = fb.as_dict()
         try:
-            df = await self._source.get_rates(self._symbol, tf, 1)
-            if len(df) == 1:
-                t = int(df["time_utc"].iloc[-1].timestamp())
-                if t == fb.t:
+            df = await self._source.get_rates(self._symbol, tf, 4)
+            if len(df):
+                ts = df["time_utc"].map(lambda x: int(x.timestamp()))
+                hit = df.index[ts == fb.t]
+                if len(hit):
+                    r = df.loc[hit[0]]
                     bar = {
-                        "t": t,
-                        "o": float(df["o"].iloc[-1]),
-                        "h": float(df["h"].iloc[-1]),
-                        "l": float(df["l"].iloc[-1]),
-                        "c": float(df["c"].iloc[-1]),
-                        "v": max(int(df["v"].iloc[-1]), fb.v),
+                        "t": fb.t,
+                        "o": float(r["o"]),
+                        "h": float(r["h"]),
+                        "l": float(r["l"]),
+                        "c": float(r["c"]),
+                        "v": max(int(r["v"]), fb.v),
                     }
         except Exception:  # noqa: BLE001 — fall back to the tick-built bar
             logger.debug("authoritative reconcile failed for %s close", tf)

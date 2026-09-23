@@ -260,6 +260,44 @@ function buildLegend(drawings: ChartDrawing[], tf: string): LegendMark[] {
         });
         break;
       }
+      // D-064 — the REST anatomy joins the legend: where the market
+      // rested, where it rests next, the live leg-count ladder
+      case "rest":
+        marks.push({
+          key,
+          swatch: TONE[d.tone].text,
+          short: "REST",
+          detail: d.bars != null ? `${d.bars} bars` : "",
+          text: d.note || d.label,
+          faded: false,
+          layer: "structure",
+        });
+        break;
+      case "magnet":
+        marks.push({
+          key,
+          swatch: TONE.gold.text,
+          short: `MAGNET · ${d.source}`,
+          detail: d.price.toFixed(2),
+          text: d.note || d.label,
+          faded: false,
+          layer: "structure",
+        });
+        break;
+      case "ladder":
+        marks.push({
+          key,
+          swatch: TONE[d.tone].text,
+          short: `LEG ${d.run} ${d.run_dir === "down" ? "↓" : "↑"}`,
+          detail:
+            d.p_reversal != null
+              ? `p(rev) ${Math.round(d.p_reversal * 100)}%`
+              : "",
+          text: d.action || d.label,
+          faded: false,
+          layer: "structure",
+        });
+        break;
     }
   });
   return marks;
@@ -1054,6 +1092,93 @@ export default function PriceChart({
             `DISTRIBUTION ${d.dir === "up" ? "↑" : "↓"}`,
             x + 7, y + (d.dir === "up" ? 20 : -20),
           );
+          ctx.restore();
+        }
+      }
+    }
+
+    /* ------------------------------------- D-064 REST anatomy (structure) */
+    // The user's own words: "মার্কেট কোথায় গিয়ে রেস্ট করে বা একটু বিশ্রাম
+    // নেয়, বিশ্রাম নিয়ে একটু উপরের দিকে যায়, তারপর আবার ডাউন এ যায়" —
+    // the REST boxes show WHERE it rested, the MAGNET lines show where
+    // it rests NEXT, and the ladder badge counts the live LL/HH legs
+    // with the honest reversal odds. Same whisper-thin language as the
+    // rest of the professional set.
+    if (L.structure && !isSignals) {
+      for (const d of drawings) {
+        if (d.kind === "rest") {
+          const y1 = yOf(d.hi);
+          const y2 = yOf(d.lo);
+          if (y1 == null || y2 == null || Math.abs(y2 - y1) < 5) continue;
+          const xRaw = d.t0 ? xOf(d.t0) : null;
+          const x2 = d.t1 ? xOf(d.t1) : null;
+          const x1 = xRaw == null ? -2 : Math.max(-2, xRaw);
+          const xe = x2 == null ? rightEdge : Math.min(rightEdge, x2);
+          if (xe <= 0 || x1 > rightEdge) continue;
+          // whisper fill + dashed hard border — the pause box
+          ctx.fillStyle = "rgba(148,163,184,0.05)";
+          ctx.fillRect(x1, Math.min(y1, y2), xe - x1, Math.abs(y2 - y1));
+          ctx.strokeStyle = "rgba(148,163,184,0.4)";
+          ctx.lineWidth = 0.7;
+          ctx.setLineDash([3, 3]);
+          ctx.strokeRect(
+            x1 + 0.5, Math.min(y1, y2) + 0.5,
+            xe - x1 - 1, Math.abs(y2 - y1) - 1,
+          );
+          ctx.setLineDash([]);
+          // the REST word — tiny, direct, no box
+          ctx.save();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = "rgba(203,213,225,0.85)";
+          ctx.fillText(
+            `REST ${d.bars != null ? d.bars : ""}`,
+            x1 + 4, Math.min(y1, y2) + 11,
+          );
+          ctx.restore();
+        } else if (d.kind === "magnet") {
+          const y = yOf(d.price);
+          if (y == null || y < 0 || y > h) continue;
+          // the pullback magnet — thin dashed gold line, partial span
+          ctx.strokeStyle = "rgba(212,175,55,0.55)";
+          ctx.lineWidth = 0.8;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          const mx = Math.max(0, rightEdge - 220);
+          ctx.moveTo(mx, Math.round(y) + 0.5);
+          ctx.lineTo(rightEdge, Math.round(y) + 0.5);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          // the tiny word at the line — where the market rests next
+          ctx.save();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = TONE.gold.text;
+          ctx.fillText(
+            `MAGNET · ${d.source}`,
+            rightEdge - 96, y - 4,
+          );
+          ctx.restore();
+        } else if (d.kind === "ladder") {
+          const x = d.t ? xOf(d.t) : null;
+          const y = yOf(d.price);
+          if (y == null) continue;
+          const bx = x == null ? rightEdge - 130 : Math.min(x, rightEdge);
+          // the leg-count badge floats just above/below the last close
+          const above = d.run_dir === "down";
+          const by = above ? Math.max(14, y - 26) : Math.min(h - 8, y + 30);
+          ctx.save();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = TONE[d.tone].text;
+          const label = d.label;
+          if (label) {
+            const wText = ctx.measureText(label).width;
+            ctx.fillText(label, Math.max(2, Math.min(bx - wText / 2, rightEdge - wText - 2)), by);
+          }
           ctx.restore();
         }
       }

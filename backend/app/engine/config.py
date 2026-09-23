@@ -394,6 +394,49 @@ class EngineConfig(BaseModel):
                     "in the warn band (the trade still fires, visibly "
                     "flagged)",
     )
+    # -------------------------------------------------- D-064 structure block
+    structure_guard: bool = Field(
+        True,
+        description="D-064 (user directive: 'মার্কেট কোথায় গিয়ে রেস্ট করে... "
+                    "কি এমন লজিক আছে যে মার্কেট এখন রিভার্স করবে? কত বার "
+                    "HL LL LH HH হলে রিভার্স বা কনটিনিউ করে?') — the "
+                    "market-structure ladder (consecutive same-direction "
+                    "breaks) + REST zones + pullback magnets ride every "
+                    "pulse and signal context; fading a MATURE run "
+                    "(structure_counter_legs+ legs) without structural "
+                    "proof (fresh CHoCH or swept-and-reclaimed pool) is "
+                    "REFUSED; chasing an extended run costs confidence",
+    )
+    structure_counter_legs: int = Field(
+        3, ge=1, le=10,
+        description="D-064 — a counter-run signal is blocked as a "
+                    "falling-knife fade only when the live run has THIS "
+                    "many consecutive same-direction breaks AND no CHoCH / "
+                    "sweep proof (measured: 87% of runs end at leg 3 — "
+                    "below this the run is not yet mature, and the D-049 "
+                    "'সিগনাল মিস করা যাবে না' directive keeps zone flow)",
+    )
+    structure_exhaust_legs: int = Field(
+        3, ge=2, le=10,
+        description="D-064 — legs at/above this mark the run EXTENDED "
+                    "(overdue for the measured ~2 ATR rest): with-trend "
+                    "signals pay structure_chase_penalty, the read says "
+                    "'do not chase, expect a rest at the magnets'",
+    )
+    structure_chase_penalty: float = Field(
+        0.08, ge=0.0, le=0.5,
+        description="D-064 — confidence penalty on a WITH-trend signal "
+                    "fired while the run is extended (buying the tail of a "
+                    "mature run: the measured rest eats the entry before "
+                    "the next leg)",
+    )
+    structure_rest_bonus: float = Field(
+        0.06, ge=0.0, le=0.5,
+        description="D-064 — confidence bonus on a WITH-trend signal fired "
+                    "right after / inside a REST zone (the user's exact "
+                    "pattern: down, rest, small counter-move, continue — "
+                    "the entry at the rest rejection is the good one)",
+    )
     # -------------------------------------------------- D-051 trusted-vote block
     trusted_min_votes: float = Field(
         2.0, ge=1.0, le=6.0,

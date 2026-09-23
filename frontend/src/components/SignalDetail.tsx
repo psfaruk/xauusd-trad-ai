@@ -208,7 +208,8 @@ export function SignalDetail({ signal }: { signal: Signal }) {
         const phase = ctx.amd?.phase ?? null;
         const trap = ctx.trap ?? null;
         const ses = ctx.session ?? null;
-        if (!phase && !trap && !ses && !ctx.news) return null;
+        const st = ctx.structure ?? null;
+        if (!phase && !trap && !ses && !st && !ctx.news) return null;
         return (
           <div className="min-w-0 rounded-xl border border-zinc-700/60 bg-zinc-800/40 p-2.5">
             <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
@@ -230,10 +231,33 @@ export function SignalDetail({ signal }: { signal: Signal }) {
                   {ses.judas_window ? "JUDAS WINDOW" : (ses.name ?? "session").toUpperCase()}
                 </Badge>
               )}
+              {st && st.run != null && st.run_dir && (
+                <Badge tone={st.run_dir === "down" ? "red" : "green"}>
+                  LEG {st.run} {st.run_dir === "down" ? "↓" : "↑"}
+                </Badge>
+              )}
+              {st && st.p_reversal != null && (
+                <Badge tone={st.p_reversal >= 0.6 ? "amber" : "zinc"}>
+                  P(REV) {Math.round(st.p_reversal * 100)}%
+                </Badge>
+              )}
             </div>
             {ctx.amd?.note && (
               <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-400">
                 {ctx.amd.note}
+              </p>
+            )}
+            {st?.action && (
+              <p className="mt-1.5 text-[10px] leading-relaxed text-amber-200/75">
+                {st.action}
+              </p>
+            )}
+            {st && st.magnets?.length > 0 && (
+              <p className="mt-1 text-[9px] leading-relaxed text-zinc-500">
+                Rest magnets:{" "}
+                {st.magnets
+                  .map((m) => `${m.kind} ${m.price?.toFixed?.(2) ?? m.price}`)
+                  .join(" · ")}
               </p>
             )}
             {trap && trap.reasons.length > 0 && (

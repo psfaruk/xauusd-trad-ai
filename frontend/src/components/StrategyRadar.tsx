@@ -263,6 +263,99 @@ function MarketRadar({ symbol }: { symbol: string }) {
             <p className="truncate text-[11px] text-zinc-500">{pulse.amd.note}</p>
           )}
 
+          {/* D-064 — the market-STRUCTURE ladder: the "কত বার LL/LH" count
+           * the user asked about, live every minute — how many consecutive
+           * same-direction breaks the run has, whether the market is
+           * resting / extended / just shifted, the honest reversal odds,
+           * and WHERE the pullback magnets sit */}
+          {pulse.structure && (
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <span className="mr-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                structure
+              </span>
+              {pulse.structure.run != null && pulse.structure.run_dir && (
+                <Badge
+                  tone={
+                    pulse.structure.run_dir === "down" ? "red" : "green"
+                  }
+                >
+                  LEG {pulse.structure.run} {pulse.structure.run_dir === "down" ? "↓" : "↑"}
+                </Badge>
+              )}
+              {pulse.structure.phase && (
+                <Badge
+                  tone={
+                    pulse.structure.phase === "reversal-confirmed"
+                    ? pulse.structure.run_dir === "down" ? "red" : "green"
+                    : pulse.structure.phase === "extended" ? "amber"
+                    : pulse.structure.phase === "resting" ? "gold"
+                    : "zinc"
+                  }
+                >
+                  {pulse.structure.phase === "reversal-confirmed"
+                    ? "SHIFTED"
+                    : pulse.structure.phase.toUpperCase()}
+                </Badge>
+              )}
+              {pulse.structure.p_reversal != null && (
+                <span className="font-mono text-[10px] tabular-nums text-zinc-500">
+                  p(rev) {Math.round(pulse.structure.p_reversal * 100)}%
+                </span>
+              )}
+              {pulse.structure.choch && (
+                <span className="font-mono text-[10px] tabular-nums text-zinc-500">
+                  CHoCH {pulse.structure.choch.dir} {pulse.structure.choch.bars_ago}b ago
+                </span>
+              )}
+            </div>
+          )}
+          {pulse.structure?.magnets?.length ? (
+            <p className="truncate text-[10px] leading-relaxed text-amber-200/70">
+              rest magnets:{" "}
+              {pulse.structure.magnets
+                .map((m) => `${m.kind} ${m.price?.toFixed(2)}`)
+                .join(" · ")}
+            </p>
+          ) : null}
+          {pulse.structure?.action && (
+            <p className="truncate text-[11px] text-zinc-500">
+              {pulse.structure.action}
+            </p>
+          )}
+
+          {/* D-065 — the TIMEFRAME LADDER (user directive: "কত মিনিটের
+           * টাইম ফ্রেম কত টি টাইম এনালাইসিস করে, কোন টাইম ফ্রেম এ
+           * সিগন্যাল প্রধান করেন"): which TF plays which role + how much
+           * history it reads — the short-time ladder, live in the app */}
+          {pulse.tf_ladder?.length ? (
+            <div className="min-w-0">
+              <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                TF ladder · who does what
+              </p>
+              <ul className="flex min-w-0 flex-col gap-1">
+                {pulse.tf_ladder.map((r, i) => (
+                  <li
+                    key={i}
+                    className="flex min-w-0 items-center justify-between gap-2 rounded-lg border border-zinc-800 bg-zinc-900/40 px-2.5 py-1.5"
+                  >
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <span className="font-mono text-[10px] font-semibold text-zinc-200">
+                        {r.tf}
+                      </span>
+                      <span className="text-[9px] uppercase tracking-wider text-zinc-500">
+                        {r.role}
+                      </span>
+                    </span>
+                    <span className="truncate text-[9px] text-zinc-500">
+                      {r.bars != null ? `${r.bars} bars · ` : ""}
+                      {r.note}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+
           {/* POI zone watchlist */}
           {pulse.zones?.length > 0 && (
             <div className="min-w-0">

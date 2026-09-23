@@ -281,6 +281,42 @@ def evaluate(
         "checks": [],
     }
 
+    # D-065 — the TIMEFRAME LADDER (user directive: "কত মিনিটের টাইম
+    # ফ্রেম কত টি টাইম এনালাইসিস করে, কোন টাইম ফ্রেম এ সিগন্যাল প্রধান
+    # করেন, কোনটি করলে ভালো হবে"): the radar shows which TF plays which
+    # role and how much history each one reads — the answer to the
+    # short-time-trading ladder question, live in the app.
+    try:
+        from app.analysis.setup_geometry import GEOMETRY_BARS
+
+        ladder_tfs: list[dict] = [{
+            "tf": cfg.timeframe, "role": "signal",
+            "bars": int(len(base)),
+            "note": "signals fire + pending entries anchor on this close",
+        }]
+        for tf in cfg.confirm_tfs:
+            ladder_tfs.append({
+                "tf": tf,
+                "role": "setup" if tf == "M5" else "confirm",
+                "bars": int(max(100, GEOMETRY_BARS.get(tf, 0))),
+                "note": (
+                    "drawn zones + trade geometry + structure ladder"
+                    if tf == "M5" else "MTF confirmation vote"
+                ),
+            })
+        ladder_tfs.append({
+            "tf": cfg.trend_tf, "role": "trend", "bars": 100,
+            "note": "bias EMA + momentum vote",
+        })
+        for tf in cfg.bias_tfs:
+            ladder_tfs.append({
+                "tf": tf, "role": "bias", "bars": 100,
+                "note": "big-frame structure vote",
+            })
+        pulse["tf_ladder"] = ladder_tfs
+    except Exception:  # noqa: BLE001 — the ladder is informational
+        pass
+
     # D-049 — multi-source direction bias (replaces the single-EMA gate:
     # while gold sat under H1 EMA50 the old gate locked the engine into
     # SELL-only mode — the exact complaint that started this rework).
@@ -351,6 +387,38 @@ def evaluate(
             "displacement": amd.get("displacement"),
         }
     except Exception:  # noqa: BLE001 — the AMD read is best-effort
+        pass
+
+    # D-064 — the market-STRUCTURE read (user directive: "মার্কেট কোথায়
+    # গিয়ে রেস্ট করে... কত বার HL LL LH HH হলে রিভার্স বা কনটিনিউ
+    # করে?"): every bar close tells the radar HOW MANY consecutive
+    # same-direction breaks the live run has (the LL/LH/HH/HL ladder),
+    # whether the market is resting / extended / just shifted, the
+    # honest reversal odds, and WHERE the pullback magnets sit — the
+    # levels the market statistically returns to before the next leg.
+    struct: dict = {}
+    try:
+        from app.analysis.structure import structure_read
+
+        m5f = htf.get("M5")
+        struct_frame = m5f if m5f is not None and len(m5f) >= 60 else base
+        struct = structure_read(struct_frame, price_now)
+        pulse["structure"] = {
+            "run": struct.get("run"),
+            "run_dir": struct.get("run_dir"),
+            "trend": struct.get("trend"),
+            "phase": struct.get("phase"),
+            "p_reversal": struct.get("p_reversal"),
+            "action": struct.get("action"),
+            "drivers": struct.get("drivers") or [],
+            "choch": struct.get("choch_fresh"),
+            "magnets": [
+                {"price": m.get("price"), "kind": m.get("kind"),
+                 "dist_atr": m.get("dist_atr")}
+                for m in (struct.get("magnets") or [])[:3]
+            ],
+        }
+    except Exception:  # noqa: BLE001 — the structure read is best-effort
         pass
 
     # D-048/D-049 — trigger ARBITRATION by QUALITY (user directive:
@@ -737,6 +805,82 @@ def evaluate(
             + "; ".join(trap.get("reasons") or ["AMD structure against the trade"]),
         )
 
+    # D-064 — MARKET-STRUCTURE GUARD (user directive: "মার্কেট কোথায় গিয়ে
+    # রেস্ট করে... কি এমন লজিক আছে যে মার্কেট এখন রিভার্স করবে?"): with
+    # the signal direction final, ask the ladder — is this trade FADING a
+    # mature run with no structural proof (no fresh CHoCH, no swept-
+    # and-reclaimed pool)?
+    #   - MOMENTUM trades (sfp / pullback) fading a mature run are the
+    #     falling-knife entries the measured hazard table refuses —
+    #     blocked, wait for the structure shift.
+    #   - ZONE (location) trades keep the D-049 precedence ("সিগনাল মিস
+    #     করা যাবে না" — the demand-zone BUY in a bearish HTF world):
+    #     the location + rejection carries them, so a mature-run fade is
+    #     VISIBLY tagged + discounted, never silently lost (the strict
+    #     sweep gate remains counter_needs_sweep, off by default).
+    # With-run trades on an EXTENDED run pay the chase penalty below
+    # (the ~2 ATR rest eats a market-chase entry before the next leg).
+    struct_adjust = 0.0
+    if cfg.structure_guard and struct:
+        from app.analysis.structure import reversal_evidence
+
+        run_dir = struct.get("run_dir")
+        run_len = int(struct.get("run") or 0)
+        sig_dir = trigger_tag.direction
+        with_run = (
+            run_dir == "up" and sig_dir == "BUY"
+        ) or (run_dir == "down" and sig_dir == "SELL")
+        evidence = reversal_evidence(sig_dir, struct, amd.get("sweep"))
+        location_trade = trigger == "zone"
+        if not with_run and run_len >= cfg.structure_counter_legs \
+                and not evidence:
+            if location_trade:
+                trace.add(
+                    "structure_guard", True,
+                    f"{sig_dir} zone fade of a {run_len}-leg {run_dir} run "
+                    "with no CHoCH / sweep proof yet — location carries the "
+                    "trade, confidence reduced (enable counter_needs_sweep "
+                    "for the hard gate)",
+                )
+                struct_adjust -= cfg.structure_chase_penalty
+            else:
+                trace.add(
+                    "structure_guard", False,
+                    f"{sig_dir} fades a {run_len}-leg {run_dir} run with no "
+                    "structural proof (no fresh CHoCH / swept pool) — "
+                    "falling-knife fade refused, wait for the shift",
+                )
+                _pulse_miss(pulse, trace)
+                return Evaluation(
+                    None, trace.to_dict(), near_miss=True, pulse=pulse
+                )
+        if not with_run and run_len >= 2 and not evidence:
+            # the run is not yet mature — the fade is early, not fatal:
+            # visible warning + a modest confidence cost
+            trace.add(
+                "structure_guard", True,
+                f"early fade — {run_len}-leg {run_dir} run intact, no "
+                "CHoCH/sweep proof yet (confidence reduced)",
+            )
+            struct_adjust -= 0.05
+        if with_run:
+            phase = struct.get("phase")
+            if phase == "extended" or run_len >= cfg.structure_exhaust_legs:
+                trace.add(
+                    "structure_guard", True,
+                    f"with-trend on an extended run ({run_len} legs) — "
+                    "chase risk: the measured ~2 ATR rest comes first "
+                    "(confidence reduced; pending-at-magnet preferred)",
+                )
+                struct_adjust -= cfg.structure_chase_penalty
+            elif phase == "resting":
+                trace.add(
+                    "structure_guard", True,
+                    "with-trend at the REST zone — the exact down-rest-"
+                    "continue entry (confidence boosted)",
+                )
+                struct_adjust += cfg.structure_rest_bonus
+
     trace.add(
         "targets", True,
         f"TP predicted at {target_note} — realized rr {realized_rr:.2f}",
@@ -790,6 +934,10 @@ def evaluate(
         # D-061 — the trade fires but the app shows WHY it is suspect:
         # confidence pays for the AMD structure stacked against it
         confidence = max(0.0, confidence - cfg.trap_conf_penalty)
+    if struct_adjust:
+        # D-064 — the structure ladder's verdict: chasing an extended
+        # run costs confidence; the rest-zone continuation entry earns it
+        confidence = max(0.0, min(1.0, confidence + struct_adjust))
     trace_dict = trace.to_dict()
     trace_dict["trigger"] = trigger  # survives inside signals.trace JSON (D-041)
     trace_dict["confluence_factors"] = factors  # D-042 — Signal Analysis panel
@@ -816,6 +964,15 @@ def evaluate(
             "killzone": bool(ses_ctx.get("in_killzone")),
             "judas_window": bool(ses_ctx.get("judas_window")),
             "note": ses_ctx.get("note"),
+        },
+        "structure": {
+            "run": struct.get("run") if struct else None,
+            "run_dir": struct.get("run_dir") if struct else None,
+            "phase": struct.get("phase") if struct else None,
+            "p_reversal": struct.get("p_reversal") if struct else None,
+            "action": struct.get("action") if struct else None,
+            "choch": struct.get("choch_fresh") if struct else None,
+            "magnets": (struct.get("magnets") or [])[:3] if struct else [],
         },
         "news": news.value,
     }
