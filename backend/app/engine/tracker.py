@@ -47,6 +47,14 @@ class TrackedSignal:
     market_ref: float | None = None  # market price at signal time
     filled_at: datetime | None = None  # when the pending order filled
     bars_pending: int = 0  # engine-TF bars spent waiting for a fill
+    # D-061 — pre-fill displacement guard: ATR at signal time + the
+    # current run of CONSECUTIVE institutional bodies printing AGAINST
+    # the pending trade (2+ big opposing bodies = the manipulation is
+    # already distributing -> cancel the waiting order before it fills
+    # into the trap)
+    atr_ref: float | None = None
+    disp_run: int = 0
+    close_reason: str | None = None
 
     def to_signal_dict(self, symbol: str, tf: str) -> dict:
         return {
@@ -66,6 +74,7 @@ class TrackedSignal:
             "entry_type": self.entry_type,
             "market_ref": self.market_ref,
             "filled_at": self.filled_at.isoformat() if self.filled_at else None,
+            "close_reason": self.close_reason,
         }
 
 
@@ -156,6 +165,7 @@ class SignalTracker:
         pending_expiry_bars: int | None = None,
         bar_low: float | None = None,
         bar_high: float | None = None,
+        bar_open: float | None = None,
     ) -> None:
         """Count a closed engine-TF bar per signal; expire when full.
 
@@ -164,6 +174,15 @@ class SignalTracker:
         strand a limit that clearly traded through), and after
         `pending_expiry_bars` bars without a fill the signal expires
         UNFILLED — result_r None (a missed trade, never a loss).
+
+        D-061 — PENDING signals additionally get the PRE-FILL
+        DISPLACEMENT GUARD: while the limit waits, two or more
+        consecutive bars whose BODIES each exceed 1.1 x ATR print
+        AGAINST the trade -> the institutional distribution (the
+        reversal the trap gate watches for) has already begun: cancel
+        the waiting order before it fills into the move (user's trapped
+        sell: "অর্ডার হলো, কয়েক pip নামলো, হঠাৎ বড় বড় বুলিশ ক্যান্ডেল").
+        A pending that already filled is managed by its SL/TP as usual.
         """
         async with self._lock:
             done: list[str] = []
@@ -180,6 +199,32 @@ class SignalTracker:
                         sig.status = "active"
                         sig.filled_at = closed_bar_close_time
                         continue
+                    # D-061 — displacement guard BEFORE the expiry clock
+                    if (
+                        bar_open is not None
+                        and sig.atr_ref is not None and sig.atr_ref > 0
+                    ):
+                        body = close_price - bar_open
+                        opposing = (
+                            (body > 0 and sig.direction == "SELL")
+                            or (body < 0 and sig.direction == "BUY")
+                        )
+                        if opposing and abs(body) >= 1.1 * sig.atr_ref:
+                            sig.disp_run += 1
+                        else:
+                            sig.disp_run = 0
+                        if sig.disp_run >= 2:
+                            sig.status = "cancelled"
+                            sig.result_r = None  # never filled — no trade, no R
+                            sig.close_reason = (
+                                "pre-fill displacement: 2+ institutional "
+                                "bodies against the trade — the reversal "
+                                "began before the fill (AMD guard)"
+                            )
+                            sig.closed_at = closed_bar_close_time
+                            await self._emit(sig)
+                            done.append(sig.id)
+                            continue
                     limit = pending_expiry_bars or cfg_expiry_bars
                     if sig.bars_pending >= limit:
                         sig.status = "expired"
@@ -221,6 +266,7 @@ def make_tracked(
     signal_id: str | None = None,
     entry_type: str = "market",
     market_ref: float | None = None,
+    atr_ref: float | None = None,
 ) -> TrackedSignal:
     risk = abs(entry - sl)
     if risk <= 0:
@@ -238,4 +284,5 @@ def make_tracked(
         status="pending" if entry_type == "limit" else "active",  # D-050
         entry_type=entry_type,
         market_ref=market_ref,
+        atr_ref=atr_ref,  # D-061 — displacement-guard anchor
     )

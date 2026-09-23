@@ -198,6 +198,70 @@ export function SignalDetail({ signal }: { signal: Signal }) {
         </p>
       )}
 
+      {/* D-061 — the institutional-cycle context (AMD phase / trap risk /
+       * session / news) the engine stamped at signal time: the user sees
+       * exactly WHICH side of the manipulation this trade took
+       * ("এই বিষয় টা কিভাবে আমার অ্যাপ বুজবে। এবং আমিও দেখতে পারবো"). */}
+      {(() => {
+        const ctx = signal.context ?? signal.trace?.context ?? null;
+        if (!ctx) return null;
+        const phase = ctx.amd?.phase ?? null;
+        const trap = ctx.trap ?? null;
+        const ses = ctx.session ?? null;
+        if (!phase && !trap && !ses && !ctx.news) return null;
+        return (
+          <div className="min-w-0 rounded-xl border border-zinc-700/60 bg-zinc-800/40 p-2.5">
+            <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+              Market context · Institutional cycle
+            </p>
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              {phase && (
+                <Badge tone={phase === "manipulation" ? "amber" : phase === "distribution" ? "green" : "gold"}>
+                  {phase.toUpperCase()}
+                </Badge>
+              )}
+              {trap && trap.risk > 0 && (
+                <Badge tone={trap.risk >= 0.7 ? "red" : trap.risk >= 0.4 ? "amber" : "zinc"}>
+                  TRAP RISK {Math.round(trap.risk * 100)}%
+                </Badge>
+              )}
+              {ses && (
+                <Badge tone={ses.judas_window ? "amber" : "zinc"}>
+                  {ses.judas_window ? "JUDAS WINDOW" : (ses.name ?? "session").toUpperCase()}
+                </Badge>
+              )}
+            </div>
+            {ctx.amd?.note && (
+              <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-400">
+                {ctx.amd.note}
+              </p>
+            )}
+            {trap && trap.reasons.length > 0 && (
+              <ul className="mt-1.5 flex min-w-0 flex-col gap-1">
+                {trap.reasons.slice(0, 3).map((r, i) => (
+                  <li
+                    key={i}
+                    className={`rounded-lg border px-2.5 py-1.5 text-[10px] leading-relaxed ${
+                      trap.warned || trap.risk >= 0.4
+                        ? "border-red-500/25 bg-red-500/5 text-zinc-300"
+                        : "border-zinc-800 bg-zinc-900/40 text-zinc-400"
+                    }`}
+                  >
+                    {r}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {(ses?.note || ctx.news) && (
+              <p className="mt-1.5 text-[9px] leading-relaxed text-zinc-500">
+                {ses?.note ? `${ses.note}. ` : ""}
+                {ctx.news ? `News: ${ctx.news}.` : ""}
+              </p>
+            )}
+          </div>
+        );
+      })()}
+
       {/* confidence */}
       <div className="min-w-0">
         <div className="mb-1 flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-zinc-500">

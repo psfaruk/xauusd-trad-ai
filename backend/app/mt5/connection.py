@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.config import Settings
-from app.mt5.base import DataSource, Order, OrderResult, Position
+from app.mt5.base import DataSource, Order, OrderResult, Position, market_key
 
 logger = logging.getLogger("xauusd.mt5")
 
@@ -496,7 +496,11 @@ class ConnectionManager:
         st = {
             "status": self.state.status,
             "symbol": self.state.symbol,
-            "symbols": [self.state.symbol] + list(self.runtimes.keys())
+            # D-061 — offer MARKET KEYS (XAUUSD, not the broker-suffixed
+            # XAUUSDm): the app's pair switcher and WS subscriptions speak
+            # platform names; the concrete spelling stays on `symbol`
+            "symbols": [market_key(self.state.symbol)]
+            + list(self.runtimes.keys())
             if self.state.status == "connected" else [],
             "account": {
                 "balance": account.get("balance") if account else None,

@@ -65,6 +65,9 @@ class BacktestSignal:
     filled: bool = True  # market signals are born filled
     fill_ts: datetime | None = None
     geometry: str = "legacy"  # D-057 — "drawing" | "legacy"
+    # D-061 — pre-fill displacement guard (mirrors the live tracker)
+    atr_ref: float | None = None  # ATR at signal time
+    close_reason: str | None = None
 
     @property
     def is_pending(self) -> bool:
@@ -85,7 +88,11 @@ class BacktestResult:
         lost = [s for s in closed if s.status == "lost"]
         expired = [s for s in closed if s.status == "expired"]
         # D-050 — expired pendings that never filled: missed trades, not losses
-        unfilled = [s for s in expired if s.entry_type == "limit" and not s.filled]
+        # D-061 — cancelled pendings (AMD displacement guard) are missed
+        # trades too: the order never filled, no trade, no R
+        unfilled = [s for s in closed
+                    if s.entry_type == "limit" and not s.filled
+                    and s.status in ("expired", "cancelled")]
         limit_signals = [s for s in self.signals if s.entry_type == "limit"]
         filled_sigs = [s for s in self.signals if s.filled]
         rs = [s.result_r for s in closed if s.result_r is not None]
@@ -181,6 +188,7 @@ class _SimTracker:
         self.open_sigs: list[BacktestSignal] = []
         self._held: dict[int, int] = {}  # id(sig) -> bars held (after fill)
         self._pbars: dict[int, int] = {}  # id(sig) -> bars pending (D-050)
+        self._drun: dict[int, int] = {}  # id(sig) -> opposing displacement run (D-061)
 
     @property
     def full(self) -> bool:
@@ -197,6 +205,7 @@ class _SimTracker:
         self.open_sigs.append(sig)
         self._held[id(sig)] = 0
         self._pbars[id(sig)] = 0
+        self._drun[id(sig)] = 0
 
     def step(self, bar: pd.Series) -> list[BacktestSignal]:
         """Advance one base-TF bar; return signals that closed this bar."""
@@ -208,6 +217,7 @@ class _SimTracker:
                 self.open_sigs.remove(sig)
                 self._held.pop(id(sig), None)
                 self._pbars.pop(id(sig), None)
+                self._drun.pop(id(sig), None)
                 closed.append(sig)
         return closed
 
@@ -234,6 +244,28 @@ class _SimTracker:
                     sig.status, sig.result_r = "lost", -1.0
                     return self._exit(sig, bar)
                 return False
+            # D-061 — PRE-FILL DISPLACEMENT GUARD (mirrors the live
+            # tracker): 2+ consecutive institutional bodies AGAINST a
+            # waiting limit = the AMD distribution already began —
+            # cancel before the trap fills
+            if sig.atr_ref is not None and sig.atr_ref > 0:
+                body = close - float(bar["o"])
+                opposing = (
+                    (body > 0 and sig.direction == "SELL")
+                    or (body < 0 and sig.direction == "BUY")
+                )
+                if opposing and abs(body) >= 1.1 * sig.atr_ref:
+                    self._drun[id(sig)] += 1
+                else:
+                    self._drun[id(sig)] = 0
+                if self._drun[id(sig)] >= 2:
+                    sig.status = "cancelled"
+                    sig.result_r = None  # never filled — missed trade, no R
+                    sig.close_reason = (
+                        "pre-fill displacement: 2+ institutional bodies "
+                        "against the trade (AMD guard)"
+                    )
+                    return self._exit(sig, bar)
             if self._pbars[id(sig)] >= self.cfg.pending_expiry_bars:
                 sig.status = "expired"
                 sig.result_r = None  # never filled — missed trade, no R
@@ -366,6 +398,15 @@ def run_backtest(
             continue
         p = ev.signal
         entry_type = p.get("entry_type", "market")
+        # D-061 — ATR scale at signal time for the pre-fill displacement
+        # guard (same math the live tracker receives via make_tracked)
+        try:
+            _o = hist["o"].to_numpy(dtype=float)[-14:]
+            _h = hist["h"].to_numpy(dtype=float)[-14:]
+            _l = hist["l"].to_numpy(dtype=float)[-14:]
+            sig_atr = float(np.mean(_h - _l)) or None
+        except Exception:  # noqa: BLE001 — guard anchor is best-effort
+            sig_atr = None
         sig = BacktestSignal(
             ts=bar["time_utc"].to_pydatetime(),
             direction=p["direction"],
@@ -379,6 +420,7 @@ def run_backtest(
             market_ref=p.get("market_ref"),
             filled=entry_type != "limit",  # D-050 — pendings wait for a fill
             geometry=p.get("geometry", "legacy"),  # D-057
+            atr_ref=sig_atr,  # D-061
         )
         result.signals.append(sig)
         sim.add(sig)

@@ -72,6 +72,48 @@ export interface SignalTrace {
   trigger?: "sfp" | "pullback" | string;
   /** D-042 — ICT/SMC confluence factors (structure, OB, FVG, liquidity…). */
   confluence_factors?: ConfluenceFactor[];
+  /** D-061 — market context (AMD phase / trap / session / news) — the DB
+   * persistence path keeps only `trace`, so the context rides there too. */
+  context?: SignalContext | null;
+}
+
+/**
+ * D-061 — the institutional-cycle context every signal now carries
+ * (user directive: "এই বিষয় টা কিভাবে আমার অ্যাপ বুজবে। এবং আমিও দেখতে
+ * পারবো"): which AMD phase the market sat in, whether the trade is the
+ * retail side of a manipulation (trap risk 0..1 + reasons), and the
+ * session / Judas-window / news verdict at signal time.
+ */
+export interface SignalContext {
+  amd: {
+    phase: "accumulation" | "manipulation" | "distribution" | "none" | null;
+    note: string | null;
+    sweep: {
+      side: "SSL" | "BSL";
+      level: number;
+      bars_ago: number;
+      depth_atr: number;
+      reclaimed: boolean;
+    } | null;
+    displacement: {
+      dir: "up" | "down";
+      run: number;
+      strength_atr: number;
+      bars_ago: number;
+    } | null;
+  } | null;
+  trap: {
+    risk: number;
+    warned: boolean;
+    reasons: string[];
+  } | null;
+  session: {
+    name: string | null;
+    killzone: boolean;
+    judas_window: boolean;
+    note: string | null;
+  } | null;
+  news: string | null;
 }
 
 export interface Signal {
@@ -98,6 +140,11 @@ export interface Signal {
   market_ref?: number | null;
   entry_note?: string | null;
   filled_at?: string | null;
+  /** D-061 — AMD phase / trap risk / session / news at signal time (WS
+   * path; the REST path reconstructs it from trace.context). */
+  context?: SignalContext | null;
+  /** D-061 — why a pending order died (AMD displacement guard text). */
+  close_reason?: string | null;
 }
 
 /** Live-feed transparency (D-030): active provider + price freshness. */
@@ -423,6 +470,8 @@ export interface WsSignalUpdateMsg {
   status: SignalStatus;
   result_r: number | null;
   closed_at: string | null;
+  /** D-061 — why a pending order died (AMD displacement guard text). */
+  reason?: string | null;
 }
 
 export interface WsAccountMsg {
@@ -571,6 +620,29 @@ export interface WsStrategyPulseMsg {
   near_miss: string | null;
   checks: PulseCheck[];
   factors?: { name: string; ok: boolean; detail: string }[];
+  /** D-061 — the AMD phase read + per-trade trap verdict (every close). */
+  amd?: {
+    phase: string | null;
+    note: string | null;
+    sweep: {
+      side: "SSL" | "BSL";
+      level: number;
+      bars_ago: number;
+      depth_atr: number;
+      reclaimed: boolean;
+    } | null;
+    displacement: {
+      dir: "up" | "down";
+      run: number;
+      strength_atr: number;
+      bars_ago: number;
+    } | null;
+  } | null;
+  trap?: {
+    risk: number;
+    phase: string | null;
+    reasons: string[];
+  } | null;
 }
 
 export type WsMessage =
@@ -1074,6 +1146,32 @@ export interface SessionDrawing {
   tone: DrawingTone;
 }
 
+/**
+ * D-061 — the institutional AMD cycle drawn on the chart: the
+ * accumulation range box, the manipulation marker (swept & reclaimed
+ * level) and the distribution marker (displacement leg). Element picks
+ * which sub-part this mark renders.
+ */
+export interface AmdDrawing {
+  kind: "amd";
+  element: "range" | "manipulation" | "distribution";
+  phase: string;
+  label: string;
+  note?: string | null;
+  tone: DrawingTone;
+  t0?: string | null;
+  t1?: string | null;
+  zone?: [number, number] | null;
+  t?: string | null;
+  price?: number | null;
+  side?: "SSL" | "BSL" | null;
+  depth_atr?: number | null;
+  bars_ago?: number | null;
+  dir?: "up" | "down" | null;
+  run?: number | null;
+  strength_atr?: number | null;
+}
+
 export type ChartDrawing =
   | HLineDrawing
   | ZoneDrawing
@@ -1087,4 +1185,5 @@ export type ChartDrawing =
   | SetupDrawing
   | EmaDrawing
   | SwingDrawing
-  | SessionDrawing;
+  | SessionDrawing
+  | AmdDrawing;

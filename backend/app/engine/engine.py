@@ -333,6 +333,26 @@ def evaluate(
     except Exception:  # noqa: BLE001
         pass
 
+    # D-061 — the AMD read (user directive: "ইকমেলিউশন ও মেনোপোলেশন
+    # কোনো লজিক এড করতে পারবেন?"): EVERY bar close tells the radar which
+    # phase the market sits in (accumulation / manipulation /
+    # distribution) — the app "understands" the institutional cycle even
+    # on bars that never reach a trigger. The per-trade trap gate runs
+    # later, once ENTRY/SL exist.
+    amd: dict = {}
+    try:
+        from app.analysis.manipulation import amd_state
+
+        amd = amd_state(base)
+        pulse["amd"] = {
+            "phase": amd.get("phase"),
+            "note": amd.get("note"),
+            "sweep": amd.get("sweep"),
+            "displacement": amd.get("displacement"),
+        }
+    except Exception:  # noqa: BLE001 — the AMD read is best-effort
+        pass
+
     # D-048/D-049 — trigger ARBITRATION by QUALITY (user directive:
     # "সব গুলো স্ট্রাটেজি একই সময় AGREE নাও থাকতে পারে" + "best strategy"):
     # every candidate setup is gathered first, each scored on its own
@@ -675,6 +695,48 @@ def evaluate(
         _pulse_miss(pulse, trace)
         return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
 
+    # D-061 — INSTITUTIONAL TRAP GATE (user directive: "কখন রিটেইলার
+    # ট্রেডার ইন্সট্রিটিউনাল ট্রেডার এর কাছে ফেইল হয়েছো"): with ENTRY/SL
+    # final, ask whether THIS trade is the retail side of an AMD
+    # manipulation — a freshly reclaimed sweep against the direction, an
+    # unswept liquidity pool inside the risk window, an opposing
+    # displacement run, Judas timing. The user's trapped sell (signal on
+    # the last red candle, filled a few pips lower, then several large
+    # bullish candles) is exactly component A + C.
+    trap: dict = {}
+    try:
+        from app.analysis.manipulation import trap_risk
+
+        trap = trap_risk(
+            base, trigger_tag.direction, entry, sl,
+            state=amd or None, now=bar_close_time,
+        )
+        pulse["trap"] = {
+            "risk": trap.get("risk", 0.0),
+            "phase": trap.get("phase"),
+            "reasons": trap.get("reasons", []),
+        }
+    except Exception:  # noqa: BLE001 — the trap gate is best-effort
+        pass
+    trap_risk_val = float(trap.get("risk", 0.0) or 0.0)
+    if cfg.trap_filter and trap_risk_val >= cfg.trap_block_risk:
+        trace.add(
+            "trap_filter", False,
+            f"institutional trap risk {trap_risk_val:.2f} >= "
+            f"{cfg.trap_block_risk:.2f} — "
+            + "; ".join(trap.get("reasons") or ["AMD structure against the trade"]),
+        )
+        _pulse_miss(pulse, trace)
+        return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
+    trap_warned = trap_risk_val >= cfg.trap_warn_risk
+    if trap_warned:
+        trace.add(
+            "trap_filter", True,
+            f"warned — trap risk {trap_risk_val:.2f} (block at "
+            f"{cfg.trap_block_risk:.2f}): "
+            + "; ".join(trap.get("reasons") or ["AMD structure against the trade"]),
+        )
+
     trace.add(
         "targets", True,
         f"TP predicted at {target_note} — realized rr {realized_rr:.2f}",
@@ -724,9 +786,40 @@ def evaluate(
         # D-051 — big players in the trade direction: the signal itself
         # gets the extra weight (clamped to 1.0 below)
         confidence = min(confidence + cfg.whale_confidence_boost, 1.0)
+    if trap_warned:
+        # D-061 — the trade fires but the app shows WHY it is suspect:
+        # confidence pays for the AMD structure stacked against it
+        confidence = max(0.0, confidence - cfg.trap_conf_penalty)
     trace_dict = trace.to_dict()
     trace_dict["trigger"] = trigger  # survives inside signals.trace JSON (D-041)
     trace_dict["confluence_factors"] = factors  # D-042 — Signal Analysis panel
+    # D-061 — the market-context block the app surfaces on every signal
+    # (phase, trap reasons, kill-zone / Judas timing, news verdict): the
+    # user asked "এই বিষয় টা কিভাবে আমার অ্যাপ বুজবে। এবং আমিও দেখতে
+    # পারবো" — it rides the payload (WS) AND the trace (DB persistence
+    # keeps only trace, so the context lives there too).
+    ses_ctx = (trap.get("session") or {})
+    context = {
+        "amd": {
+            "phase": (amd.get("phase") if amd else None) or trap.get("phase"),
+            "note": (amd.get("note") if amd else None) or trap.get("amd_note"),
+            "sweep": amd.get("sweep") if amd else None,
+            "displacement": amd.get("displacement") if amd else None,
+        },
+        "trap": {
+            "risk": trap_risk_val,
+            "warned": trap_warned,
+            "reasons": trap.get("reasons") or [],
+        },
+        "session": {
+            "name": session_name,
+            "killzone": bool(ses_ctx.get("in_killzone")),
+            "judas_window": bool(ses_ctx.get("judas_window")),
+            "note": ses_ctx.get("note"),
+        },
+        "news": news.value,
+    }
+    trace_dict["context"] = context
     payload = {
         "direction": trigger_tag.direction,
         "entry": round(entry, 2),
@@ -741,6 +834,7 @@ def evaluate(
         "market_ref": round(market_ref, 2),  # market at signal time
         "entry_note": entry_note,  # D-050 — the POI anchor description
         "trace": trace_dict,
+        "context": context,  # D-061 — AMD phase / trap / session / news
         "bar_time": base["time_utc"].iloc[-1],
         "session": session_name,
         "spread_points": spread_points,
@@ -756,6 +850,11 @@ def evaluate(
         "confidence": payload["confidence"],
         "trigger": trigger,
         "whale": whale_ok,
+        "trap": {  # D-061 — the fired trade's trap verdict on the radar
+            "risk": trap_risk_val,
+            "warned": trap_warned,
+            "phase": (trap.get("phase") or (amd.get("phase") if amd else None)),
+        },
     }
     _pulse_miss(pulse, trace)  # fills checks (+ no near-miss on a fire)
     pulse["near_miss"] = None
@@ -977,6 +1076,12 @@ class SignalEngine:
                 signal_id=signal_id,
                 entry_type=payload.get("entry_type", "market"),
                 market_ref=payload.get("market_ref"),
+                # D-061 — the pre-fill displacement-guard anchor: the
+                # tracker needs the ATR scale to recognize institutional
+                # bodies printing against a WAITING limit order
+                atr_ref=float(
+                    atr_calc(base, cfg.atr_period) or 0.0
+                ) or None,
             )
         )
 
@@ -998,9 +1103,18 @@ class SignalEngine:
         if pulse is None:
             return
         try:
+            from app.mt5.base import market_key
+
+            # D-061 — pulses carry the MARKET KEY (XAUUSD), not the
+            # broker-suffixed concrete symbol (XAUUSDm): the strategy
+            # radar keys its state by the platform market name
+            sym = market_key(symbol)
+        except Exception:  # noqa: BLE001 — normalization must never break
+            sym = symbol
+        try:
             await self._hub.broadcast_all(
                 "strategy_pulse",
-                {**pulse, "symbol": symbol, "tf": tf,
+                {**pulse, "symbol": sym, "tf": tf,
                  "ts": pulse.get("ts") or bar_close_time.isoformat()},
             )
         except Exception:  # noqa: BLE001

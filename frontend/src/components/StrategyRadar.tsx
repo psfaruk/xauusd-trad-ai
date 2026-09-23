@@ -222,6 +222,47 @@ function MarketRadar({ symbol }: { symbol: string }) {
             <p className="truncate text-[11px] text-zinc-500">{pulse.whale.last}</p>
           )}
 
+          {/* D-061 — the AMD cycle read + per-trade trap verdict: the radar
+           * tells the user WHICH phase the market sits in every minute
+           * (accumulation / manipulation / distribution) and whether the
+           * institutional trap structure is stacked against new trades */}
+          {(pulse.amd || pulse.trap) && (
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <span className="mr-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                AMD cycle
+              </span>
+              {pulse.amd?.phase && (
+                <Badge
+                  tone={
+                    pulse.amd.phase === "manipulation" ? "amber"
+                    : pulse.amd.phase === "distribution" ? "green"
+                    : "gold"
+                  }
+                >
+                  {pulse.amd.phase.toUpperCase()}
+                </Badge>
+              )}
+              {pulse.amd?.sweep && (
+                <span className="font-mono text-[10px] tabular-nums text-zinc-500">
+                  {pulse.amd.sweep.side} swept {pulse.amd.sweep.bars_ago}b ago · reclaimed
+                </span>
+              )}
+              {pulse.trap && pulse.trap.risk > 0 && (
+                <Badge tone={pulse.trap.risk >= 0.7 ? "red" : pulse.trap.risk >= 0.4 ? "amber" : "zinc"}>
+                  trap {Math.round(pulse.trap.risk * 100)}%
+                </Badge>
+              )}
+            </div>
+          )}
+          {pulse.trap && pulse.trap.risk >= 0.4 && pulse.trap.reasons?.[0] && (
+            <p className="truncate text-[10px] leading-relaxed text-amber-300/80">
+              {pulse.trap.reasons[0]}
+            </p>
+          )}
+          {pulse.amd?.note && !pulse.trap?.reasons?.length && (
+            <p className="truncate text-[11px] text-zinc-500">{pulse.amd.note}</p>
+          )}
+
           {/* POI zone watchlist */}
           {pulse.zones?.length > 0 && (
             <div className="min-w-0">

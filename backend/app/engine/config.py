@@ -361,6 +361,39 @@ class EngineConfig(BaseModel):
                     "is seed-mixed (protects the worst day, costs the "
                     "good ones) — enable it for a quieter signal flow",
     )
+    # -------------------------------------------------- D-061 trap/AMD block
+    trap_filter: bool = Field(
+        True,
+        description="D-061 (user directive: 'কখন রিটেইলার ট্রেডার "
+                    "ইন্সট্রিটিউনাল ট্রেডার এর কাছে ফেইল হয়েছো... "
+                    "ইকমেলিউশন ও মেনোপোলেশন কোনো লজিক এড করতে পারবেন?') — "
+                    "detect the institutional AMD trap (liquidity sweep "
+                    "reclaimed against the trade, unswept pool inside the "
+                    "risk window, opposing displacement run, Judas timing) "
+                    "and REFUSE the retail side above trap_block_risk. "
+                    "The AMD phase + trap reasons ride every signal "
+                    "payload + strategy pulse regardless of this flag",
+    )
+    trap_block_risk: float = Field(
+        0.7, ge=0.0, le=1.0,
+        description="D-061 — trap risk at/above this blocks the signal "
+                    "(near-miss: 'institutional trap'): the trade IS the "
+                    "liquidity the institutions are hunting",
+    )
+    trap_warn_risk: float = Field(
+        0.4, ge=0.0, le=1.0,
+        description="D-061 — trap risk at/above this tags the signal "
+                    "(context.trap + trace line) and cuts confidence by "
+                    "trap_conf_penalty, but the signal still fires — the "
+                    "user SEES the warning on the chart and the signal "
+                    "panel",
+    )
+    trap_conf_penalty: float = Field(
+        0.12, ge=0.0, le=0.5,
+        description="D-061 — confidence penalty applied when trap risk is "
+                    "in the warn band (the trade still fires, visibly "
+                    "flagged)",
+    )
     # -------------------------------------------------- D-051 trusted-vote block
     trusted_min_votes: float = Field(
         2.0, ge=1.0, le=6.0,

@@ -240,6 +240,26 @@ function buildLegend(drawings: ChartDrawing[], tf: string): LegendMark[] {
           text: d.label, faded: false, layer: "structure",
         });
         break;
+      // D-061 — the institutional AMD cycle joins the legend
+      case "amd": {
+        const short =
+          d.element === "range" ? `AMD · ${d.phase.toUpperCase()}`
+          : d.element === "manipulation" ? "MANIPULATION"
+          : "DISTRIBUTION";
+        marks.push({
+          key,
+          swatch: TONE[d.tone].text,
+          short,
+          detail:
+            d.element === "range" && d.zone
+              ? `${d.zone[0].toFixed(2)}–${d.zone[1].toFixed(2)}`
+              : d.price != null ? d.price.toFixed(2) : "",
+          text: d.note || d.label,
+          faded: false,
+          layer: "structure",
+        });
+        break;
+      }
     }
   });
   return marks;
@@ -252,6 +272,19 @@ export interface ChartTfChange {
 
 const TF_SECONDS: Record<string, number> = {
   M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400,
+};
+
+/** D-063 — old order drawings auto-delete (user directive: "নির্দিষ্ট
+ * কিছু সময়ে পুরাতন ড্রয়িং মুছে যাবে"): signal arrows on the candles and
+ * the dashed ENTRY/SL/TP lines of active signals vanish once older than
+ * this TTL (120 minutes ≈ the engine's whole short-time trade horizon).
+ * The signals still live in the SIGNAL ANALYSIS panel + history — only
+ * the chart ink expires. */
+const SIGNAL_CHART_TTL_MS = 120 * 60 * 1000;
+
+const isFreshSignal = (s: Signal, now = Date.now()): boolean => {
+  const t = new Date(s.ts).getTime();
+  return Number.isFinite(t) && now - t <= SIGNAL_CHART_TTL_MS;
 };
 
 interface PriceChartProps {
@@ -630,7 +663,10 @@ export default function PriceChart({
   useEffect(() => {
     const series = seriesRef.current;
     if (!series || !ready) return;
-    const markers: SeriesMarker<Time>[] = signals
+    // D-063 — only RECENT signals paint markers on the candles: the
+    // arrows of trades from hours ago were permanent chart clutter
+    const fresh = signals.filter((s) => isFreshSignal(s));
+    const markers: SeriesMarker<Time>[] = fresh
       .slice(0, 40)
       .map((s) => {
         const t = Math.floor(new Date(s.ts).getTime() / 1000) as UTCTimestamp;
@@ -933,6 +969,93 @@ export default function PriceChart({
         ctx.fillStyle = TONE[d.tone].text;
         ctx.fillText(d.tag, x - 6, y + (above ? -11 : 19));
         ctx.restore();
+      }
+    }
+
+    /* ------------------------------------ D-061 AMD cycle (institutional) */
+    // The trap anatomy the user's screenshot showed: the accumulation
+    // range box, the MANIPULATION marker at the swept-and-reclaimed
+    // level, the DISTRIBUTION arrow on the displacement leg. Thin hard
+    // lines, tiny fixed-size unboxed words — same language as every
+    // other mark (user directive: the app must SEE it, and so must the
+    // user: "এই বিষয় টা কিভাবে আমার অ্যাপ বুজবে। এবং আমিও দেখতে পারবো").
+    if (L.structure && !isSignals) {
+      for (const d of drawings) {
+        if (d.kind !== "amd") continue;
+        if (d.element === "range" && d.zone) {
+          const y1 = yOf(d.zone[1]);
+          const y2 = yOf(d.zone[0]);
+          if (y1 == null || y2 == null || Math.abs(y2 - y1) < 6) continue;
+          const xRaw = d.t0 ? xOf(d.t0) : null;
+          const x2 = d.t1 ? xOf(d.t1) : null;
+          const x1 = xRaw == null ? -2 : Math.max(-2, xRaw);
+          const xe = x2 == null ? rightEdge : Math.min(rightEdge, x2);
+          if (xe <= 0 || x1 > rightEdge) continue;
+          // whisper fill + dashed hard border — the coil the cycle lives in
+          ctx.fillStyle = "rgba(212,175,55,0.035)";
+          ctx.fillRect(x1, Math.min(y1, y2), xe - x1, Math.abs(y2 - y1));
+          ctx.strokeStyle = "rgba(212,175,55,0.42)";
+          ctx.lineWidth = 0.7;
+          ctx.setLineDash([3, 3]);
+          ctx.strokeRect(
+            x1 + 0.5, Math.min(y1, y2) + 0.5,
+            xe - x1 - 1, Math.abs(y2 - y1) - 1,
+          );
+          ctx.setLineDash([]);
+          // the phase word — tiny, direct, no box
+          ctx.save();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = TONE.gold.text;
+          ctx.fillText(
+            `ACCUMULATION ${(d.phase || "").toUpperCase()}`,
+            x1 + 4, Math.min(y1, y2) + 11,
+          );
+          ctx.restore();
+        } else if (d.element === "manipulation" && d.price != null) {
+          const x = d.t ? xOf(d.t) : null;
+          const y = yOf(d.price);
+          if (x == null || y == null || x < 0 || x > rightEdge) continue;
+          // the swept level — a thin hard line to the right edge
+          hardSeg(
+            x, Math.round(y) + 0.5, rightEdge, Math.round(y) + 0.5,
+            TONE[d.tone].line, TONE[d.tone].halo, 0.7, [4, 3],
+          );
+          // the X where the stop hunt printed (reclaim proof)
+          ctx.strokeStyle = TONE[d.tone].line;
+          ctx.lineWidth = 1.1;
+          const r = 4.5;
+          ctx.beginPath();
+          ctx.moveTo(x - r, y - r); ctx.lineTo(x + r, y + r);
+          ctx.moveTo(x + r, y - r); ctx.lineTo(x - r, y + r);
+          ctx.stroke();
+          ctx.save();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = TONE[d.tone].text;
+          ctx.fillText("MANIPULATION", x + 7, y + 3);
+          ctx.restore();
+        } else if (d.element === "distribution") {
+          const x = d.t ? xOf(d.t) : null;
+          const y = d.price != null ? yOf(d.price) : null;
+          if (x == null || y == null || x < 0 || x > rightEdge) continue;
+          arrow(
+            x, y + (d.dir === "up" ? 16 : -16), d.dir === "up" ? "up" : "down",
+            TONE[d.tone].line, TONE[d.tone].halo,
+          );
+          ctx.save();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = TONE[d.tone].text;
+          ctx.fillText(
+            `DISTRIBUTION ${d.dir === "up" ? "↑" : "↓"}`,
+            x + 7, y + (d.dir === "up" ? 20 : -20),
+          );
+          ctx.restore();
+        }
       }
     }
 
@@ -1260,8 +1383,12 @@ export default function PriceChart({
     }
 
     /* --------------------------------- D-043 active signal entry/SL/TP lines */
+    // D-063 — the dashed order lines expire with the same TTL as the
+    // arrows: an active trade from hours ago no longer drags its
+    // ENTRY/SL/TP across the whole chart
     const activeSignals = signals.filter(
-      (s) => s.status === "active" && s.id !== selectedSignal?.id,
+      (s) => s.status === "active" && s.id !== selectedSignal?.id
+        && isFreshSignal(s),
     );
     for (const sig of activeSignals.slice(0, 2)) {
       const line = (p: number, color: string, label: string) => {
@@ -1377,7 +1504,16 @@ export default function PriceChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [legendMarks, layers],
   );
-  // close the dropdowns on any outside pointer press
+  // D-062 — the Marks panel's height bound: `max-h-[62%]` resolved
+  // against the auto-height dropdown container = UNBOUNDED, so the
+  // panel grew taller than the (overflow-hidden) chart card and the
+  // bottom clipped off on short/mobile charts — "ড্রপ-ডাউন বাটন টি
+  // সম্পুর্ণ বা ওপেন হয় না, ভিতরে বসে আছে". Bind it to the MEASURED
+  // chart card height (header 36px + breathing room) so every option
+  // is reachable and the panel scrolls INSIDE itself.
+  const marksMaxH = Math.max(180, (wrapRef.current?.clientHeight ?? 480) - 52);
+
+  // D-062 — close the dropdowns on any outside pointer press
   useEffect(() => {
     if (!tfOpen && !marksOpen) return;
     const onDown = (e: PointerEvent) => {
@@ -1477,7 +1613,10 @@ export default function PriceChart({
               </svg>
             </button>
             {marksOpen && (
-              <div className="absolute left-0 top-8 z-30 flex max-h-[62%] w-64 flex-col gap-1.5 overflow-y-auto rounded-xl border border-zinc-700 bg-zinc-950/97 p-1.5 shadow-2xl backdrop-blur [scrollbar-width:thin]">
+              <div
+                style={{ maxHeight: marksMaxH }}
+                className="absolute left-0 top-8 z-30 flex w-64 flex-col gap-1.5 overflow-y-auto rounded-xl border border-zinc-700 bg-zinc-950/97 p-1.5 shadow-2xl backdrop-blur [scrollbar-width:thin]"
+              >
                 {/* layer toggles */}
                 <div className="flex flex-wrap gap-1">
                   {layerChips.map((l) => (

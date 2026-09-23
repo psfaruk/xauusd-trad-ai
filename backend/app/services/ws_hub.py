@@ -3,6 +3,13 @@
 Market events (tick / bar_*) go only to clients subscribed to that symbol+tf.
 Global events (signal / signal_update / account / mt5_status / engine_log)
 broadcast to every authenticated client. Heartbeat every 15s.
+
+D-061 fix — SYMBOL NORMALIZATION at the wire: engine runtimes stream the
+CONCRETE broker symbol ("XAUUSDm" on Exness AND the mock) while clients
+subscribe with the platform market key ("XAUUSD") — the mismatch meant
+ticks / bars / strategy pulses silently never reached the default pair's
+subscribers. Every market broadcast now passes through market_key() so
+"XAUUSDm" and "XAUUSD" land in the same bucket on BOTH sides.
 """
 
 from __future__ import annotations
@@ -14,6 +21,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+from app.mt5.base import market_key
 
 logger = logging.getLogger("xauusd.ws")
 
@@ -52,7 +61,9 @@ class WSHub:
 
     async def subscribe(self, client: Client, symbol: str, tf: str) -> None:
         async with self._lock:
-            client.symbol, client.tf = symbol, tf
+            # D-061 — store the normalized market key so concrete-symbol
+            # broadcasts (XAUUSDm) and key subscriptions (XAUUSD) match
+            client.symbol, client.tf = market_key(symbol), tf
 
     async def unsubscribe(self, client: Client) -> None:
         async with self._lock:
@@ -66,16 +77,19 @@ class WSHub:
 
     async def broadcast_market(self, event_type: str, symbol: str, tf: str, payload: dict) -> None:
         """tick / bar_open / bar_update / bar_close -> subscribers of symbol+tf."""
-        msg = {"type": event_type, "symbol": symbol, "tf": tf, **payload}
+        # D-061 — broker-suffixed symbols broadcast under their market key
+        key = market_key(symbol)
+        msg = {"type": event_type, "symbol": key, "tf": tf, **payload}
         for client in list(self._clients):
-            if client.symbol == symbol and client.tf == tf:
+            if client.symbol == key and client.tf == tf:
                 await self._send(client, msg)
 
     async def broadcast_ticks(self, event_type: str, symbol: str, payload: dict) -> None:
         """tick -> any client subscribed to the symbol (any tf)."""
-        msg = {"type": event_type, "symbol": symbol, **payload}
+        key = market_key(symbol)
+        msg = {"type": event_type, "symbol": key, **payload}
         for client in list(self._clients):
-            if client.symbol == symbol:
+            if client.symbol == key:
                 await self._send(client, msg)
 
     async def broadcast_all(self, event_type: str, payload: dict) -> None:

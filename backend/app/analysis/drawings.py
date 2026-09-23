@@ -50,7 +50,9 @@ logger = logging.getLogger("xauusd.drawings")
 #: hard cap — a pro chart never carries more than this many marks
 #: D-058 — 42: the momentum ribbon / swing labels / kill-zone bands add
 #: marks, and every one of them is 2-4px thin on the canvas
-MAX_DRAWINGS = 42
+#: D-061 — 45: +3 for the AMD cycle set (range / manipulation /
+#: distribution) that labels the institutional trap on the chart
+MAX_DRAWINGS = 45
 #: drawings live on the recent 80–150 candles of the ACTIVE timeframe
 DRAW_WINDOW_BARS = 150
 #: how close (in ATR units) price must be to a zone for the SETUP box
@@ -272,6 +274,83 @@ def _sessions(df: pd.DataFrame | None, tf: str) -> list[dict]:
             "tone": "gold" if cur_name in ("london", "ny-am") else "neutral",
         })
     return out
+
+
+# ------------------------------------------------------- D-061 AMD marks
+
+
+def _amd_marks(base: pd.DataFrame, tf: str) -> list[dict]:
+    """kind: "amd" — the institutional cycle drawn the way ICT teaches it.
+
+    User directive (D-061, Bengali): the sell filled into the sweep and
+    the market reversed — "তোমি ফাদ বুজতে পারো নাই" (you did not see the
+    trap). The chart now labels the trap anatomy ON the bars where it
+    happened:
+
+    - the ACCUMULATION range box (the coil before the false break),
+    - the MANIPULATION marker on the swept-and-reclaimed level,
+    - the DISTRIBUTION marker on the displacement leg.
+
+    One compact mark per element, full-word labels, only when the phase
+    structure actually exists (a pro does not label noise).
+    """
+    if base is None or len(base) < 40 or tf not in ("M1", "M5", "M15", "M30"):
+        return []
+    try:
+        from app.analysis.manipulation import amd_state
+
+        st = amd_state(base)
+    except Exception:  # noqa: BLE001 — AMD marks must never break the set
+        return []
+    if st.get("phase") == "none" or not st.get("range"):
+        return []
+    out: list[dict] = []
+    rng = st["range"]
+    out.append({
+        "kind": "amd",
+        "element": "range",
+        "t0": _iso(rng.get("t0")),
+        "t1": _iso(base["time_utc"].iloc[-1]),
+        "zone": [rng.get("lo"), rng.get("hi")],
+        "phase": st.get("phase"),
+        "label": f"Accumulation Range — {st.get('phase')}",
+        "note": st.get("note"),
+        "tone": "gold",
+    })
+    sweep = st.get("sweep")
+    if sweep:
+        out.append({
+            "kind": "amd",
+            "element": "manipulation",
+            "t": _iso(sweep.get("t")),
+            "price": sweep.get("level"),
+            "side": sweep.get("side"),
+            "depth_atr": sweep.get("depth_atr"),
+            "bars_ago": sweep.get("bars_ago"),
+            "label": (
+                f"Manipulation — {sweep.get('side')} swept & reclaimed "
+                f"({sweep.get('depth_atr')} ATR deep)"
+            ),
+            "tone": "bear" if sweep.get("side") == "BSL" else "bull",
+        })
+    disp = st.get("displacement")
+    if disp:
+        out.append({
+            "kind": "amd",
+            "element": "distribution",
+            "t": _iso(disp.get("t")),
+            "price": disp.get("price"),
+            "dir": disp.get("dir"),
+            "run": disp.get("run"),
+            "strength_atr": disp.get("strength_atr"),
+            "label": (
+                f"Distribution — {disp.get('run')} institutional bodies "
+                f"{'up' if disp.get('dir') == 'up' else 'down'} "
+                f"({disp.get('strength_atr')} ATR)"
+            ),
+            "tone": "bull" if disp.get("dir") == "up" else "bear",
+        })
+    return out[:3]
 
 
 # ----------------------------------------------------------------- hlines
@@ -757,6 +836,24 @@ def _setup(
     if kz:
         factors.append(kz)
 
+    # D-061 — the TRAP verdict on the box the user watches (directive:
+    # "এই বিষয় টা কিভাবে আমার অ্যাপ বুজবে। এবং আমিও দেখতে পারবো"): the
+    # same manipulation.trap_risk the engine gates on, drawn where the
+    # trade is drawn — the user sees WHY a setup is suspect before the
+    # order ever exists
+    trap_note: str | None = None
+    try:
+        from app.analysis.manipulation import trap_risk
+
+        trap = trap_risk(m1, direction, entry, sl, now=now)
+        if float(trap.get("risk", 0.0) or 0.0) >= 0.4:
+            factors.append(f"trap risk {float(trap['risk']):.2f}")
+            reasons = trap.get("reasons") or []
+            if reasons:
+                trap_note = reasons[0]
+    except Exception:  # noqa: BLE001 — the tag is best-effort
+        pass
+
     # triggered? an engine signal for this direction fired recently:
     # the box then mirrors the FIRED signal's actual levels — the box IS
     # the trade contract, so after the trigger it shows exactly what the
@@ -791,6 +888,8 @@ def _setup(
     note += f" · SL {side_word} zone · TP at drawn target · RR {rr}"
     if sig_note:
         note += f" · {sig_note}"
+    if trap_note:
+        note += f" · TRAP: {trap_note}"
 
     return {
         "kind": "setup",
@@ -897,8 +996,11 @@ def _build(
     # 10. momentum ribbon (EMA 9/21/50) — under price, whisper-thin
     # 11. HH/HL/LH/LL swing structure reads
     # 12. ICT kill-zone session bands (intraday views only)
+    # 13. D-061 — the AMD cycle (accumulation range / manipulation /
+    #     distribution) — the institutional trap labeled on the chart
     out.append(_ema_ribbon(base))
     out.extend(_swing_labels(base, atr))
     out.extend(_sessions(base, tf))
+    out.extend(_amd_marks(base, tf))
 
     return [d for d in out if d is not None][:MAX_DRAWINGS]

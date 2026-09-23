@@ -126,10 +126,14 @@ class EngineRuntime:
             )
             # D-050 — pending-fill fallback (bar low/high) + the separate
             # pending-expiry budget for unfilled limit orders
+            # D-061 — bar open feeds the tracker's PRE-FILL displacement
+            # guard (2+ institutional bodies against a waiting limit =
+            # cancel before the trap fills)
             await self.tracker.on_bar_close(
                 cfg.expiry_bars, close_time, bar["c"],
                 pending_expiry_bars=cfg.pending_expiry_bars,
                 bar_low=bar.get("l"), bar_high=bar.get("h"),
+                bar_open=bar.get("o"),
             )
 
     async def _on_signal_status(self, sig: TrackedSignal) -> None:
@@ -144,10 +148,14 @@ class EngineRuntime:
                 "status": sig.status,
                 "result_r": sig.result_r,
                 "closed_at": sig.closed_at.isoformat() if sig.closed_at else None,
+                # D-061 — WHY a pending died (AMD displacement guard text)
+                "reason": getattr(sig, "close_reason", None),
             },
         )
         logger.info(
-            "signal %s -> %s (r=%s)", sig.id[:8], sig.status, sig.result_r
+            "signal %s -> %s (r=%s%s)",
+            sig.id[:8], sig.status, sig.result_r,
+            f" — {sig.close_reason}" if getattr(sig, "close_reason", None) else "",
         )
         # D-036 — the live MT5 plane keeps its REAL position in step
         # (expiry -> terminal close; won/lost -> record reconciliation).
