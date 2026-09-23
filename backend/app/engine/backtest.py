@@ -64,6 +64,7 @@ class BacktestSignal:
     market_ref: float | None = None  # market price at signal time
     filled: bool = True  # market signals are born filled
     fill_ts: datetime | None = None
+    geometry: str = "legacy"  # D-057 — "drawing" | "legacy"
 
     @property
     def is_pending(self) -> bool:
@@ -349,9 +350,15 @@ def run_backtest(
             continue
 
         htf = {}
+        # D-056 — mirror the LIVE fetch window: the engine's _htf_frame()
+        # asks get_rates for ~100 bars per confirm/trend TF, so the replay
+        # must not feed evaluate() the WHOLE growing history (quadratic
+        # iloc copies + more context than live ever sees). Cap each frame
+        # at the last 300 closed bars — every consumer slices .iloc[-160:]
+        # or needs <= slow+2 EMA bars, 300 gives warmup margin.
         for tf, frame in htf_frames.items():
             idx = int(np.searchsorted(htf_close_ts[tf], close_np, side="right"))
-            htf[tf] = frame.iloc[:idx]
+            htf[tf] = frame.iloc[max(0, idx - 300) : idx]
         if len(htf.get(cfg.trend_tf, pd.DataFrame())) < cfg.trend_ema + 1:
             continue
         ev = evaluate(hist, htf, bar_close_time, cfg, spread_points, news=news)
@@ -371,6 +378,7 @@ def run_backtest(
             entry_type=entry_type,
             market_ref=p.get("market_ref"),
             filled=entry_type != "limit",  # D-050 — pendings wait for a fill
+            geometry=p.get("geometry", "legacy"),  # D-057
         )
         result.signals.append(sig)
         sim.add(sig)
@@ -512,6 +520,7 @@ def simulate_risk(
     )
     equity = start_equity
     peak = start_equity
+    day_peak = start_equity  # D-056 — the DAILY drawdown anchor
     max_dd = 0.0
     armed = True
     kills = 0
@@ -520,20 +529,36 @@ def simulate_risk(
     lots_seen: list[float] = []
     total_r = 0.0
     per_trade: list[dict] = []
+    day: Any = None
 
     for sig in res.signals:
         if sig.status == "active" or sig.result_r is None:
             continue  # never counted in a realized simulation
+        # D-056 — the LIVE money window re-arms every UTC day (the daily
+        # drawdown anchor resets to the new day's start equity). The old
+        # replay set armed=False FOREVER after one trip, silently skipped
+        # every later signal and misreported a recovering run as a
+        # terminal "net loss" — a sim artifact, not the live behaviour.
+        d = sig.ts.date() if hasattr(sig.ts, "date") else None
+        if d is not None and d != day:
+            if day is not None and not armed:
+                per_trade.append({
+                    "ts": sig.ts.isoformat(),
+                    "event": "RE_ARM (new day)",
+                    "equity": round(equity, 2),
+                })
+            armed = True
+            day = d
+            day_peak = equity  # today's anchor: day-start equity
         if not armed:
             skipped += 1
             continue
         sl_distance = abs(sig.entry - sig.sl)
         if sl_distance <= 0:
             continue
-        # daily-loss check BEFORE every order (SPEC §9 order)
-        # (intraday drawdown vs the running peak is the conservative proxy
-        #  for the equity-based daily anchor in this replay)
-        if peak and (peak - equity) / peak * 100.0 >= cfg.daily_max_loss_pct:
+        # daily-loss check BEFORE every order (SPEC §9 order) — against
+        # the DAY's anchor, exactly like the live money window
+        if day_peak and (day_peak - equity) / day_peak * 100.0 >= cfg.daily_max_loss_pct:
             armed = False
             kills += 1
             skipped += 1
@@ -542,7 +567,7 @@ def simulate_risk(
                     "ts": sig.ts.isoformat(),
                     "event": "KILL_SWITCH",
                     "equity": round(equity, 2),
-                    "loss_pct": round((peak - equity) / peak * 100.0, 3),
+                    "loss_pct": round((day_peak - equity) / day_peak * 100.0, 3),
                 }
             )
             continue
@@ -551,6 +576,7 @@ def simulate_risk(
         equity += pnl
         total_r += sig.result_r
         peak = max(peak, equity)
+        day_peak = max(day_peak, equity)  # D-056 — intraday high-water
         max_dd = max(max_dd, peak - equity)
         taken += 1
         lots_seen.append(lot.lots)

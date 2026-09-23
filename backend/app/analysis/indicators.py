@@ -226,37 +226,60 @@ def swings(df: pd.DataFrame, left: int = 2, right: int = 2) -> list[dict]:
     """Fractal swing points (confirmed `right` bars later — no lookahead).
 
     Returns [{t, price, kind: "high"|"low", i}] ascending by bar index.
+
+    D-056 — vectorized: the old per-bar Python loop (two `all()` generator
+    chains per bar) was the #1 hot spot of both the live evaluate() pass
+    and the backtest (~950k builtins.all calls per 4k bars). Same output,
+    including the D-043 adjacent-equal dedupe, computed with numpy
+    sliding-window maxima.
     """
     out: list[dict] = []
-    h, low = df["h"].values, df["l"].values
     n = len(df)
     need = left + right + 1
     if n < need:
         return out
-    times = df["time_utc"].iloc[left: n - right]
+    h = df["h"].to_numpy(dtype=float)
+    low = df["l"].to_numpy(dtype=float)
+    # rolling max of the `left` bars BEFORE k and the `right` bars AFTER k
+    lm_h = np.full(n, -np.inf)
+    rm_h = np.full(n, -np.inf)
+    lm_l = np.full(n, np.inf)
+    rm_l = np.full(n, np.inf)
+    for j in range(1, left + 1):
+        np.maximum(lm_h[j:], h[:-j], out=lm_h[j:])
+        np.minimum(lm_l[j:], low[:-j], out=lm_l[j:])
+    for j in range(1, right + 1):
+        np.maximum(rm_h[:-j], h[j:], out=rm_h[:-j])
+        np.minimum(rm_l[:-j], low[j:], out=rm_l[:-j])
+    hi_mask = (h >= lm_h) & (h >= rm_h)
+    lo_mask = (low <= lm_l) & (low <= rm_l)
+    hi_mask[:left] = False
+    hi_mask[n - right:] = False
+    lo_mask[:left] = False
+    lo_mask[n - right:] = False
+
+    times = df["time_utc"].to_numpy()
+    # walk confirmed bars in order, appending highs/lows interleaved EXACTLY
+    # like the original loop (sequence order matters to detect_structure)
+    hi_set = {int(k) for k in np.flatnonzero(hi_mask)}
+    lo_set = {int(k) for k in np.flatnonzero(lo_mask)}
     for k in range(left, n - right):
-        hi_ok = all(h[k] >= h[k - j] for j in range(1, left + 1)) and all(
-            h[k] >= h[k + j] for j in range(1, right + 1)
-        )
-        lo_ok = all(low[k] <= low[k - j] for j in range(1, left + 1)) and all(
-            low[k] <= low[k + j] for j in range(1, right + 1)
-        )
-        # D-043 FIX — dedupe ADJACENT equal prints: two neighbouring bars
-        # with the exact same high (or low) both qualify as fractals, which
-        # used to emit duplicate swing points. detect_structure then
-        # labelled the duplicate pair "LH"/"LL" (equal price never counts
-        # as a higher print) — flipping real bullish structure to bearish.
-        # Equal prints SEPARATED in time stay (they are the BSL/SSL pools).
-        if hi_ok:
+        if k in hi_set:
+            # D-043 FIX — dedupe ADJACENT equal prints: two neighbouring bars
+            # with the exact same high (or low) both qualify as fractals, which
+            # used to emit duplicate swing points. detect_structure then
+            # labelled the duplicate pair "LH"/"LL" (equal price never counts
+            # as a higher print) — flipping real bullish structure to bearish.
+            # Equal prints SEPARATED in time stay (they are the BSL/SSL pools).
             dup = out and out[-1]["kind"] == "high" and out[-1]["i"] >= k - 1 \
                 and out[-1]["price"] == float(h[k])
             if not dup:
-                out.append({"t": times.iloc[k - left], "price": float(h[k]),
+                out.append({"t": times[k], "price": float(h[k]),
                             "kind": "high", "i": k})
-        if lo_ok:
+        if k in lo_set:
             dup = out and out[-1]["kind"] == "low" and out[-1]["i"] >= k - 1 \
                 and out[-1]["price"] == float(low[k])
             if not dup:
-                out.append({"t": times.iloc[k - left], "price": float(low[k]),
+                out.append({"t": times[k], "price": float(low[k]),
                             "kind": "low", "i": k})
     return out

@@ -301,6 +301,66 @@ class EngineConfig(BaseModel):
                     "clog the signal flow (user directive: signals must "
                     "keep coming)",
     )
+    # -------------------------------------------------- D-057 drawing-true block
+    drawing_true: bool = Field(
+        True,
+        description="D-057 (user directive: 'SL TP ENTRY সব কিছু এই চার্ট "
+                    "ফলো করে হবে') — when a zone supports the trade, the "
+                    "signal's ENTRY/SL/TP come from the SAME shared "
+                    "geometry the chart's entry-setup box draws "
+                    "(app.analysis.setup_geometry): entry = zone midpoint, "
+                    "SL beyond the zone protected past liquidity, TP at "
+                    "the drawn liquidity target. False keeps the legacy "
+                    "poi_pending_entry + smart_targets chain",
+    )
+    setup_near_atr: float = Field(
+        1.5, gt=0,
+        description="D-057 — how close (in M5-ATR units) a DRAWN zone "
+                    "(the zone boxes the chart renders) must be to the "
+                    "market for the drawing-true geometry to anchor the "
+                    "order there; the setup BOX itself still uses the "
+                    "tighter 0.75 (setup_geometry.SETUP_NEAR_ATR) — the "
+                    "box is the 'trade is live here' card, this window is "
+                    "the 'orders sit at drawn zone boxes' reach",
+    )
+    setup_entry_anchor: str = Field(
+        "near", pattern="^(near|mid)$",
+        description="D-057 — where on the DRAWN zone the entry anchors: "
+                    "'near' = the zone's near edge (the first-touch "
+                    "boundary line — a pending there fills on the first "
+                    "retest; a mid-zone pending only fills when price "
+                    "trades deep, which is adverse selection); 'mid' = "
+                    "the classic D-052 box midpoint",
+    )
+    setup_max_rr: float = Field(
+        1.8, gt=0,
+        description="D-057 — drawn targets beyond this RR are swing-scale "
+                    "trades, not short-time trades: the geometry falls "
+                    "back to the legacy ladder instead ('TP যেনো হিট "
+                    "বেশি হয়' — a TP the market cannot reach in the "
+                    "engine's horizon is a missed TP, not a win)",
+    )
+    setup_max_risk_atr: float = Field(
+        1.6, gt=0,
+        description="D-057 — sanity cap on the drawn SL distance in M5-ATR "
+                    "units (ATR-relative so the same gate scales across "
+                    "mock / gold / BTC): a zone whose structural stop is "
+                    "wider than this is a swing trade, not the user's "
+                    "short-time profile — the engine falls back to the "
+                    "legacy chain",
+    )
+    counter_needs_sweep: bool = Field(
+        False,
+        description="D-056 — when TRUE, counter-trend zone reversals must "
+                    "show the stop-hunt PROOF (the bar wicked through the "
+                    "zone's far edge and closed back inside: sweep + "
+                    "reclaim) before firing. Default FALSE: the D-049 "
+                    "user directive ('Best POI ZONE... সিগন্যাল দিতে হবে, "
+                    "মিস করা যাবে না') requires zone signals to keep "
+                    "flowing against the bias; the A/B showed the gate "
+                    "is seed-mixed (protects the worst day, costs the "
+                    "good ones) — enable it for a quieter signal flow",
+    )
     # -------------------------------------------------- D-051 trusted-vote block
     trusted_min_votes: float = Field(
         2.0, ge=1.0, le=6.0,

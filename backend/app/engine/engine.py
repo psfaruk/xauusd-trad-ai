@@ -131,6 +131,100 @@ def _pulse_miss(pulse: dict, trace: Trace) -> None:
         pulse["near_miss"] = "no trigger on this bar"
 
 
+def _drawing_geometry(
+    base: pd.DataFrame,
+    htf: dict[str, pd.DataFrame],
+    direction: str,
+    market: float,
+    cfg: EngineConfig,
+    spread_price: float,
+) -> dict | None:
+    """D-057 — the chart-true trade contract: ENTRY/SL/TP exactly where
+    the chart's entry-setup box draws them.
+
+    Builds the M5/M15 snapshots from the SAME bar windows the drawing
+    layer uses (setup_snapshot mirrors services/analysis.py
+    BARS_PER_TF), runs the SHARED setup_geometry (the single source of
+    truth both the chart box and this order read), then books the drawn
+    entry as a PENDING LIMIT when it sits beyond the noise margin or a
+    market entry when the market is already at the drawn level.
+
+    Returns None when the chart draws no supporting zone for this
+    direction (the caller falls back to the legacy geometry chain) or
+    when the drawn trade fails the sanity gates (risk floor/cap, min
+    RR) — the drawing is the instruction, but never a suicide note.
+    """
+    from app.analysis.setup_geometry import setup_geometry, setup_snapshot
+
+    s5 = setup_snapshot(htf.get("M5"), "M5")
+    s15 = setup_snapshot(htf.get("M15"), "M15")
+    if s5 is None and s15 is None:
+        return None
+    a_m1 = atr_calc(base, cfg.atr_period) or 1e-9
+    geo = setup_geometry(
+        s5, s15, direction, market,
+        near_atr=cfg.setup_near_atr, atr_fallback=a_m1,
+        entry_anchor=cfg.setup_entry_anchor, max_rr=cfg.setup_max_rr,
+        max_risk_atr=cfg.setup_max_risk_atr,
+    )
+    if geo is None:
+        return None
+    entry, sl, tp = geo["entry"], geo["sl"], geo["tp"]
+    risk = abs(entry - sl)
+    risk_cap = cfg.setup_max_risk_atr * float(geo.get("atr5") or a_m1)
+    if risk <= 0 or risk > risk_cap:
+        return None  # degenerate or swing-scale — not a short-time trade
+    # a stop the spread can eat half of is not a stop (D-049 floor)
+    floor = 2.5 * max(spread_price, 0.0)
+    if risk < floor:
+        sl = entry - floor if direction == "BUY" else entry + floor
+        risk = floor
+        if risk > risk_cap:
+            return None  # the floor pushed past the cap — skip, not stretch
+    if abs(tp - entry) / risk < cfg.tp_min_rr:
+        return None  # the drawn TP is too close — poor geometry
+
+    # market vs pending: the drawn entry beyond the noise margin books
+    # as a LIMIT at the drawn level; an entry at/behind the market fills
+    # now with the drawn SL/TP contract intact
+    min_off = max(
+        cfg.entry_offset_atr * a_m1, 2.0 * spread_price, cfg.entry_min_usd
+    )
+    dist = (market - entry) if direction == "BUY" else (entry - market)
+    if dist >= min_off:
+        entry_type = "limit"
+        rr = abs(tp - entry) / risk
+        note = (
+            f"{geo['tag']} {geo['lo']:.2f}-{geo['hi']:.2f} entry {entry:.2f} "
+            f"({dist:.2f} USD from market) — chart-true"
+        )
+    else:
+        # price already at/through the drawn entry: fill at the market,
+        # keep the drawn SL/TP (the zone rejected here and now)
+        entry_type = "market"
+        entry = round(market, 2)
+        risk = abs(entry - sl)
+        rr = abs(tp - entry) / risk if risk > 0 else 0.0
+        if risk <= 0 or rr < cfg.tp_min_rr or rr > cfg.setup_max_rr:
+            return None  # the shifted entry breaks the contract's scale
+        note = (
+            f"{geo['tag']} {geo['lo']:.2f}-{geo['hi']:.2f} retested at "
+            f"market {market:.2f} — chart-true"
+        )
+    return {
+        "entry": round(float(entry), 2),
+        "sl": round(float(sl), 2),
+        "tp": round(float(tp), 2),
+        "rr": round(float(rr), 2),
+        "entry_type": entry_type,
+        "entry_note": note,
+        "tag": geo["tag"],
+        "zone": (geo["lo"], geo["hi"]),
+        "target_note": f"{geo.get('tp_source', 'drawn target')} "
+                       f"(chart-true D-057)",
+    }
+
+
 def evaluate(
     base: pd.DataFrame,  # closed bars of cfg.timeframe (trigger TF)
     htf: dict[str, pd.DataFrame],  # {"H1": ..., "M5": ..., "M15": ...} closed-only
@@ -475,61 +569,96 @@ def evaluate(
         trigger_quality = pullback_quality(sig_pb)
         trigger_tag = sig_pb
 
-    # D-050 — POI pending entry (user directive): the entry stops being
-    # the trigger close (a market order that fills wherever the noise
-    # happens to be) and becomes a PENDING LIMIT anchored at a structural
-    # POI level BEYOND the market — BUY limits below the demand/support
-    # zone, SELL limits above the supply/resistance zone. The distance
-    # between market and entry is the margin the old mode lacked; SL/TP
-    # are then re-derived from the (deeper) pending entry by the same
-    # smart_targets pass below.
+    # D-057 — DRAWING-TRUE GEOMETRY (user directive: "SL TP ENTRY সব
+    # কিছু এই চার্ট ফলো করে হবে"): when the chart is drawing a setup box
+    # (a supporting zone within reach of the market), the signal's
+    # ENTRY/SL/TP ARE the drawn levels — app.analysis.setup_geometry is
+    # the single source of truth for BOTH the chart box and this order.
+    # No drawn zone -> the legacy chain below (poi_pending_entry +
+    # smart_targets) still places the trade.
     market_ref = entry  # trigger close = the market price at signal time
     entry_type = "market"
     entry_note = "market entry at trigger close"
-    if cfg.entry_mode == "poi_limit":
-        atr_val = atr_calc(base, cfg.atr_period) or 1e-9
-        point = point_size if point_size > 0 else 0.01
-        pending, entry_note = poi_pending_entry(
-            trigger_tag.direction, market_ref, zones, atr_val, cfg,
-            spread_price=spread_points * point,
-        )
-        entry, entry_type = pending, "limit"
-        trace.add(
-            "entry_mode", True,
-            f"pending {entry_type} @ {entry:.2f} "
-            f"({market_ref - entry:+.2f} from market {market_ref:.2f}) — "
-            f"{entry_note}",
-        )
-
-    # D-042/D-047/D-049 — structure-aware exits: SL beyond the structural
-    # invalidation, floored at 2.5x spread AND min_sl_atr ATRs, capped at
-    # max_sl_atr, anchored past the NEAREST strong TPO level; TP predicted
-    # from the nearest opposing zone/liquidity/TPO target (tp=None means
-    # a barrier stands before min_rr — the geometry itself rejects it).
-    tpo_levels: list[dict] = []
-    try:
-        from app.analysis.tpo import tpo_profile_cached
-
-        tpo_levels = tpo_profile_cached(
-            base, lookback_minutes=cfg.tpo_lookback_min
-        )["levels"]
-    except Exception:  # noqa: BLE001 — anchoring is best-effort
-        tpo_levels = []
     point = point_size if point_size > 0 else 0.01
     spread_price = spread_points * point
-    entry, sl, tp, target_note = smart_targets(
-        base, trigger_tag.direction, entry, sl_base, cfg.rr,
-        cfg.min_sl_atr, cfg.max_sl_atr, tpo_levels=tpo_levels,
-        zones=zones, spread_price=spread_price,
-        min_rr=cfg.tp_min_rr, max_tp_r=cfg.tp_max_r,
+    geo = (
+        _drawing_geometry(
+            base, htf, trigger_tag.direction, market_ref, cfg,
+            spread_price=spread_price,
+        )
+        if cfg.drawing_true else None
     )
-    if tp is None:
-        # poor geometry — the nearest opposing structure sits closer than
-        # min_rr x risk: the market is predicted to hit the barrier first
-        trace.add("targets", False, target_note)
-        _pulse_miss(pulse, trace)
-        return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
-    realized_rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+    if geo is not None:
+        entry, sl, tp = geo["entry"], geo["sl"], geo["tp"]
+        entry_type, entry_note = geo["entry_type"], geo["entry_note"]
+        target_note = geo["target_note"]
+        realized_rr = float(geo["rr"])
+        trace.add(
+            "geometry", True,
+            f"drawing-true setup — {entry_note}; SL {sl:.2f} "
+            f"TP {tp:.2f} RR {realized_rr:.2f}",
+        )
+    else:
+        if cfg.drawing_true:
+            # informational mode report, never a gate: the chart draws no
+            # supporting zone here, so the legacy chain placed the trade
+            trace.add(
+                "geometry", True,
+                "legacy geometry — the chart draws no supporting zone "
+                "for this trade",
+            )
+        # D-050 — POI pending entry (legacy path, user directive): the
+        # entry stops being the trigger close (a market order that fills
+        # wherever the noise happens to be) and becomes a PENDING LIMIT
+        # anchored at a structural POI level BEYOND the market — BUY
+        # limits below the demand/support zone, SELL limits above the
+        # supply/resistance zone. The distance between market and entry
+        # is the margin the old mode lacked; SL/TP are then re-derived
+        # from the (deeper) pending entry by the same smart_targets pass
+        # below.
+        if cfg.entry_mode == "poi_limit":
+            atr_val = atr_calc(base, cfg.atr_period) or 1e-9
+            pending, entry_note = poi_pending_entry(
+                trigger_tag.direction, market_ref, zones, atr_val, cfg,
+                spread_price=spread_price,
+            )
+            entry, entry_type = pending, "limit"
+            trace.add(
+                "entry_mode", True,
+                f"pending {entry_type} @ {entry:.2f} "
+                f"({market_ref - entry:+.2f} from market {market_ref:.2f})"
+                f" — {entry_note}",
+            )
+
+        # D-042/D-047/D-049 — structure-aware exits (legacy path): SL
+        # beyond the structural invalidation, floored at 2.5x spread AND
+        # min_sl_atr ATRs, capped at max_sl_atr, anchored past the
+        # NEAREST strong TPO level; TP predicted from the nearest
+        # opposing zone/liquidity/TPO target (tp=None means a barrier
+        # stands before min_rr — the geometry itself rejects it).
+        tpo_levels: list[dict] = []
+        try:
+            from app.analysis.tpo import tpo_profile_cached
+
+            tpo_levels = tpo_profile_cached(
+                base, lookback_minutes=cfg.tpo_lookback_min
+            )["levels"]
+        except Exception:  # noqa: BLE001 — anchoring is best-effort
+            tpo_levels = []
+        entry, sl, tp, target_note = smart_targets(
+            base, trigger_tag.direction, entry, sl_base, cfg.rr,
+            cfg.min_sl_atr, cfg.max_sl_atr, tpo_levels=tpo_levels,
+            zones=zones, spread_price=spread_price,
+            min_rr=cfg.tp_min_rr, max_tp_r=cfg.tp_max_r,
+        )
+        if tp is None:
+            # poor geometry — the nearest opposing structure sits closer
+            # than min_rr x risk: the market is predicted to hit the
+            # barrier first
+            trace.add("targets", False, target_note)
+            _pulse_miss(pulse, trace)
+            return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
+        realized_rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
 
     # D-041 — spread vs risk: entering at ask/exiting at bid costs one
     # spread; when that cost exceeds `max_spread_to_risk` of the stop
@@ -608,6 +737,7 @@ def evaluate(
         "confidence": round(min(max(confidence, 0.0), 1.0), 3),
         "trigger": trigger,
         "entry_type": entry_type,  # D-050 — "market" | "limit"
+        "geometry": "drawing" if geo is not None else "legacy",  # D-057
         "market_ref": round(market_ref, 2),  # market at signal time
         "entry_note": entry_note,  # D-050 — the POI anchor description
         "trace": trace_dict,
@@ -769,7 +899,14 @@ class SignalEngine:
         if cfg.smc_enabled:
             fetch_tfs += cfg.bias_tfs  # D-042 ICT structure-bias frames
         for higher in fetch_tfs:
-            frame = await self._htf_frame(source, symbol, higher, 100)
+            # D-057 — M5/M15 frames carry the SAME bar counts the drawing
+            # layer fetches (services/analysis.py BARS_PER_TF) so the
+            # drawing-true geometry sees the very zones/liquidity the
+            # chart draws; other TFs keep the light 100-bar fetch
+            from app.analysis.setup_geometry import GEOMETRY_BARS
+
+            bars = max(100, GEOMETRY_BARS.get(higher, 0))
+            frame = await self._htf_frame(source, symbol, higher, bars)
             if frame is None:
                 return  # bridge hiccup — better to skip than evaluate blind
             htf[higher] = closed_asof(frame, higher, bar_close_time)

@@ -263,7 +263,14 @@ def test_counter_trend_zone_needs_higher_quality() -> None:
     if q < cfg.counter_trend_quality:
         assert sig is None  # a normal zone may not counter the H1 trend
     else:
+        # D-049 directive stands by default: the zone signal flows
         assert sig is not None and sig.counter_trend
+        # D-056 capability: the optional sweep+reclaim gate blocks the
+        # plain counter-trend bounce
+        gated = detect_zone_retest(
+            df, zones, EngineConfig(counter_needs_sweep=True), "SELL"
+        )
+        assert gated is None
 
 
 def test_rejection_quality_scale() -> None:

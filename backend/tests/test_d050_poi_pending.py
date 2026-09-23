@@ -44,26 +44,32 @@ CFG = EngineConfig()
 
 
 def test_pending_buy_anchors_below_demand_zone() -> None:
-    """BUY limit = the demand zone's LOWER edge (below the support zone).
-    D-051: the zone sits 4-6 USD below the market — inside the USD window
-    the user asked for ("সর্বোচ্চ 4 থেকে 6 usd")."""
+    """BUY limit anchored at the demand zone's NEAR edge (D-056).
+
+    D-056 adverse-selection fix: the old code anchored at the zone's FAR
+    edge (lo) — an order that only fills when the zone BREAKS. The near
+    edge (hi) is the first-retest level where an intact zone rejects;
+    the entry still clears the market by >= entry_min_usd and stays
+    inside the user's USD window."""
     zones = [{"side": "demand", "source": "sd", "lo": 4508.0, "hi": 4510.0,
               "quality": 0.8, "t": None}]
     entry, note = poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=CFG)
-    assert entry == 4508.0  # zone.lo — "সাপোর্ট জোন এর নিচ"
+    assert entry == 4510.0  # zone.hi — the NEAR edge (D-056)
     assert 1.0 <= 4513.0 - entry <= CFG.pending_max_usd  # the USD window
     assert "demand" in note
+    assert "near edge" in note
 
 
 def test_pending_sell_anchors_above_supply_zone() -> None:
-    """SELL limit = the supply zone's UPPER edge (above the resistance),
-    inside the 4-6 USD window."""
+    """SELL limit anchored at the supply zone's NEAR edge (D-056) —
+    the first-retest level, inside the 4-6 USD window."""
     zones = [{"side": "supply", "source": "sd", "lo": 4516.0, "hi": 4518.5,
               "quality": 0.8, "t": None}]
     entry, note = poi_pending_entry("SELL", 4513.0, zones, atr=1.0, cfg=CFG)
-    assert entry == 4518.5  # zone.hi — "রেসিস্টেন্স এর উপর"
+    assert entry == 4516.0  # zone.lo — the NEAR edge (D-056)
     assert 1.0 <= entry - 4513.0 <= CFG.pending_max_usd
     assert "supply" in note
+    assert "near edge" in note
 
 
 def test_pending_nearest_zone_wins() -> None:
@@ -74,7 +80,8 @@ def test_pending_nearest_zone_wins() -> None:
          "quality": 0.6, "t": None},   # 5.5 USD away — nearest usable
     ]
     entry, _ = poi_pending_entry("BUY", 4513.0, zones, atr=2.0, cfg=CFG)
-    assert entry == 4507.5  # nearest usable zone, not the best quality
+    assert entry == 4509.0  # nearest usable zone's NEAR edge (D-056),
+    #                          not the best quality zone's
 
 
 def test_pending_fallback_offset_without_zone() -> None:

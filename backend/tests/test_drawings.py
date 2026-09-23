@@ -63,8 +63,45 @@ def _frames() -> dict[str, pd.DataFrame]:
     }
 
 
+def _m5_demand_supply_around(price: float) -> pd.DataFrame:
+    """D-057 — an M5 tape whose smc layer draws BOTH sides of the trade:
+    a demand zone just under `price` (entry) and a supply zone above it
+    (the drawn TP target). The setup box only exists when the chart
+    draws a real target — no invented TPs."""
+    t0 = pd.Timestamp("2025-01-06 11:00", tz="UTC")
+    rows = []
+    quiet = price - 3.4
+    for i in range(20):  # ATR ~ 1.0, unique lows (no SSL pools nearby)
+        t = t0 + pd.Timedelta(minutes=5 * i)
+        c = quiet + 0.1 * (i % 3)
+        rows.append([t, c - 0.1, c + 0.5, c - 0.6 - 0.01 * i, c + 0.1, 60])
+    zlo, zhi = price - 0.7, price - 0.1          # demand zone band
+    rows.append([t0 + pd.Timedelta(minutes=100), zhi - 0.2, zhi, zlo,
+                 zlo + 0.1, 60])                 # down base candle
+    rows.append([t0 + pd.Timedelta(minutes=105), zlo + 0.1, price + 2.7,
+                 zlo + 0.15, price + 2.5, 60])   # up impulse
+    slo, shi = price + 1.8, price + 2.5          # supply zone band
+    rows.append([t0 + pd.Timedelta(minutes=110), slo + 0.05, shi, slo,
+                 shi - 0.1, 60])                 # UP base candle (c > o)
+    rows.append([t0 + pd.Timedelta(minutes=115), shi - 0.1, price + 2.6,
+                 price - 0.8, price - 0.6, 60])  # down impulse
+    legs = [
+        (price - 0.4, price + 0.1, price - 0.5, price - 0.2),
+        (price - 0.2, price + 0.2, price - 0.35, price - 0.1),
+        (price - 0.1, price + 0.3, price - 0.25, price + 0.0),
+        (price + 0.0, price + 0.4, price - 0.15, price + 0.1),
+        (price + 0.1, price + 0.35, price - 0.05, price + 0.05),
+        (price + 0.05, price + 0.3, price - 0.1, price + 0.0),
+    ]
+    for i, (o, h, low, c) in enumerate(legs):
+        rows.append([t0 + pd.Timedelta(minutes=5 * (24 + i)), o, h, low, c, 60])
+    return _mk(rows)
+
+
 def test_setup_drawing_on_bullish_ict_tape():
     frames = _frames()
+    # D-057 — the M5 must draw BOTH the entry zone and a TP target
+    frames["M5"] = _m5_demand_supply_around(float(frames["M1"]["c"].iloc[-1]))
     price = float(frames["M1"]["c"].iloc[-1])
     out = build_drawings(frames, _snaps(frames), price, [])
     assert len(out) <= 26
@@ -88,6 +125,7 @@ def test_setup_drawing_on_bullish_ict_tape():
 
 def test_setup_marks_triggered_with_recent_signal():
     frames = _frames()
+    frames["M5"] = _m5_demand_supply_around(float(frames["M1"]["c"].iloc[-1]))
     price = float(frames["M1"]["c"].iloc[-1])
     recent = [{
         "direction": "BUY",

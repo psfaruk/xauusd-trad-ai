@@ -173,6 +173,12 @@ def detect_zone_retest(
         if q < gate:
             continue
         sweep_reclaim = bool(swept and closed_back)
+        # D-056 — counter-trend zone reversals need the stop-hunt PROOF:
+        # the bar wicked through the far edge and closed back (sweep +
+        # reclaim). A plain bounce against the bias is a coin flip —
+        # the backtest losers were exactly these.
+        if counter and cfg.counter_needs_sweep and not sweep_reclaim:
+            continue
         rej = rejection_quality(wick_share, body_pos, sweep_reclaim)
         if counter and rej < COUNTER_REJECT_MIN:
             continue
@@ -270,21 +276,21 @@ def poi_pending_entry(
     cfg: EngineConfig,
     spread_price: float = 0.0,  # current spread in price units
 ) -> tuple[float, str]:
-    """D-050/D-051 — the PENDING limit-entry price + its anchor note.
+    """D-050/D-051/D-056 — the PENDING limit-entry price + its anchor note.
 
     BUY  -> a BUY LIMIT below the market anchored at the nearest DEMAND
-            (support) zone's LOWER edge: "সাপোর্ট জোন এর নিচ থেকে buy order".
+            (support) zone: D-056 anchors at the zone's NEAR edge (the
+            first-retest level where an intact zone rejects), never deeper
+            than the user's 4-6 USD window.
     SELL -> a SELL LIMIT above the market anchored at the nearest SUPPLY
-            (resistance) zone's UPPER edge: "রেসিস্টেন্স এর উপর থেকে sell
-            order".
+            (resistance) zone's NEAR edge.
 
-    D-051 (user directive: "সর্বোচ্চ 4 থেকে 6 usd উপরে অথবা নিচে পেন্ডিং
-    অর্ডার বসাবেন ... অবশ্যই এক মিনিটের ক্যান্ডেল দেখে এন্ট্রি বসাবেন"):
-    the entry distance is now USD-BOUNDED — the market reference IS the
-    M1 trigger close, the anchor is the nearest structural POI level the
-    M1 candle can see, and the distance never exceeds pending_max_usd
-    (6.0). Orders further out than that simply never book (the exact
-    complaint: "আমার মনে হয় না অর্ডার গুলো বুক করবে").
+    D-056 ROOT-CAUSE FIX (adverse selection): the D-051 code anchored a BUY
+    limit at the zone's FAR edge (zlo) — that order only fills when price
+    trades THROUGH the whole demand zone, i.e. exactly when the zone BREAKS.
+    The fills were the failures: fill-rate 37%, filled-trade WR < 50% while
+    the unfilled "misses" were the winners. The near edge is where a valid
+    zone gets its FIRST/SECOND retest — the ICT entry itself.
 
     Geometry guards (combined ATR + USD):
     - minimum distance: max(entry_offset_atr*ATR, 2 spreads, entry_min_usd);
@@ -314,8 +320,17 @@ def poi_pending_entry(
         if float(z.get("quality", 0.0)) < 0.30:
             continue  # weak zone — not worth anchoring an entry to
         zlo, zhi = float(z["lo"]), float(z["hi"])
-        # far edge: below the support zone (BUY) / above the resistance (SELL)
-        anchor = zlo if direction == "BUY" else zhi
+        # D-056 — NEAR edge: the level price touches FIRST on a retrace
+        # (zhi for demand, zlo for supply). Retests of an intact zone
+        # reject here; the far edge only trades on a break.
+        near_edge = zhi if direction == "BUY" else zlo
+        # pending must still clear the market by min_off (noise margin);
+        # a near edge that hugs the market degrades to the pure offset
+        anchor = (
+            min(near_edge, market - min_off)
+            if direction == "BUY" else
+            max(near_edge, market + min_off)
+        )
         dist = (market - anchor) if direction == "BUY" else (anchor - market)
         if dist < min_off:
             continue  # zone hugs the market — no margin to be had from it
@@ -338,8 +353,8 @@ def poi_pending_entry(
             entry = anchor
             note = (
                 f"{where} {want} POI {z['lo']:.2f}-{z['hi']:.2f} "
-                f"({z['source']}, q {float(z['quality']):.2f}) at {anchor:.2f} "
-                f"— {dist:.2f} USD from market"
+                f"({z['source']}, q {float(z['quality']):.2f}) at near edge "
+                f"{anchor:.2f} — {dist:.2f} USD from market"
             )
         return round(entry, 2), note
 

@@ -42,6 +42,7 @@ import pandas as pd
 from app.analysis import indicators as ind
 from app.analysis import smc
 from app.analysis.context import mtf_bias
+from app.analysis.setup_geometry import setup_geometry
 
 logger = logging.getLogger("xauusd.drawings")
 
@@ -508,31 +509,6 @@ def _fib(df: pd.DataFrame | None, pd_state: dict | None) -> dict | None:
 # ------------------------------------------------------------------- setup
 
 
-def _candidate_zones(
-    s5: dict | None, s15: dict | None, direction: str, price: float, atr5: float
-) -> list[tuple[str, float, float, Any]]:
-    """(tag, lo, hi, origin_t) zones that support `direction`."""
-    zones: list[tuple[str, float, float, Any]] = []
-    if atr5 <= 0:
-        return zones
-    want_bull = direction == "BUY"
-    for snap in (s5, s15):
-        if not snap or not snap.get("ok"):
-            continue
-        for z in snap.get("zones") or []:
-            if (z.get("side") == "demand") == want_bull:
-                zones.append((f"{z['side']} zone", float(z["lo"]), float(z["hi"]), z.get("t")))
-        for ob in snap.get("order_blocks") or []:
-            if (ob.get("side") == "bullish") == want_bull:
-                zones.append(("OB retest", float(ob["lo"]), float(ob["hi"]), ob.get("t")))
-        for g in snap.get("fvgs") or []:
-            if g.get("filled"):
-                continue
-            if (g.get("side") == "bullish") == want_bull:
-                zones.append(("FVG", float(g["lo"]), float(g["hi"]), g.get("t")))
-    return zones
-
-
 def _setup(
     frames: dict[str, pd.DataFrame],
     snaps: dict[str, dict],
@@ -546,6 +522,13 @@ def _setup(
     Fires only when a real confluence exists: MTF bias + price sitting in /
     near a supporting zone (demand/OB/FVG/OTE). That is exactly the user's
     directive — draw WHEN a good setup appears, not always.
+
+    D-057: the ENTRY/SL/TP geometry comes from the SHARED module
+    (app.analysis.setup_geometry) — the exact same numbers the signal
+    engine places its order at, so the box the user watches IS the trade
+    the broker receives. Once a signal fires, the box mirrors the
+    signal's actual levels verbatim ("সিগন্যাল গুলো এই ড্রয়িং ফলো করে
+    আসবে ... SL TP ENTRY সব কিছু এই চার্ট ফলো করে হবে").
     """
     m1, m5 = frames.get("M1"), frames.get("M5")
     s1, s5, s15 = snaps.get("M1"), snaps.get("M5"), snaps.get("M15")
@@ -568,65 +551,15 @@ def _setup(
     else:
         return None
 
-    zones = _candidate_zones(s5, s15, direction, price, atr5)
-    # OTE band as an extra candidate zone
-    pd_state = (s15 or {}).get("premium_discount") if s15 else None
-    ote = (pd_state or {}).get("ote") if pd_state else None
-    if isinstance(ote, dict) and ote.get("lo") is not None:
-        leg = (pd_state or {}).get("leg")
-        if (leg == "up") == (direction == "BUY"):
-            zones.append(("OTE 0.62–0.79", float(ote["lo"]), float(ote["hi"]), None))
-
-    # nearest supporting zone by distance to price
-    best: tuple[float, str, float, float, Any] | None = None
-    near = SETUP_NEAR_ATR * atr5
-    for tag, lo, hi, t0 in zones:
-        if hi < lo:
-            lo, hi = hi, lo
-        dist = 0.0 if (lo <= price <= hi) else min(abs(price - lo), abs(price - hi))
-        if dist > near:
-            continue
-        if best is None or dist < best[0]:
-            best = (dist, tag, lo, hi, t0)
-    if best is None:
+    # D-057 — the SHARED geometry: the same entry/SL/TP the signal engine
+    # places its order at (setup_geometry is the single source of truth)
+    geo = setup_geometry(s5, s15, direction, price, atr_fallback=atr5)
+    if geo is None:
         return None
-    _, tag, lo, hi, t0 = best
+    tag, lo, hi, t0 = geo["tag"], geo["lo"], geo["hi"], geo["t0"]
+    entry, sl, tp, rr = geo["entry"], geo["sl"], geo["tp"], geo["rr"]
     if t0 is not None and _age_min(t0, now) > SETUP_MAX_AGE_MIN:
         t0 = m1["time_utc"].iloc[-1]
-    entry = round((lo + hi) / 2.0, 2)
-
-    # app-controlled SL: below/above the zone, protected beyond liquidity
-    levels = ((s5 or {}).get("liquidity") or {}).get("levels") or []
-    if direction == "BUY":
-        sl = lo - 0.35 * atr5
-        ssl_below = [lv["price"] for lv in levels
-                     if lv.get("kind") == "SSL" and lo - 1.6 * atr5 < lv["price"] < lo]
-        if ssl_below:
-            sl = min(ssl_below) - 0.15 * atr5
-        risk = entry - sl
-        if risk <= 0:
-            return None
-        bsl_above = [lv["price"] for lv in levels
-                     if lv.get("kind") == "BSL" and lv["price"] > entry + 0.5 * risk]
-        tp = (min(bsl_above) - 0.15 * atr5) if bsl_above else entry + 1.5 * risk
-        if (tp - entry) / risk < 0.8:
-            tp = entry + 1.2 * risk
-    else:
-        sl = hi + 0.35 * atr5
-        bsl_above = [lv["price"] for lv in levels
-                     if lv.get("kind") == "BSL" and hi < lv["price"] < hi + 1.6 * atr5]
-        if bsl_above:
-            sl = max(bsl_above) + 0.15 * atr5
-        risk = sl - entry
-        if risk <= 0:
-            return None
-        ssl_below = [lv["price"] for lv in levels
-                     if lv.get("kind") == "SSL" and lv["price"] < entry - 0.5 * risk]
-        tp = (max(ssl_below) + 0.15 * atr5) if ssl_below else entry - 1.5 * risk
-        if (entry - tp) / risk < 0.8:
-            tp = entry - 1.2 * risk
-
-    rr = round(abs(tp - entry) / risk, 2)
 
     # confluence factor tags (the "why" the trader writes on the chart)
     factors: list[str] = [tag]
@@ -645,7 +578,10 @@ def _setup(
     if kz:
         factors.append(kz)
 
-    # triggered? an engine signal for this direction fired recently
+    # triggered? an engine signal for this direction fired recently:
+    # the box then mirrors the FIRED signal's actual levels — the box IS
+    # the trade contract, so after the trigger it shows exactly what the
+    # broker holds (entry/SL/TP of the live order)
     status = "forming"
     sig_note = None
     for sig in recent_signals or []:
@@ -658,7 +594,14 @@ def _setup(
             continue
         if 0 <= age <= TRIGGER_WINDOW_MIN and sig.get("direction") == direction:
             status = "triggered"
-            sig_note = f"entry taken @ {sig.get('entry')}"
+            try:
+                entry = round(float(sig["entry"]), 2)
+                sl = round(float(sig["sl"]), 2)
+                tp = round(float(sig["tp"]), 2)
+                rr = round(float(sig.get("rr") or rr), 2)
+                sig_note = f"order live @ {entry}"
+            except (KeyError, TypeError, ValueError):
+                sig_note = f"entry taken @ {sig.get('entry')}"
             break
 
     pd_state_txt = "range"
@@ -666,7 +609,7 @@ def _setup(
         pd_state_txt = (s15.get("premium_discount") or {}).get("state") or "range"
     note = f"{direction} setup — {tag} in {pd_state_txt}"
     side_word = "below" if direction == "BUY" else "above"
-    note += f" · SL {side_word} zone · TP at liquidity · RR {rr}"
+    note += f" · SL {side_word} zone · TP at drawn target · RR {rr}"
     if sig_note:
         note += f" · {sig_note}"
 

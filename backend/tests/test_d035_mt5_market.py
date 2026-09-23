@@ -276,7 +276,10 @@ async def test_mcp_market_tick_volume_builds_m1():
     """MT5 ticks fold into the tick-built M1 exactly like crypto events."""
     mcp = FakeMcp(fresh_keys=("XAUUSD",))
     core = _core(mcp)
-    now = time_mod.time()
+    # FIXED epoch (a safe 5s inside a synthetic minute): wall-clock `now`
+    # occasionally lands at second 58+ and the now+2 tick spills into the
+    # NEXT minute bucket — a 1-in-30 latent flake, not a code path
+    now = 1_700_000_000 * 60 + 5.0
     core.on_mt5_tick(4378.10, 4378.40, now)
     core.on_mt5_tick(4378.50, 4378.80, now + 1)
     core.on_mt5_tick(4379.00, 4379.30, now + 2)
