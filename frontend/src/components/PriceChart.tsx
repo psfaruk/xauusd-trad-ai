@@ -161,8 +161,11 @@ export default function PriceChart({
         borderColor: "#262b36",
         timeVisible: true,
         secondsVisible: false,
-        // D-043 — professional candle density for the deep 1200-bar window
-        barSpacing: 7,
+        // D-052 — user directive: the drawings must be VISIBLE within the
+        // recent 80-150 candles ("এই ড্রয়িং গুলো রিসেন্ট 80 থেকে 150
+        // ক্যান্ডেল এ দেখলেই হবে") — a denser default zoom keeps ~110
+        // bars (and their zone boxes / levels / structure marks) on screen.
+        barSpacing: 4,
         rightOffset: 8,
       },
       autoSize: true,
@@ -287,7 +290,9 @@ export default function PriceChart({
           color: c.c >= c.o ? "#1f5f57" : "#6b3232",
         })),
       );
-      chartRef.current?.timeScale().scrollToRealTime();
+      chartRef.current?.timeScale().setVisibleLogicalRange(
+        { from: Math.max(0, clean.length - 110), to: clean.length + 6 },
+      );
     } catch (err) {
       console.warn("chart setData failed — dropping this batch", err);
     }
@@ -414,6 +419,7 @@ export default function PriceChart({
     const series = seriesRef.current;
     if (!canvas || !chart || !series) return;
     const L = layersRef.current;
+    try {
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
     if (w === 0 || h === 0) return;
@@ -854,6 +860,11 @@ export default function PriceChart({
       line(sig.sl, "rgba(248,113,113,0.4)", `${sig.direction} STOP LOSS`);
       line(sig.tp, "rgba(52,211,153,0.4)", `${sig.direction} TAKE PROFIT`);
     }
+    } catch (err) {
+      // D-052 — a drawing failure must NEVER blank the whole chart: log
+      // and keep the candles + markers alive.
+      console.warn("[PriceChart] overlay draw skipped:", err);
+    }
   }, [drawings, signals, selectedSignal, tf]);
 
   // redraw on data/symbol changes + continuously while zooming/panning
@@ -939,10 +950,13 @@ export default function PriceChart({
   return (
     <div className="relative h-full min-h-0 w-full overflow-hidden rounded-2xl border border-zinc-800/80 bg-[#0b0d12]">
       <div ref={containerRef} className="h-full w-full" aria-label={`${symbol} ${tf} chart`} />
-      {/* D-052 — professional drawing overlay (pointer-transparent) */}
+      {/* D-052 — professional drawing overlay (pointer-transparent).
+       *  z-10 is REQUIRED: lightweight-charts paints its own canvases at
+       *  z-index 1/2/3 — an z-auto overlay would be buried UNDER the
+       *  chart (that was the "drawings invisible" bug). */}
       <canvas
         ref={overlayRef}
-        className="pointer-events-none absolute inset-0 h-full w-full"
+        className="pointer-events-none absolute inset-0 z-10 h-full w-full"
         aria-hidden
       />
       {chip && <div className="absolute left-3 top-3 z-10">{chip}</div>}

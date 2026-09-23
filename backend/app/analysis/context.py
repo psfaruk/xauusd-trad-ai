@@ -19,7 +19,11 @@ from app.analysis import orderflow as of
 from app.analysis import smc, tpo
 
 # timeframes the /api/analysis endpoint reports by default
-ANALYSIS_TFS: tuple[str, ...] = ("M1", "M5", "M15", "H1", "H4")
+# D-052 follow-up: M30 + D1 join the set — the frontend chart offers every
+# TF from M1 to D1, and EACH needs its own drawing set so switching
+# timeframes never blanks the overlay (user directive: "টাইম ফ্রম
+# পরিবর্তন করলেও ড্রয়িং নষ্ট হবে না").
+ANALYSIS_TFS: tuple[str, ...] = ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
 
 
 # ------------------------------------------------------------ per-TF view

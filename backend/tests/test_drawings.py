@@ -56,8 +56,10 @@ def _frames() -> dict[str, pd.DataFrame]:
         "M1": m1,
         "M5": m1,  # price sits inside this frame's bullish OB zone
         "M15": wavy_frame(base, 15, start=81.6, bars=120),
+        "M30": wavy_frame(base, 30, start=81.6, bars=120),
         "H1": wavy_frame(base, 60, start=81.6, bars=120),
         "H4": wavy_frame(base, 240, start=81.6, bars=120),
+        "D1": wavy_frame(base, 1440, start=81.6, bars=120),
     }
 
 
@@ -156,7 +158,7 @@ def test_d052_zone_drawings_with_full_word_labels():
             assert z["label"].split()[0] in (
                 "Supply", "Demand", "Bullish", "Bearish", "Fair",
             )
-            assert z["source_tf"] in ("M1", "M5", "M15", "H1", "H4")
+            assert z["source_tf"] in ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
 
 
 def test_d052_every_tf_gets_its_own_drawing_set():
@@ -271,8 +273,8 @@ async def test_d052_analysis_service_serves_per_tf_drawings():
     svc = AnalysisService(ttl_s=0.0)
     payload = await svc.get(_Src(), "XAUUSD", [])
     assert payload["drawings_by_tf"], "per-TF drawing sets must be present"
-    for tf in ("M1", "M5", "M15", "H1", "H4"):
-        assert tf in payload["drawings_by_tf"]
+    for tf in ("M1", "M5", "M15", "M30", "H1", "H4", "D1"):
+        assert tf in payload["drawings_by_tf"], f"{tf} view missing"
         marks = payload["drawings_by_tf"][tf]
         assert isinstance(marks, list)
         assert any(d["kind"] == "hline" for d in marks), f"{tf} levels"

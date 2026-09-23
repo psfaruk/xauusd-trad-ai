@@ -1,6 +1,6 @@
 """AnalysisService (D-042/D-043) — cached multi-TF ICT/SMC snapshots.
 
-Backs GET /api/analysis: pulls closed bars for M1/M5/M15/H1/H4 through
+Backs GET /api/analysis: pulls closed bars for M1..D1 through
 the live DataSource, runs the analysis package (structure, order
     blocks, FVG, liquidity, supply/demand, whales, classic indicators) per
 TF and aggregates the MTF bias. Results are cached ~20s per symbol —
@@ -33,7 +33,10 @@ from app.analysis.orderflow import flow_stats
 logger = logging.getLogger("xauusd.analysis")
 
 CACHE_TTL_S = 20.0
-BARS_PER_TF = {"M1": 260, "M5": 200, "M15": 160, "H1": 140, "H4": 120}
+# D-052 — every chart timeframe (M1..D1) gets a snapshot + its own
+# drawing set; M30/D1 carry a bit less depth (bars cost fetch time).
+BARS_PER_TF = {"M1": 260, "M5": 200, "M15": 160, "M30": 140, "H1": 140,
+                "H4": 120, "D1": 120}
 
 
 class AnalysisService:

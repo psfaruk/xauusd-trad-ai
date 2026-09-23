@@ -139,18 +139,24 @@ function BrokerCard({
 
 /** D-052 — STRATEGY-ONLY engine fields, full-word labels.
  *
- * Money-management criteria (balance, stop loss, target profit, lot
- * size, signals per day, concurrent trades) live ONLY in the AI tab's
- * money-management window — never duplicated here (user directive:
- * "একই বিষয় দুই জায়গায় থাকবে না"). Trade-stopping instructions are
- * likewise absent from this section.
+ * D-052 follow-up (user feedback): the Risk:Reward ratio, minimum stop
+ * distance and maximum spread were dropped too aggressively — they are
+ * STRATEGY parameters, not money management, so they are RESTORED here
+ * with full-word labels. Money-management criteria (balance, stop loss
+ * USD, target profit USD, lot size, signals per day, concurrent trades)
+ * live ONLY in the AI tab's money-management window — never duplicated
+ * here (user directive: "একই বিষয় দুই জায়গায় থাকবে না"). Trade-stopping
+ * instructions are likewise absent from this section.
  */
 const ENGINE_NUM_FIELDS: { key: keyof EngineConfig; label: string; hint?: string; step?: string }[] = [
+  { key: "rr", label: "Risk : Reward Ratio", hint: "take-profit distance = this many times the stop-loss distance (fallback when no zone target is near)", step: "0.1" },
+  { key: "min_sl_atr", label: "Minimum Stop Distance (× ATR)", hint: "stop loss never closer than this — keeps it clear of spread noise", step: "0.1" },
+  { key: "max_spread_points", label: "Maximum Spread (points)", hint: "signals are skipped while the spread is wider than this", step: "1" },
   { key: "trusted_min_votes", label: "Trusted Strategy Votes", hint: "how many trusted strategies must vote together — whale flow counts double", step: "0.5" },
   { key: "pending_target_usd", label: "Preferred Pending Distance (USD)", hint: "how far from the market pending orders are placed", step: "0.5" },
   { key: "pending_max_usd", label: "Maximum Pending Distance (USD)", hint: "hard cap — orders further than this never fill", step: "0.5" },
   { key: "min_atr", label: "Minimum Volatility (ATR)", hint: "skip dead markets — signals need movement", step: "0.05" },
-  { key: "cooldown_bars", label: "Cooldown After Each Signal (bars)", step: "1" },
+  { key: "cooldown_bars", label: "Cooldown After Each Signal (bars)", hint: "quiet period after every signal before the next one can fire", step: "1" },
   { key: "expiry_bars", label: "Pending Order Expiry (bars)", hint: "unfilled orders cancel after this many bars", step: "1" },
 ];
 

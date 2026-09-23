@@ -59,7 +59,7 @@ TRIGGER_WINDOW_MIN = 25
 FIB_RATIOS = (0.236, 0.382, 0.5, 0.618, 0.786)
 
 #: timeframe ladder used to pick the "one higher" HTF context per view
-TF_ORDER = ("M1", "M5", "M15", "H1", "H4", "D1")
+TF_ORDER = ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
 
 
 def _iso(t: Any) -> str | None:
