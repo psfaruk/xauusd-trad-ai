@@ -7,13 +7,12 @@
  * until data comes).
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTick } from "../state/feed";
 import { getAnalysis } from "../lib/api";
 import ErrorBoundary from "../components/ErrorBoundary";
 import PriceChart from "../components/PriceChart";
 import {
-  TIMEFRAMES,
   type AnalysisResponse,
   type BrokerConnection,
   type Candle,
@@ -116,13 +115,15 @@ function PriceHero({
   );
 }
 
-/* ------------------------------------------------ D-053 home chart section */
+/* ------------------------------------------------ D-053/D-058 home chart */
 
 /**
  * HomeChartSection — the SAME chart as the Chart tab, in "full" variant:
- * every drawing layer (FVG / OB / liquidity / structure / fib / whales)
- * + the entry setup + signal markers. The user can blow it up to FULL
- * SCREEN (native Fullscreen API; CSS-overlay fallback for iOS Safari).
+ * every drawing layer (FVG / OB / liquidity / structure / fib / whales /
+ * EMA momentum / kill-zone bands) + the entry setup + signal markers.
+ * D-058: the chart card carries its OWN header (TF dropdown LEFT, marks
+ * dropdown, live quote, fullscreen) — this wrapper is now a thin frame,
+ * and on desktop the chart takes the whole main column.
  */
 function HomeChartSection({
   symbol,
@@ -171,67 +172,6 @@ function HomeChartSection({
     };
   }, [token, symbol]);
 
-  /* -------------------------------------------------- fullscreen (D-053) */
-  const wrapRef = useRef<HTMLElement | null>(null);
-  const [overlayFs, setOverlayFs] = useState(false); // CSS fallback (iOS)
-  const [nativeFs, setNativeFs] = useState(false);
-
-  useEffect(() => {
-    const onFs = () =>
-      setNativeFs(document.fullscreenElement === wrapRef.current);
-    document.addEventListener("fullscreenchange", onFs);
-    return () => document.removeEventListener("fullscreenchange", onFs);
-  }, []);
-
-  // ESC + scroll-lock while the overlay fallback is up
-  useEffect(() => {
-    if (!overlayFs) return;
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOverlayFs(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => {
-      document.body.style.overflow = prev;
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [overlayFs]);
-
-  const isFs = overlayFs || nativeFs;
-
-  const enterFs = async () => {
-    const el = wrapRef.current;
-    if (!el) return;
-    const req = (
-      el as HTMLElement & {
-        requestFullscreen?: (o?: FullscreenOptions) => Promise<void>;
-      }
-    ).requestFullscreen;
-    if (typeof req === "function") {
-      try {
-        await req.call(el);
-        return;
-      } catch (err) {
-        const name = (err as { name?: string })?.name ?? "";
-        if (name === "AbortError") return; // user cancelled — stay put
-        /* fall through to the CSS-overlay fallback */
-      }
-    }
-    setOverlayFs(true);
-  };
-
-  const exitFs = async () => {
-    if (document.fullscreenElement === wrapRef.current) {
-      try {
-        await document.exitFullscreen();
-      } catch {
-        /* ignore */
-      }
-    }
-    setOverlayFs(false);
-  };
-
   const symbolSignals = useMemo(
     () => signals.filter((s) => s.symbol === symbol).slice(0, 40),
     [signals, symbol],
@@ -244,92 +184,20 @@ function HomeChartSection({
 
   return (
     <section
-      ref={wrapRef}
-      className={`flex min-w-0 flex-col rounded-2xl ${
-        isFs
-          ? "fixed inset-0 z-[130] bg-zinc-950 p-2 sm:p-3"
-          : ""
-      }`}
+      className="flex min-w-0 flex-col"
       aria-label="Live chart"
     >
-      {/* header: title + price + fullscreen toggle */}
-      <div className="mb-2 flex min-w-0 items-center gap-2">
-        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-gold/15 text-[11px] font-black text-gold">
-          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-            <path d="M3 20h18M7 16V9m5 7V5m5 11v-5" strokeLinecap="round" />
-          </svg>
-        </span>
-        <h2 className="shrink-0 text-sm font-bold tracking-tight text-zinc-100">
-          Live Chart
-        </h2>
-        <span className="shrink-0 text-[10px] font-semibold text-zinc-500">
-          {symbol} · {tf}
-        </span>
-        {tick ? (
-          <span className="ml-1 truncate font-mono text-sm font-bold tabular-nums text-zinc-200">
-            {tick.bid.toFixed(2)}
-          </span>
-        ) : null}
-        <span className="ml-auto flex shrink-0 items-center gap-1.5">
-          {isFs ? (
-            <button
-              type="button"
-              onClick={() => void exitFs()}
-              className="flex items-center gap-1 rounded-lg border border-gold/50 bg-gold/15 px-2.5 py-1.5 text-[11px] font-bold text-gold"
-              aria-label="Exit fullscreen"
-            >
-              <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4">
-                <path d="M9 3v6H3m12-6v6h6M9 21v-6H3m12 6v-6h6" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              Exit
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={() => void enterFs()}
-              className="flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-[11px] font-bold text-zinc-300 transition-colors hover:border-gold/50 hover:text-gold"
-              aria-label="View chart fullscreen"
-            >
-              <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4">
-                <path d="M15 3h6v6M9 21H3v-6m18-9-7 7M3 15l7-7" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              Fullscreen
-            </button>
-          )}
-        </span>
-      </div>
-
-      {/* timeframe pills (shared with the Chart tab) */}
-      <div className="mb-2 flex min-w-0 gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-        {TIMEFRAMES.map((t) => (
-          <button
-            key={t}
-            type="button"
-            onClick={() => onTfChange(t)}
-            className={`shrink-0 rounded-lg border px-3 py-1 font-mono text-[11px] font-bold transition-colors ${
-              t === tf
-                ? "border-gold/60 bg-gold/15 text-gold"
-                : "border-zinc-800 bg-zinc-900/60 text-zinc-500 hover:text-zinc-300"
-            }`}
-          >
-            {t}
-          </button>
-        ))}
-      </div>
-
       {/* the chart — everything on it (zones, levels, structure, fib,
-       * whales, setup, signals) + the external MARKS legend */}
+       * whales, momentum ribbon, sessions, setup, signals); its header
+       * row holds the TF dropdown + marks dropdown + fullscreen (D-058) */}
       <div
-        className={
-          isFs
-            ? "min-h-0 flex-1"
-            : "h-[44vh] min-h-[300px] sm:h-[46vh] lg:h-[48vh]"
-        }
+        className="h-[52vh] min-h-[320px] lg:h-[calc(100vh-8.5rem)]"
       >
         <ErrorBoundary label="Home chart">
           <PriceChart
             symbol={symbol}
             tf={tf}
+            onTfChange={onTfChange}
             candles={candles}
             candlesLoading={candlesLoading}
             signals={symbolSignals}
@@ -339,6 +207,7 @@ function HomeChartSection({
             onDesync={onDesync}
             analysis={analysis}
             variant="full"
+            headerQuote={tick?.bid ?? null}
           />
         </ErrorBoundary>
       </div>
@@ -398,134 +267,143 @@ export default function HomeView({
         </div>
       )}
 
-      <PriceHero symbol={symbol} tick={tick} market={market} />
-
-      {/* D-053 — the FULL analysis chart (every drawing + signals), with
-       * fullscreen (user directive: "হোম পেজে চার্টটি ইউজার full screen
-       * করে দেখতে পারবে, এবং সমস্ত ড্রয়িং হোম ট্যাবের চার্ট থেকে দেখা
-       * যাবে") */}
-      <HomeChartSection
-        symbol={symbol}
-        tf={tf}
-        onTfChange={onTfChange}
-        candles={candles}
-        candlesLoading={candlesLoading}
-        signals={signals}
-        market={market}
-        wsConnected={wsConnected}
-        onDesync={onDesync}
-        token={token}
-        tick={tick}
-      />
-
-      {/* D-051 — live per-candle buyer/seller dominance (tick-driven) */}
-      <CandlePulseCard symbol={symbol} />
-
-      {/* AI auto trading */}
-      <Card>
-        <SectionTitle
-          title="AI Auto-Trading"
-          right={
-            autoArmed ? (
-              <Badge tone="green" pulse>ARMED</Badge>
-            ) : (
-              <Badge tone="amber">PAUSED</Badge>
-            )
-          }
-        />
-        <p className="min-w-0 text-[11px] leading-relaxed text-zinc-400">
-          {autoArmed
-            ? "Engine armed — every M1 close is analyzed and confirmed signals place real orders automatically."
-            : autoWhy
-              ? autoWhy.text
-              : "Arm the engine to let it place real orders on confirmed signals."}
-        </p>
-        <div className="mt-3 grid grid-cols-3 gap-2">
-          <Stat label="Signals 30d" value={stats?.total_signals ?? "—"}
-            loading={stats === null} />
-          <Stat
-            label="Win rate"
-            value={winRate != null ? `${(winRate * 100).toFixed(0)}%` : "—"}
-            tone={winRate != null && winRate >= 0.5 ? "up" : winRate != null ? "down" : "default"}
-            loading={stats === null}
-          />
-          <Stat
-            label="Expectancy"
-            value={expectancy != null ? `${expectancy >= 0 ? "+" : ""}${expectancy.toFixed(2)}R` : "—"}
-            tone={expectancy != null && expectancy >= 0 ? "up" : expectancy != null ? "down" : "default"}
-            loading={stats === null}
+      {/* D-058 — the desktop split: the chart takes the WHOLE main
+       *  column (no gutters, no empty space), the intel cards stack in
+       *  the right rail (user directive: "2 পাশে অনেক ফাঁকা জায়গা পরে
+       *  আছে… কোথাও কোনো ফাঁকা থাকতে পারবে না"). Mobile keeps the
+       *  single column. */}
+      <div className="flex min-w-0 flex-col gap-3 xl:flex-row xl:items-start">
+        {/* the chart column — full width of the main area, tall */}
+        <div className="min-w-0 flex-1 xl:sticky xl:top-16">
+          <HomeChartSection
+            symbol={symbol}
+            tf={tf}
+            onTfChange={onTfChange}
+            candles={candles}
+            candlesLoading={candlesLoading}
+            signals={signals}
+            market={market}
+            wsConnected={wsConnected}
+            onDesync={onDesync}
+            token={token}
+            tick={tick}
           />
         </div>
-        <div className="mt-3">
-          <Btn variant="gold" onClick={onOpenAi} className="w-full">
-            Open AI Trading →
-          </Btn>
-        </div>
-      </Card>
 
-      <LatestSignalCard signal={latest} onOpen={() => latest && onOpenSignal(latest.id)} />
+        {/* the intel rail — hero + pulse + AI + signals + account */}
+        <div className="flex w-full min-w-0 flex-col gap-3 xl:w-[340px] 2xl:w-[380px] xl:shrink-0">
+          <PriceHero symbol={symbol} tick={tick} market={market} />
 
-      {/* the user's own trading account (D-044 — isolated practice plane) */}
-      <Card>
-        <SectionTitle
-          title="Your Trading Account"
-          right={
-            tradingAccount?.connected ? (
-              <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400">
-                <Dot tone="green" /> active
-              </span>
-            ) : (
-              <span className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-400">
-                <Dot tone="amber" /> starting…
-              </span>
-            )
-          }
-        />
-        <div className="grid grid-cols-2 gap-2">
-          <Stat
-            label="Balance"
-            value={account?.balance != null ? account.balance.toFixed(2) : "—"}
-            loading={tradingAccount === null}
-            hint={account?.currency ?? "USD"}
-          />
-          <Stat
-            label="Equity"
-            value={account?.equity != null ? account.equity.toFixed(2) : "—"}
-            loading={tradingAccount === null}
-            tone={
-              account?.balance != null && account?.equity != null
-                ? account.equity >= account.balance ? "up" : "down"
-                : "default"
-            }
-          />
-        </div>
-        <p className="mt-2.5 truncate text-[10px] text-zinc-500">
-          {brokerLinked
-            ? `Broker linked · ${broker?.login_masked ?? broker?.server ?? "—"}`
-            : "Practice account · link your broker in Settings"}
-        </p>
-        <div className="mt-3">
-          <Btn variant="gold" onClick={onOpenAi} className="w-full">
-            Trade with AI →
-          </Btn>
-        </div>
-      </Card>
+          {/* D-051 — live per-candle buyer/seller dominance (tick-driven) */}
+          <CandlePulseCard symbol={symbol} />
 
-      {/* feed transparency */}
-      <Card>
-        <SectionTitle title="Market Data" />
-        <div className="flex flex-wrap items-center gap-2 text-[10px] text-zinc-500">
-          <Badge tone={feedProvider?.mt5 || feedProvider?.provider ? "green" : "zinc"}>
-            {feedProvider?.mt5 ? "Institutional feed" : feedProvider?.provider ?? "—"}
-          </Badge>
-          {mt5?.status === "connected" && <Badge tone="green">platform connected</Badge>}
-          {mt5?.status === "reconnecting" && <Badge tone="amber" pulse>reconnecting…</Badge>}
-          {mt5?.status === "disconnected" && <Badge tone="red">disconnected</Badge>}
-          {feedProvider?.spread != null && (
-            <span className="font-mono tabular-nums">spread {feedProvider.spread.toFixed(2)}</span>
-          )}
+          {/* AI auto trading */}
+          <Card>
+            <SectionTitle
+              title="AI Auto-Trading"
+              right={
+                autoArmed ? (
+                  <Badge tone="green" pulse>ARMED</Badge>
+                ) : (
+                  <Badge tone="amber">PAUSED</Badge>
+                )
+              }
+            />
+            <p className="min-w-0 text-[11px] leading-relaxed text-zinc-400">
+              {autoArmed
+                ? "Engine armed — every M1 close is analyzed and confirmed signals place real orders automatically."
+                : autoWhy
+                  ? autoWhy.text
+                  : "Arm the engine to let it place real orders on confirmed signals."}
+            </p>
+            <div className="mt-3 grid grid-cols-3 gap-2">
+              <Stat label="Signals 30d" value={stats?.total_signals ?? "—"}
+                loading={stats === null} />
+              <Stat
+                label="Win rate"
+                value={winRate != null ? `${(winRate * 100).toFixed(0)}%` : "—"}
+                tone={winRate != null && winRate >= 0.5 ? "up" : winRate != null ? "down" : "default"}
+                loading={stats === null}
+              />
+              <Stat
+                label="Expectancy"
+                value={expectancy != null ? `${expectancy >= 0 ? "+" : ""}${expectancy.toFixed(2)}R` : "—"}
+                tone={expectancy != null && expectancy >= 0 ? "up" : expectancy != null ? "down" : "default"}
+                loading={stats === null}
+              />
+            </div>
+            <div className="mt-3">
+              <Btn variant="gold" onClick={onOpenAi} className="w-full">
+                Open AI Trading →
+              </Btn>
+            </div>
+          </Card>
+
+          <LatestSignalCard signal={latest} onOpen={() => latest && onOpenSignal(latest.id)} />
+
+          {/* the user's own trading account (D-044 — isolated practice plane) */}
+          <Card>
+            <SectionTitle
+              title="Your Trading Account"
+              right={
+                tradingAccount?.connected ? (
+                  <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400">
+                    <Dot tone="green" /> active
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-400">
+                    <Dot tone="amber" /> starting…
+                  </span>
+                )
+              }
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <Stat
+                label="Balance"
+                value={account?.balance != null ? account.balance.toFixed(2) : "—"}
+                loading={tradingAccount === null}
+                hint={account?.currency ?? "USD"}
+              />
+              <Stat
+                label="Equity"
+                value={account?.equity != null ? account.equity.toFixed(2) : "—"}
+                loading={tradingAccount === null}
+                tone={
+                  account?.balance != null && account?.equity != null
+                    ? account.equity >= account.balance ? "up" : "down"
+                    : "default"
+                }
+              />
+            </div>
+            <p className="mt-2.5 truncate text-[10px] text-zinc-500">
+              {brokerLinked
+                ? `Broker linked · ${broker?.login_masked ?? broker?.server ?? "—"}`
+                : "Practice account · link your broker in Settings"}
+            </p>
+            <div className="mt-3">
+              <Btn variant="gold" onClick={onOpenAi} className="w-full">
+                Trade with AI →
+              </Btn>
+            </div>
+          </Card>
+
+          {/* feed transparency */}
+          <Card>
+            <SectionTitle title="Market Data" />
+            <div className="flex flex-wrap items-center gap-2 text-[10px] text-zinc-500">
+              <Badge tone={feedProvider?.mt5 || feedProvider?.provider ? "green" : "zinc"}>
+                {feedProvider?.mt5 ? "Institutional feed" : feedProvider?.provider ?? "—"}
+              </Badge>
+              {mt5?.status === "connected" && <Badge tone="green">platform connected</Badge>}
+              {mt5?.status === "reconnecting" && <Badge tone="amber" pulse>reconnecting…</Badge>}
+              {mt5?.status === "disconnected" && <Badge tone="red">disconnected</Badge>}
+              {feedProvider?.spread != null && (
+                <span className="font-mono tabular-nums">spread {feedProvider.spread.toFixed(2)}</span>
+              )}
+            </div>
+          </Card>
         </div>
-      </Card>
+      </div>
     </div>
   );
 }

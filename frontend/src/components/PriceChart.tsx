@@ -1,34 +1,31 @@
 /**
- * PriceChart (D-041/D-042/D-052/D-053) — candlestick chart around the feed store.
+ * PriceChart (D-041/D-042/D-052/D-053/D-058) — candlestick chart around
+ * the feed store.
  *
- * D-053 — the HARD drawing layer + clean-chart contract:
- *  - every mark renders with a near-opaque core line and a soft halo
- *    underlay ("শক্তিশালী / hard") while the STROKE WIDTHS went THIN
- *    (user directive: "দাগ গুলো একটু চিকন");
- *  - faded marks (broken trendlines, tested order blocks) render THIN
- *    and ghosted at ~1/3 opacity ("মোছে যাওয়া অঙ্কনের লেখা চিকন");
- *  - NO text labels on the chart canvas anymore ("FVG/OB/Liquidity…
- *    চার্টের উপরে ছোট ছোট লেখা" — removed): the marks are listed in
- *    the external MARKS legend BELOW the chart, outside the canvas;
- *  - variant="signals" (the Chart tab) draws ONLY the entry-setup box +
- *    ENTRY/SL/TP + signal markers — nothing that hides the signals;
- *  - variant="full" (the Home chart) draws everything.
+ * D-058 (user directive, Bengali) — the SEE-EVERYTHING pass:
+ *  - a PC/desktop layout that fills the whole viewport: the chart card
+ *    owns a compact header (timeframe dropdown LEFT + marks dropdown +
+ *    live price + fullscreen), the marks legend moved from BELOW the
+ *    canvas into a LEFT-side dropdown panel — the canvas grew by both
+ *    rows ("চার্ট এর আকার বাড়বে");
+ *  - CANDLE CLARITY: zone fills dropped to ~7% alpha, halos halved,
+ *    volume ghosted — the candles are the loudest thing on screen
+ *    ("ক্যান্ডেল স্পষ্ট দেখা যায় না");
+ *  - every line THIN and hard (0.7–1px core), every stroke crisp
+ *    ("লাইন গুলো কে আরও চিকন করে স্পষ্ট");
+ *  - NO background boxes behind on-chart text — small words written
+ *    DIRECTLY on the chart with a soft dark shadow for legibility, and
+ *    the font is FIXED px so enlarging the chart never grows the words
+ *    ("লেখার পিছনে বক্স থাকবে না… লেখা গুলো বড় না হয়");
+ *  - deeper professional layer: EMA momentum ribbon, HH/HL/LH/LL swing
+ *    reads, ICT kill-zone session bands, the equilibrium line.
  *
- * D-052 — the professional drawing layer, styled after the reference
- * screenshots the user supplied:
- *  - labeled zone boxes ("SUPPLY ZONE", "DEMAND ZONE", "BULLISH ORDER
- *    BLOCK", "FAIR VALUE GAP") drawn from origin to the right edge;
- *  - channels with a dashed median line and a full-word label;
- *  - trend lines labeled "Bullish / Bearish Trend Line" + projection;
- *  - liquidity sweep lines ("Liquidity Sweep High / Low");
- *  - BOS / CHoCH chips with the full words, direction arrows;
- *  - Support / Resistance levels with full-word labels;
- *  - the entry-setup box with ENTRY / STOP LOSS / TAKE PROFIT lines.
- *
- * Every timeframe picks its OWN drawing set from analysis.drawings_by_tf
- * (recent 80–150 candles of that TF) so switching timeframes never wipes
- * the overlay. The engine's ~15Hz display fill keeps the last candle
- * moving between broker ticks.
+ * D-053 — faded marks (broken trendlines, tested order blocks) render
+ *  THIN and ghosted at ~1/3 opacity; variant="signals" (the Chart tab)
+ *  draws ONLY the entry-setup box + ENTRY/SL/TP + signal markers.
+ * D-052 — per-TF drawing sets from analysis.drawings_by_tf survive TF
+ *  switches; the engine's ~15Hz display fill keeps the last candle
+ *  moving between broker ticks.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -43,6 +40,7 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { feed } from "../state/feed";
+import { TIMEFRAMES } from "../types";
 import type {
   AnalysisResponse, Candle, ChartDrawing, DrawingTone, Signal, Timeframe,
 } from "../types";
@@ -53,33 +51,38 @@ const GOLD = "#d4af37";
 const EASE = 0.22;
 const EPSILON = 1e-9;
 
-/** Drawing-strength contract (D-053):
- *  - ACTIVE core line: thin (0.8–1.2px) but ~95% opaque, with a 3px halo
- *    underlay — reads "hard" without fat strokes;
- *  - FADED (broken / tested): 0.7px at ~1/3 alpha, no halo — the mark is
- *    visibly dissolving (মোছে যাওয়া) and its legend text renders THIN. */
-const FADED_ALPHA = 0.32;
-const FADED_WIDTH = 0.7;
+/** D-058 — fixed on-chart text metrics. The font is CONSTANT regardless
+ *  of chart size (zoom/enlarge never grows the words), tiny by design
+ *  ("ছোট করে লিখে দিবেন") and shadowed instead of boxed. */
+const FONT_FAMILY = "ui-sans-serif, system-ui, sans-serif";
+const TEXT_SHADOW = "rgba(0,0,0,0.9)";
 
-/** D-053 — "hard" tone palette: near-opaque core + soft halo underlay. */
+/** Drawing-strength contract (D-053/D-058):
+ *  - ACTIVE core line: THIN (0.7–1px) ~95% opaque, with a whisper halo
+ *    underlay — reads "hard" without fat strokes;
+ *  - FADED (broken / tested): 0.6px at ~1/3 alpha, no halo. */
+const FADED_ALPHA = 0.32;
+const FADED_WIDTH = 0.6;
+
+/** D-058 — the candle-clarity palette: fills at whisper alpha (the
+ *  candles must be the loudest thing on the chart), thin cores. */
 const TONE: Record<DrawingTone, { line: string; halo: string; text: string; fill: string }> = {
-  bull: { line: "rgba(52,211,153,0.95)", halo: "rgba(52,211,153,0.18)", text: "#6ee7b7", fill: "rgba(52,211,153,0.18)" },
-  bear: { line: "rgba(248,113,113,0.95)", halo: "rgba(248,113,113,0.18)", text: "#fca5a5", fill: "rgba(248,113,113,0.18)" },
-  gold: { line: "rgba(212,175,55,0.95)", halo: "rgba(212,175,55,0.18)", text: "#e5c76a", fill: "rgba(212,175,55,0.18)" },
-  violet: { line: "rgba(167,139,250,0.95)", halo: "rgba(167,139,250,0.18)", text: "#c4b5fd", fill: "rgba(139,92,246,0.18)" },
-  neutral: { line: "rgba(154,160,170,0.85)", halo: "rgba(154,160,170,0.10)", text: "#9aa0aa", fill: "rgba(154,160,170,0.10)" },
+  bull: { line: "rgba(52,211,153,0.92)", halo: "rgba(52,211,153,0.10)", text: "#5eead4", fill: "rgba(52,211,153,0.045)" },
+  bear: { line: "rgba(248,113,113,0.92)", halo: "rgba(248,113,113,0.10)", text: "#fda4a4", fill: "rgba(248,113,113,0.045)" },
+  gold: { line: "rgba(212,175,55,0.92)", halo: "rgba(212,175,55,0.10)", text: "#e7cd6f", fill: "rgba(212,175,55,0.045)" },
+  violet: { line: "rgba(167,139,250,0.92)", halo: "rgba(167,139,250,0.10)", text: "#c7b8fd", fill: "rgba(139,92,246,0.04)" },
+  neutral: { line: "rgba(154,160,170,0.75)", halo: "rgba(154,160,170,0.06)", text: "#a6adb8", fill: "rgba(154,160,170,0.04)" },
 };
 
-/** D-052 — zone box palette; D-053 — hardened (fills 0.18–0.22, borders
- *  0.75–0.9) + halo underlay. Faded zones scale everything by
- *  FADED_ALPHA at draw time. */
+/** D-058 — zone boxes at whisper fills (candles visible THROUGH them),
+ *  0.7px borders. Faded zones scale everything by FADED_ALPHA. */
 const ZONE_STYLE: Record<string, { fill: string; border: string; halo: string; text: string }> = {
-  supply: { fill: "rgba(239,83,80,0.22)", border: "rgba(239,83,80,0.9)", halo: "rgba(239,83,80,0.20)", text: "#fca5a5" },
-  demand: { fill: "rgba(38,166,154,0.22)", border: "rgba(38,166,154,0.9)", halo: "rgba(38,166,154,0.20)", text: "#6ee7b7" },
-  ob_bull: { fill: "rgba(59,130,246,0.20)", border: "rgba(59,130,246,0.85)", halo: "rgba(59,130,246,0.18)", text: "#93c5fd" },
-  ob_bear: { fill: "rgba(217,119,6,0.20)", border: "rgba(217,119,6,0.85)", halo: "rgba(217,119,6,0.18)", text: "#fcd34d" },
-  fvg_bull: { fill: "rgba(139,92,246,0.20)", border: "rgba(139,92,246,0.8)", halo: "rgba(139,92,246,0.16)", text: "#c4b5fd" },
-  fvg_bear: { fill: "rgba(236,72,153,0.18)", border: "rgba(236,72,153,0.75)", halo: "rgba(236,72,153,0.14)", text: "#f9a8d4" },
+  supply: { fill: "rgba(239,83,80,0.07)", border: "rgba(239,83,80,0.62)", halo: "rgba(239,83,80,0.07)", text: "#fda4a4" },
+  demand: { fill: "rgba(38,166,154,0.07)", border: "rgba(38,166,154,0.62)", halo: "rgba(38,166,154,0.07)", text: "#5eead4" },
+  ob_bull: { fill: "rgba(59,130,246,0.07)", border: "rgba(59,130,246,0.58)", halo: "rgba(59,130,246,0.07)", text: "#93c5fd" },
+  ob_bear: { fill: "rgba(217,119,6,0.07)", border: "rgba(217,119,6,0.58)", halo: "rgba(217,119,6,0.07)", text: "#fcd34d" },
+  fvg_bull: { fill: "rgba(139,92,246,0.07)", border: "rgba(139,92,246,0.55)", halo: "rgba(139,92,246,0.07)", text: "#c7b8fd" },
+  fvg_bear: { fill: "rgba(236,72,153,0.06)", border: "rgba(236,72,153,0.5)", halo: "rgba(236,72,153,0.06)", text: "#f9a8d4" },
 };
 
 /** D-053 — compact legend names for the external MARKS panel. */
@@ -109,7 +112,7 @@ function isFaded(d: { state?: "active" | "faded"; broken?: boolean; label?: stri
   return Boolean(d.broken) || Boolean(d.label?.includes("· tested"));
 }
 
-type LayerKey = "setup" | "zones" | "levels" | "structure" | "fib" | "whales";
+type LayerKey = "setup" | "zones" | "levels" | "structure" | "fib" | "whales" | "momentum";
 
 /** One row of the external MARKS legend (outside the chart canvas). */
 export interface LegendMark {
@@ -212,6 +215,31 @@ function buildLegend(drawings: ChartDrawing[], tf: string): LegendMark[] {
           faded: false, layer: "setup",
         });
         break;
+      // D-058 — the deep-professional layers join the legend
+      case "ema":
+        marks.push({
+          key, swatch: TONE[d.tone].text,
+          short: "EMA 9/21/50",
+          detail: d.tone === "bull" ? "bull stack" : "bear stack",
+          text: d.label, faded: false, layer: "momentum",
+        });
+        break;
+      case "swing":
+        marks.push({
+          key, swatch: TONE[d.tone].text,
+          short: d.tag,
+          detail: d.price.toFixed(2),
+          text: d.label, faded: false, layer: "structure",
+        });
+        break;
+      case "session":
+        marks.push({
+          key, swatch: d.tone === "gold" ? TONE.gold.text : TONE.neutral.text,
+          short: d.name.replace(" Kill Zone", " KZ").toUpperCase(),
+          detail: "",
+          text: d.label, faded: false, layer: "structure",
+        });
+        break;
     }
   });
   return marks;
@@ -242,6 +270,11 @@ interface PriceChartProps {
    *  Chart tab): ONLY the entry-setup drawing + signal markers — the
    *  analysis layers must never bury the signals (user directive). */
   variant?: "full" | "signals";
+  /** D-058 — timeframe dropdown in the chart header (user directive:
+   *  "টাইম ফ্রেম গুলো চার্ট এর হেডার এরিয়াতে লেফট সাইডে ড্রপ ডাউন"). */
+  onTfChange?: (tf: Timeframe) => void;
+  /** D-058 — live quote shown in the chart header (right side). */
+  headerQuote?: number | null;
 }
 
 /** strictly-ascending, deduped, finite-only bars (D-035 hardening). */
@@ -278,6 +311,8 @@ export default function PriceChart({
   onDesync,
   analysis,
   variant = "full",
+  onTfChange,
+  headerQuote,
 }: PriceChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
@@ -291,18 +326,84 @@ export default function PriceChart({
   const [ready, setReady] = useState(false);
   const isSignals = variant === "signals";
   // D-052 — simplified overlay layer toggles (full words, six chips);
-  // D-053 — they live OUTSIDE the chart, in the MARKS legend header
-  // (user directive: nothing small written on top of the canvas).
+  // D-058 — seventh layer "momentum" (EMA ribbon); all toggles live in
+  // the LEFT-side MARKS dropdown (user directive) — zero canvas cost.
   const [layers, setLayers] = useState<Record<LayerKey, boolean>>({
     setup: true, // entry-setup boxes (ENTRY / SL / TP)
     zones: true, // supply/demand/OB/FVG zone boxes
     levels: true, // support/resistance/liquidity lines
-    structure: true, // trend lines + channels + BOS/CHoCH + sweeps + arrows
+    structure: true, // trend lines + channels + BOS/CHoCH + sweeps + swings
     fib: true, // fibonacci retracement + OTE band
     whales: true, // whale/institutional event markers
+    momentum: true, // D-058 — EMA 9/21/50 momentum ribbon
   });
   const layersRef = useRef(layers);
   layersRef.current = layers;
+
+  /* ------------------------------------- D-058 chart header dropdowns */
+  const [tfOpen, setTfOpen] = useState(false);
+  const [marksOpen, setMarksOpen] = useState(false);
+
+  /* -------------------------------------------- D-058 fullscreen (in-chart) */
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const [overlayFs, setOverlayFs] = useState(false); // CSS fallback (iOS)
+  const [nativeFs, setNativeFs] = useState(false);
+
+  useEffect(() => {
+    const onFs = () =>
+      setNativeFs(document.fullscreenElement === wrapRef.current);
+    document.addEventListener("fullscreenchange", onFs);
+    return () => document.removeEventListener("fullscreenchange", onFs);
+  }, []);
+
+  // ESC + scroll-lock while the overlay fallback is up
+  useEffect(() => {
+    if (!overlayFs) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOverlayFs(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = prev;
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [overlayFs]);
+
+  const isFs = overlayFs || nativeFs;
+
+  const enterFs = async () => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const req = (
+      el as HTMLElement & {
+        requestFullscreen?: (o?: FullscreenOptions) => Promise<void>;
+      }
+    ).requestFullscreen;
+    if (typeof req === "function") {
+      try {
+        await req.call(el);
+        return;
+      } catch (err) {
+        const name = (err as { name?: string })?.name ?? "";
+        if (name === "AbortError") return; // user cancelled — stay put
+        /* fall through to the CSS-overlay fallback */
+      }
+    }
+    setOverlayFs(true);
+  };
+
+  const exitFs = async () => {
+    if (document.fullscreenElement === wrapRef.current) {
+      try {
+        await document.exitFullscreen();
+      } catch {
+        /* ignore */
+      }
+    }
+    setOverlayFs(false);
+  };
 
   /* ------------------------------------------------------ create once */
   useEffect(() => {
@@ -311,11 +412,11 @@ export default function PriceChart({
       layout: {
         background: { type: ColorType.Solid, color: "#0b0d12" },
         textColor: "#9aa0aa",
-        fontFamily: "ui-sans-serif, system-ui, sans-serif",
+        fontFamily: FONT_FAMILY,
       },
       grid: {
-        vertLines: { color: "#1a1d26" },
-        horzLines: { color: "#1a1d26" },
+        vertLines: { color: "#141720" },
+        horzLines: { color: "#141720" },
       },
       crosshair: {
         mode: CrosshairMode.Normal,
@@ -327,11 +428,11 @@ export default function PriceChart({
         borderColor: "#262b36",
         timeVisible: true,
         secondsVisible: false,
-        // D-052 — user directive: the drawings must be VISIBLE within the
-        // recent 80-150 candles ("এই ড্রয়িং গুলো রিসেন্ট 80 থেকে 150
-        // ক্যান্ডেল এ দেখলেই হবে") — a denser default zoom keeps ~110
-        // bars (and their zone boxes / levels / structure marks) on screen.
-        barSpacing: 4,
+        // D-052 — drawings visible within the recent 80–150 candles.
+        // D-058 — barSpacing 4 -> 6.5: fatter candles, the loudest thing
+        // on screen ("ক্যান্ডেল গুলো আরও স্পষ্ট দেখা যায়") — ~85 bars
+        // on screen keeps every recent drawing anchored in view.
+        barSpacing: 6.5,
         rightOffset: 8,
       },
       autoSize: true,
@@ -341,16 +442,18 @@ export default function PriceChart({
       downColor: DOWN,
       borderUpColor: UP,
       borderDownColor: DOWN,
-      wickUpColor: UP,
-      wickDownColor: DOWN,
+      wickUpColor: "#2fbcad",
+      wickDownColor: "#f66a64",
       priceLineColor: GOLD,
     });
     const volume = chart.addHistogramSeries({
       priceScaleId: "",
-      color: "#3d4350",
+      // D-058 — ghosted volume: a hint of participation, never a wall
+      // of color under the candles
+      color: "rgba(61,67,80,0.35)",
       priceFormat: { type: "volume" },
     });
-    chart.priceScale("").applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
+    chart.priceScale("").applyOptions({ scaleMargins: { top: 0.88, bottom: 0 } });
 
     const pushBar = (bar: Candle) => {
       series.update({
@@ -363,7 +466,7 @@ export default function PriceChart({
       volume.update({
         time: bar.t as UTCTimestamp,
         value: bar.v,
-        color: bar.c >= bar.o ? "#1f5f57" : "#6b3232",
+        color: bar.c >= bar.o ? "rgba(38,166,154,0.25)" : "rgba(239,83,80,0.25)",
       });
     };
 
@@ -453,11 +556,11 @@ export default function PriceChart({
         clean.map((c) => ({
           time: c.t as UTCTimestamp,
           value: c.v,
-          color: c.c >= c.o ? "#1f5f57" : "#6b3232",
+          color: c.c >= c.o ? "rgba(38,166,154,0.25)" : "rgba(239,83,80,0.25)",
         })),
       );
       chartRef.current?.timeScale().setVisibleLogicalRange(
-        { from: Math.max(0, clean.length - 110), to: clean.length + 6 },
+        { from: Math.max(0, clean.length - 95), to: clean.length + 5 },
       );
     } catch (err) {
       console.warn("chart setData failed — dropping this batch", err);
@@ -490,7 +593,7 @@ export default function PriceChart({
           volumeRef.current?.update({
             time: bar.t as UTCTimestamp,
             value: bar.v,
-            color: bar.c >= bar.o ? "#1f5f57" : "#6b3232",
+            color: bar.c >= bar.o ? "rgba(38,166,154,0.25)" : "rgba(239,83,80,0.25)",
           });
         } catch (err) {
           console.warn("chart update rejected — requesting resync", err);
@@ -621,34 +724,36 @@ export default function PriceChart({
       return c == null ? null : c;
     };
 
-    /* -------------------------------------- D-053 hard-stroke helpers */
-    // On-chart TEXT is gone (user directive: the small "FVG / OB /
-    // LIQUIDITY…" writings moved OUT of the chart, into the MARKS
-    // legend below the canvas). Only the entry-setup tags remain —
-    // they ARE the signal contract (ENTRY / STOP LOSS / TAKE PROFIT).
+    /* -------------------------------------- D-058 no-box text helpers */
+    // On-chart text: written DIRECTLY on the canvas, tiny and FIXED-size
+    // (never grows with the chart), with a soft dark shadow under the
+    // glyphs instead of a background box (user directive: "লেখার পিছনে
+    // কোনও প্রকার বক্স বা কালার থাকবে না… সরাসরি চার্ট এর উপরে ছোট করে
+    // লিখে দিবেন").
     const tag = (
-      text: string, x: number, y: number, tone: DrawingTone, size = 10,
+      text: string, x: number, y: number, tone: DrawingTone, size = 9,
     ) => {
-      ctx.font = `700 ${size}px ui-sans-serif, system-ui, sans-serif`;
-      const tw = ctx.measureText(text).width;
-      ctx.fillStyle = "rgba(11,13,18,0.85)";
-      ctx.fillRect(x, y - size + 1, tw + 8, size + 4);
+      ctx.font = `700 ${size}px ${FONT_FAMILY}`;
+      ctx.shadowColor = TEXT_SHADOW;
+      ctx.shadowBlur = 3;
       ctx.fillStyle = TONE[tone].text;
-      ctx.fillText(text, x + 4, y);
+      ctx.fillText(text, x, y);
+      ctx.shadowBlur = 0;
     };
     const rightTag = (text: string, y: number, tone: DrawingTone) => {
-      ctx.font = "700 9px ui-sans-serif, system-ui, sans-serif";
+      ctx.font = `700 9px ${FONT_FAMILY}`;
       const tw = ctx.measureText(text).width;
-      tag(text, rightEdge - tw - 14, y - 3, tone, 9);
+      tag(text, rightEdge - tw - 6, y - 3, tone, 9);
     };
-    /** HARD stroke: a soft halo pass under a thin near-opaque core —
-     * the "শক্তিশালী / hard-coded" look without fat lines. */
+    /** HARD stroke: a whisper halo pass under a thin near-opaque core —
+     * the "hard" look without fat lines (D-058: halo width+1.5, was
+     * +2.6 — thinner, the candles stay loud). */
     const hardSeg = (
       x1: number, y1: number, x2: number, y2: number,
       color: string, halo: string, width: number, dash: number[],
     ) => {
       ctx.strokeStyle = halo;
-      ctx.lineWidth = width + 2.6;
+      ctx.lineWidth = width + 1.5;
       ctx.setLineDash([]);
       ctx.beginPath();
       ctx.moveTo(x1, y1);
@@ -737,6 +842,100 @@ export default function PriceChart({
       ctx.fill();
     };
 
+    /* ------------------------------ D-058 kill-zone session bands */
+    // The WHEN layer — whisper-quiet vertical shading UNDER everything
+    // else (Asia / London / New York), with a tiny fixed-size word at
+    // the top of each band. Drawn first so no mark ever hides behind it.
+    if (L.structure && !isSignals) {
+      for (const d of drawings) {
+        if (d.kind !== "session") continue;
+        const x1 = xOf(d.t0);
+        const x2 = xOf(d.t1);
+        if (x1 == null || x2 == null) continue;
+        if (x2 <= 0 || x1 > rightEdge) continue;
+        const bx = Math.max(0, x1);
+        const bw = Math.min(rightEdge, x2) - bx;
+        if (bw <= 1) continue;
+        ctx.fillStyle = d.tone === "gold"
+          ? "rgba(212,175,55,0.045)"
+          : "rgba(120,130,150,0.035)";
+        ctx.fillRect(bx, 0, bw, h);
+        // the band's left edge — a 0.6px whisper line
+        ctx.strokeStyle = d.tone === "gold"
+          ? "rgba(212,175,55,0.22)"
+          : "rgba(120,130,150,0.16)";
+        ctx.lineWidth = 0.6;
+        ctx.beginPath();
+        ctx.moveTo(Math.round(bx) + 0.5, 0);
+        ctx.lineTo(Math.round(bx) + 0.5, h);
+        ctx.stroke();
+        // tiny fixed-size word at the top of the band, no box
+        ctx.save();
+        ctx.font = `700 8px ${FONT_FAMILY}`;
+        ctx.shadowColor = TEXT_SHADOW;
+        ctx.shadowBlur = 3;
+        ctx.fillStyle = d.tone === "gold" ? TONE.gold.text : TONE.neutral.text;
+        const word = d.name.replace(" Kill Zone", "").toUpperCase();
+        ctx.fillText(word, bx + 3, 12);
+        ctx.restore();
+      }
+    }
+
+    /* ------------------------------------ D-058 EMA momentum ribbon */
+    // EMA 9/21/50 as 0.75px polylines — the momentum context under
+    // price. Thin by contract: the ribbon informs, never shouts.
+    if (L.momentum && !isSignals) {
+      for (const d of drawings) {
+        if (d.kind !== "ema") continue;
+        for (const line of d.lines) {
+          const pts = line.points
+            .map((p) => ({ x: xOf(p.t), y: yOf(p.p) }))
+            .filter((p): p is { x: number; y: number } =>
+              p.x != null && p.y != null && p.x >= -2 && p.x <= rightEdge + 2);
+          if (pts.length < 2) continue;
+          const width = line.period === 9 ? 0.85 : 0.7;
+          ctx.strokeStyle = TONE[line.tone].line;
+          ctx.lineWidth = width;
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+          ctx.stroke();
+        }
+      }
+    }
+
+    /* ------------------------------------- D-058 HH/HL/LH/LL swing reads */
+    // The structure map a price-action trader keeps in their head: a
+    // 2px tick at the swing + a tiny fixed-size word, no boxes.
+    if (L.structure && !isSignals) {
+      for (const d of drawings) {
+        if (d.kind !== "swing") continue;
+        const x = d.t ? xOf(d.t) : null;
+        const y = yOf(d.price);
+        if (x == null || y == null || x < 0 || x > rightEdge) continue;
+        const above = d.side === "low";
+        // small tick at the swing point
+        ctx.strokeStyle = TONE[d.tone].line;
+        ctx.lineWidth = 0.8;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x, y + (above ? -7 : 7));
+        ctx.stroke();
+        ctx.fillStyle = TONE[d.tone].line;
+        ctx.beginPath();
+        ctx.arc(x, y, 1.4, 0, Math.PI * 2);
+        ctx.fill();
+        // the tiny word — direct, shadowed, fixed size
+        ctx.save();
+        ctx.font = `700 8px ${FONT_FAMILY}`;
+        ctx.shadowColor = TEXT_SHADOW;
+        ctx.shadowBlur = 3;
+        ctx.fillStyle = TONE[d.tone].text;
+        ctx.fillText(d.tag, x - 6, y + (above ? -11 : 19));
+        ctx.restore();
+      }
+    }
+
     /* -------------------------------------------- zone boxes (D-053) */
     if (L.zones) {
       for (const d of drawings) {
@@ -753,10 +952,10 @@ export default function PriceChart({
         if (faded) ctx.globalAlpha = FADED_ALPHA;
         ctx.fillStyle = style.fill;
         ctx.fillRect(x1, Math.min(y1, y2), rightEdge - x1, Math.abs(y2 - y1));
-        // halo underlay — the "hard" border pass (active marks only)
+        // halo underlay — the thin "hard" border pass (active only)
         if (!faded) {
           ctx.strokeStyle = style.halo;
-          ctx.lineWidth = 3.4;
+          ctx.lineWidth = 1.4;
           ctx.setLineDash([]);
           ctx.strokeRect(
             x1 - 0.5, Math.min(y1, y2) - 0.5,
@@ -764,15 +963,26 @@ export default function PriceChart({
           );
         }
         ctx.strokeStyle = style.border;
-        ctx.lineWidth = faded ? FADED_WIDTH : 1;
+        ctx.lineWidth = faded ? FADED_WIDTH : 0.7;
         ctx.setLineDash([]);
         ctx.strokeRect(
           x1 + 0.5, Math.min(y1, y2) + 0.5,
           rightEdge - x1 - 1, Math.abs(y2 - y1) - 1,
         );
         ctx.globalAlpha = 1;
-        // D-053 — NO text on the canvas: the full-word label lives in
-        // the external MARKS legend below the chart (user directive).
+        // the compact zone word — small, direct, no box (D-058: the
+        // user asked for the writings ON the chart, just unboxed)
+        if (!faded && Math.abs(y2 - y1) > 14) {
+          ctx.save();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = style.text;
+          const word = (ZONE_SHORT[d.side] ?? "ZONE") +
+            (d.source_tf && d.source_tf !== tf ? ` · ${d.source_tf}` : "");
+          ctx.fillText(word, Math.max(x1, 0) + 4, Math.min(y1, y2) + 11);
+          ctx.restore();
+        }
       }
     }
 
@@ -975,15 +1185,15 @@ export default function PriceChart({
       const yS = yOf(setup.sl);
       const yT = yOf(setup.tp);
       if (yZhi != null && yZlo != null) {
-        // entry zone box — D-053 halo underlay + thin hard border
+        // entry zone box — D-058 whisper fill + thin hard border
         ctx.fillStyle = TONE[tone].fill;
         ctx.fillRect(x0, Math.min(yZhi, yZlo), rightEdge - x0, Math.abs(yZlo - yZhi));
         ctx.strokeStyle = TONE[tone].halo;
-        ctx.lineWidth = 3.4;
+        ctx.lineWidth = 1.4;
         ctx.setLineDash([]);
         ctx.strokeRect(x0 - 0.5, Math.min(yZhi, yZlo) - 0.5, rightEdge - x0 + 1, Math.abs(yZlo - yZhi) + 1);
         ctx.strokeStyle = TONE[tone].line;
-        ctx.lineWidth = 1.1;
+        ctx.lineWidth = 0.9;
         ctx.strokeRect(x0 + 0.5, Math.min(yZhi, yZlo) + 0.5, rightEdge - x0 - 1, Math.abs(yZlo - yZhi) - 1);
         tag(
           `${setup.dir} SETUP${setup.status === "triggered" ? " · ENTRY TAKEN" : " · FORMING"}`,
@@ -1015,44 +1225,38 @@ export default function PriceChart({
       line(yE, "rgba(212,175,55,0.95)", TONE.gold.halo, [], `ENTRY ${setup.entry}`, x0);
       line(yS, "rgba(248,113,113,0.9)", TONE.bear.halo, [5, 4], `STOP LOSS ${setup.sl}`, x0);
       line(yT, "rgba(52,211,153,0.9)", TONE.bull.halo, [5, 4], `TAKE PROFIT ${setup.tp} · RR ${setup.rr}`, x0);
-      // the note card (what a trader writes next to the setup)
+      // D-058 — the setup words: written DIRECTLY on the chart, tiny,
+      // fixed-size, no card behind them (user directive: "লেখার পিছনে
+      // কোনও প্রকার বক্স বা কালার থাকবে না")
       const title = `${isBuy ? "▲" : "▼"} ${setup.dir} SETUP · ${
         setup.status === "triggered" ? "ENTRY TAKEN" : "FORMING"
       } · RR ${setup.rr}`;
-      const factors = setup.factors.slice(0, 5).join(" · ");
-      ctx.font = "700 10px ui-sans-serif, system-ui, sans-serif";
-      const wT = ctx.measureText(title).width;
-      ctx.font = "500 9px ui-sans-serif, system-ui, sans-serif";
-      const wF = ctx.measureText(factors).width;
-      const cardW = Math.min(Math.max(wT, wF) + 16, rightEdge - x0 - 8);
-      const cardY = Math.max(
-        10,
-        Math.min((yZhi ?? h / 2) - 34, h - 58),
+      const factors = setup.factors.slice(0, 4).join(" · ");
+      const textX = Math.max(8, x0 + 6);
+      const textY = Math.max(
+        24,
+        Math.min((yZhi ?? h / 2) - 10, h - 46),
       );
-      const cardX = Math.max(4, rightEdge - cardW - 10);
-      ctx.fillStyle = "rgba(11,13,18,0.88)";
-      ctx.strokeStyle = setup.status === "triggered" ? TONE[tone].line : "rgba(212,175,55,0.5)";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(cardX, cardY, cardW, 40, 6);
-      ctx.fill();
-      ctx.stroke();
-      ctx.font = "700 10px ui-sans-serif, system-ui, sans-serif";
-      ctx.fillStyle = setup.status === "triggered" ? TONE[tone].text : "#e5c76a";
-      ctx.fillText(title, cardX + 8, cardY + 14);
-      ctx.font = "500 9px ui-sans-serif, system-ui, sans-serif";
+      ctx.save();
+      ctx.font = `700 9px ${FONT_FAMILY}`;
+      ctx.shadowColor = TEXT_SHADOW;
+      ctx.shadowBlur = 3;
+      ctx.fillStyle = setup.status === "triggered" ? TONE[tone].text : "#e7cd6f";
+      ctx.fillText(title, textX, textY);
+      ctx.font = `500 8px ${FONT_FAMILY}`;
       ctx.fillStyle = "#b7bcc6";
       ctx.fillText(
-        factors.length > 70 ? factors.slice(0, 68) + "…" : factors,
-        cardX + 8,
-        cardY + 28,
+        factors.length > 64 ? factors.slice(0, 62) + "…" : factors,
+        textX,
+        textY + 12,
       );
-      ctx.fillStyle = "#8b91a0";
+      ctx.fillStyle = "#9aa0aa";
       ctx.fillText(
-        setup.note.length > 74 ? setup.note.slice(0, 72) + "…" : setup.note,
-        cardX + 8,
-        cardY + 38,
+        setup.note.length > 70 ? setup.note.slice(0, 68) + "…" : setup.note,
+        textX,
+        textY + 23,
       );
+      ctx.restore();
     }
 
     /* --------------------------------- D-043 active signal entry/SL/TP lines */
@@ -1064,20 +1268,21 @@ export default function PriceChart({
         const y = yOf(p);
         if (y == null || y < 0 || y > h) return;
         ctx.strokeStyle = color;
-        ctx.lineWidth = 0.7;
+        ctx.lineWidth = 0.6;
         ctx.setLineDash([2, 4]);
         ctx.beginPath();
         ctx.moveTo(0, Math.round(y) + 0.5);
         ctx.lineTo(rightEdge, Math.round(y) + 0.5);
         ctx.stroke();
         ctx.setLineDash([]);
-        // D-053 — subtle THIN label (secondary info, never the star)
-        ctx.font = "400 9px ui-sans-serif, system-ui, sans-serif";
-        const tw = ctx.measureText(label).width;
-        ctx.fillStyle = "rgba(11,13,18,0.8)";
-        ctx.fillRect(6, y - 11, tw + 6, 13);
-        ctx.fillStyle = "rgba(154,160,170,0.75)";
-        ctx.fillText(label, 9, y - 2);
+        // D-058 — subtle THIN direct label (no box, shadowed)
+        ctx.save();
+        ctx.font = `400 8px ${FONT_FAMILY}`;
+        ctx.shadowColor = TEXT_SHADOW;
+        ctx.shadowBlur = 2;
+        ctx.fillStyle = "rgba(154,160,170,0.8)";
+        ctx.fillText(label, 6, y - 3);
+        ctx.restore();
       };
       line(sig.entry, "rgba(212,175,55,0.6)", `${sig.direction} ENTRY`);
       line(sig.sl, "rgba(248,113,113,0.45)", `${sig.direction} SL`);
@@ -1155,12 +1360,14 @@ export default function PriceChart({
     { key: "zones", label: "Zones" },
     { key: "levels", label: "Levels" },
     { key: "structure", label: "Structure" },
+    { key: "momentum", label: "Momentum" },
     { key: "fib", label: "Fibonacci" },
     { key: "whales", label: "Whales" },
   ];
-  // D-053 — the external MARKS legend lives BELOW the canvas (outside
-  // the chart): the on-chart small writings are gone, the words + prices
-  // live here instead (user directive).
+  // D-058 — the MARKS legend lives in a LEFT-side dropdown panel that
+  // overlays the chart only while open (user directive: "বটম এরিয়াতে যে
+  // marks box টি আছে সেটিও লেফট সাইডে ড্রপ ডাউন বাটনে… চার্ট এর আকার
+  // বাড়বে") — closed, it costs ZERO canvas height.
   const legendMarks = useMemo(
     () => (isSignals ? [] : buildLegend(allDrawings, tf)),
     [isSignals, allDrawings, tf],
@@ -1170,28 +1377,200 @@ export default function PriceChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [legendMarks, layers],
   );
+  // close the dropdowns on any outside pointer press
+  useEffect(() => {
+    if (!tfOpen && !marksOpen) return;
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t?.closest?.("[data-chart-menu]")) return;
+      setTfOpen(false);
+      setMarksOpen(false);
+    };
+    window.addEventListener("pointerdown", onDown);
+    return () => window.removeEventListener("pointerdown", onDown);
+  }, [tfOpen, marksOpen]);
+
+  // D-058 — compact status chip sized for the 36px header row
   const chip =
     market === "open" ? (
-      <span className="flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-semibold tracking-wide text-emerald-300 backdrop-blur">
+      <span className="flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[9px] font-bold tracking-wide text-emerald-300">
         <span className="relative flex h-1.5 w-1.5">
           <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
           <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
         </span>
-        LIVE · INSTITUTIONAL FEED
+        LIVE
       </span>
     ) : market === "closed" ? (
-      <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[10px] font-semibold tracking-wide text-amber-300 backdrop-blur">
-        MARKET CLOSED
+      <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[9px] font-bold tracking-wide text-amber-300">
+        CLOSED
       </span>
     ) : market === "unavailable" ? (
-      <span className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] font-semibold tracking-wide text-red-300 backdrop-blur">
-        FEED OFFLINE
+      <span className="rounded-full border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-[9px] font-bold tracking-wide text-red-300">
+        OFFLINE
       </span>
     ) : null;
 
   return (
-    <div className="flex h-full min-h-0 w-full flex-col overflow-hidden rounded-2xl border border-zinc-800/80 bg-[#0b0d12]">
-      {/* chart area (the canvas proper — everything below is OUTSIDE) */}
+    <div
+      ref={wrapRef}
+      className={`flex h-full min-h-0 w-full flex-col overflow-hidden rounded-2xl border border-zinc-800/80 bg-[#0b0d12] ${
+        isFs ? "fixed inset-0 z-[130] bg-zinc-950 p-1 sm:p-2" : ""
+      }`}
+    >
+      {/* D-058 — the chart's OWN compact header: timeframe dropdown LEFT
+       *  + marks dropdown + live quote + status + fullscreen. One 36px
+       *  row replaces the two fat rows (TF pills + marks legend) that
+       *  used to eat the chart (user directive). */}
+      <div className="relative z-20 flex h-9 shrink-0 items-center gap-1.5 border-b border-zinc-800/60 bg-zinc-950/80 px-2">
+        {/* timeframe dropdown — LEFT side of the chart header */}
+        {onTfChange && (
+          <div data-chart-menu className="relative">
+            <button
+              type="button"
+              onClick={() => { setTfOpen((v) => !v); setMarksOpen(false); }}
+              className="flex items-center gap-1 rounded-lg border border-gold/50 bg-gold/15 px-2 py-1 font-mono text-[11px] font-bold text-gold"
+              aria-label="Select timeframe"
+            >
+              {tf}
+              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6">
+                <path d="m6 9 6 6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            {tfOpen && (
+              <div className="absolute left-0 top-8 z-30 w-36 rounded-xl border border-zinc-700 bg-zinc-950/97 p-1 shadow-2xl backdrop-blur">
+                <div className="grid grid-cols-3 gap-1">
+                  {TIMEFRAMES.map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => { onTfChange(t); setTfOpen(false); }}
+                      className={`rounded-md px-1.5 py-1.5 font-mono text-[11px] font-bold transition-colors ${
+                        t === tf
+                          ? "bg-gold/20 text-gold"
+                          : "text-zinc-400 hover:bg-zinc-800/70 hover:text-zinc-200"
+                      }`}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* marks dropdown — the drawing legend, LEFT-anchored overlay */}
+        {!isSignals && (
+          <div data-chart-menu className="relative">
+            <button
+              type="button"
+              onClick={() => { setMarksOpen((v) => !v); setTfOpen(false); }}
+              className="flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-900/80 px-2 py-1 text-[10px] font-bold text-zinc-300 transition-colors hover:border-gold/40 hover:text-gold"
+              aria-label="Toggle marks legend"
+            >
+              Marks
+              <span className="font-mono text-[9px] tabular-nums text-zinc-500">
+                {visibleLegendMarks.length}
+              </span>
+              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6">
+                <path d="m6 9 6 6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            {marksOpen && (
+              <div className="absolute left-0 top-8 z-30 flex max-h-[62%] w-64 flex-col gap-1.5 overflow-y-auto rounded-xl border border-zinc-700 bg-zinc-950/97 p-1.5 shadow-2xl backdrop-blur [scrollbar-width:thin]">
+                {/* layer toggles */}
+                <div className="flex flex-wrap gap-1">
+                  {layerChips.map((l) => (
+                    <button
+                      key={l.key}
+                      type="button"
+                      onClick={() => setLayers((s) => ({ ...s, [l.key]: !s[l.key] }))}
+                      className={`shrink-0 rounded-full border px-2 py-0.5 text-[9px] font-bold tracking-wide transition-colors ${
+                        layers[l.key]
+                          ? "border-gold/50 bg-gold/15 text-gold"
+                          : "border-zinc-700/70 bg-zinc-900/70 text-zinc-500"
+                      }`}
+                    >
+                      {l.label}
+                    </button>
+                  ))}
+                </div>
+                {/* the marks themselves */}
+                {visibleLegendMarks.length === 0 ? (
+                  <span className="px-0.5 py-1 text-[9px] text-zinc-600">
+                    No marks in view — zones, levels and structure appear here
+                    as the engine maps them.
+                  </span>
+                ) : (
+                  <div className="flex flex-wrap gap-1">
+                    {visibleLegendMarks.map((m) => (
+                      <span
+                        key={m.key}
+                        title={m.text}
+                        className={`flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[9px] leading-none ${
+                          m.faded
+                            ? "border-zinc-800/60 bg-zinc-900/40 font-normal text-zinc-500"
+                            : "border-zinc-700/80 bg-zinc-900/70 font-semibold"
+                        }`}
+                      >
+                        <span
+                          className="h-1.5 w-1.5 shrink-0 rounded-[2px]"
+                          style={{
+                            backgroundColor: m.swatch,
+                            opacity: m.faded ? 0.45 : 1,
+                          }}
+                        />
+                        <span style={{ color: m.faded ? undefined : m.swatch }}>
+                          {m.short}
+                        </span>
+                        {m.detail && (
+                          <span className="text-zinc-500">{m.detail}</span>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* symbol + live quote */}
+        <span className="ml-1 flex min-w-0 items-center gap-1.5 text-[10px] font-semibold text-zinc-500">
+          <span className="truncate font-mono text-zinc-400">{symbol}</span>
+          {headerQuote != null && headerQuote > 0 && (
+            <span className="truncate font-mono text-[11px] font-bold tabular-nums text-zinc-200">
+              {headerQuote.toFixed(2)}
+            </span>
+          )}
+        </span>
+
+        {/* status + fullscreen, right */}
+        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {chip}
+          <button
+            type="button"
+            onClick={() => (isFs ? void exitFs() : void enterFs())}
+            className={`flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] font-bold transition-colors ${
+              isFs
+                ? "border-gold/50 bg-gold/15 text-gold"
+                : "border-zinc-700 bg-zinc-900/80 text-zinc-400 hover:border-gold/40 hover:text-gold"
+            }`}
+            aria-label={isFs ? "Exit fullscreen" : "View chart fullscreen"}
+          >
+            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4">
+              {isFs ? (
+                <path d="M9 3v6H3m12-6v6h6M9 21v-6H3m12 6v-6h6" strokeLinecap="round" strokeLinejoin="round" />
+              ) : (
+                <path d="M15 3h6v6M9 21H3v-6m18-9-7 7M3 15l7-7" strokeLinecap="round" strokeLinejoin="round" />
+              )}
+            </svg>
+            {isFs ? "Exit" : "Full"}
+          </button>
+        </span>
+      </div>
+
+      {/* chart area (the canvas proper) */}
       <div className="relative min-h-0 flex-1">
         <div ref={containerRef} className="h-full w-full" aria-label={`${symbol} ${tf} chart`} />
         {/* D-052 — professional drawing overlay (pointer-transparent).
@@ -1203,7 +1582,6 @@ export default function PriceChart({
           className="pointer-events-none absolute inset-0 z-10 h-full w-full"
           aria-hidden
         />
-        {chip && <div className="absolute left-3 top-3 z-10">{chip}</div>}
         {showLoading && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-zinc-950/70 backdrop-blur-sm">
             <svg className="h-7 w-7 animate-spin text-gold" viewBox="0 0 24 24" fill="none">
@@ -1220,79 +1598,6 @@ export default function PriceChart({
           </div>
         )}
       </div>
-
-      {/* D-053 — external MARKS legend: the layer toggles + every drawing
-       *  listed with its compact name and price. Full-variant only — the
-       *  Chart tab stays pure (setup + signals). */}
-      {!isSignals && (
-        <div className="shrink-0 border-t border-zinc-800/80 bg-zinc-950/70 px-2.5 pb-2 pt-1.5">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <span className="shrink-0 text-[9px] font-bold uppercase tracking-wider text-zinc-600">
-              Marks
-            </span>
-            <span className="shrink-0 text-[9px] font-mono tabular-nums text-zinc-500">
-              {visibleLegendMarks.length}
-            </span>
-            <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-              {layerChips.map((l) => (
-                <button
-                  key={l.key}
-                  type="button"
-                  onClick={() => setLayers((s) => ({ ...s, [l.key]: !s[l.key] }))}
-                  className={`shrink-0 rounded-full border px-2 py-0.5 text-[9px] font-bold tracking-wide transition-colors ${
-                    layers[l.key]
-                      ? "border-gold/50 bg-gold/15 text-gold"
-                      : "border-zinc-700/70 bg-zinc-900/70 text-zinc-500"
-                  }`}
-                >
-                  {l.label}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="mt-1.5 flex max-h-[52px] flex-wrap gap-1 overflow-y-auto [scrollbar-width:thin]">
-            {visibleLegendMarks.length === 0 ? (
-              <span className="px-0.5 py-0.5 text-[9px] text-zinc-600">
-                No marks in view — zones, levels and structure appear here as
-                the engine maps them.
-              </span>
-            ) : (
-              <>
-                {visibleLegendMarks.slice(0, 14).map((m) => (
-                  <span
-                    key={m.key}
-                    title={m.text}
-                    className={`flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[9px] leading-none ${
-                      m.faded
-                        ? "border-zinc-800/60 bg-zinc-900/40 font-normal text-zinc-500"
-                        : "border-zinc-700/80 bg-zinc-900/70 font-semibold"
-                    }`}
-                  >
-                    <span
-                      className="h-1.5 w-1.5 shrink-0 rounded-[2px]"
-                      style={{
-                        backgroundColor: m.swatch,
-                        opacity: m.faded ? 0.45 : 1,
-                      }}
-                    />
-                    <span style={{ color: m.faded ? undefined : m.swatch }}>
-                      {m.short}
-                    </span>
-                    {m.detail && (
-                      <span className="text-zinc-500">{m.detail}</span>
-                    )}
-                  </span>
-                ))}
-                {visibleLegendMarks.length > 14 && (
-                  <span className="flex shrink-0 items-center rounded-md border border-zinc-800 bg-zinc-900/50 px-1.5 py-0.5 font-mono text-[9px] leading-none text-zinc-500">
-                    +{visibleLegendMarks.length - 14}
-                  </span>
-                )}
-              </>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   );
 }

@@ -1,4 +1,5 @@
-"""D-043/D-052 — Professional auto-drawing engine (user directive, Bengali):
+"""D-043/D-052/D-058 — Professional auto-drawing engine (user directive,
+Bengali):
 
 "একজন প্রফেশনাল ট্রেডার যেভাবে তার চার্ট এনালাইসিস করার জন্য ড্রয়িং করে —
 হরাইজন্টাল লাইন, ট্রেন্ড লাইন, fibonacchi… সব সময় ড্রয়িং করবে না।"
@@ -42,12 +43,14 @@ import pandas as pd
 from app.analysis import indicators as ind
 from app.analysis import smc
 from app.analysis.context import mtf_bias
-from app.analysis.setup_geometry import setup_geometry
+from app.analysis.setup_geometry import setup_geometry, setup_snapshot
 
 logger = logging.getLogger("xauusd.drawings")
 
 #: hard cap — a pro chart never carries more than this many marks
-MAX_DRAWINGS = 34
+#: D-058 — 42: the momentum ribbon / swing labels / kill-zone bands add
+#: marks, and every one of them is 2-4px thin on the canvas
+MAX_DRAWINGS = 42
 #: drawings live on the recent 80–150 candles of the ACTIVE timeframe
 DRAW_WINDOW_BARS = 150
 #: how close (in ATR units) price must be to a zone for the SETUP box
@@ -113,6 +116,162 @@ def _in_window(t: Any, t_start: pd.Timestamp) -> bool:
         return ts >= t_start
     except (TypeError, ValueError):
         return False
+
+
+# ------------------------------------------------- D-058 momentum / structure
+
+
+def _ema_ribbon(df: pd.DataFrame | None) -> dict | None:
+    """kind: "ema" — the MOMENTUM ribbon a pro keeps under price.
+
+    EMA 9 / 21 / 50 sampled across the drawing window (payload stays
+    light: ~60 points per line). The label carries the live verdict —
+    which EMA stack is in charge and whether momentum agrees with the
+    last close (the "momentum" axis of the user's Setup/Level/Zone/
+    Structure/Momentum checklist).
+    """
+    if df is None or len(df) < 55:
+        return None
+    win = df.tail(DRAW_WINDOW_BARS + 60)
+    lines: list[dict] = []
+    series = {
+        9: ind.ema(win["c"], 9),
+        21: ind.ema(win["c"], 21),
+        50: ind.ema(win["c"], 50),
+    }
+    for period, tone in ((9, "gold"), (21, "violet"), (50, "neutral")):
+        s = series[period]
+        pts: list[dict] = []
+        times = win["time_utc"].tolist()
+        for i in range(len(win)):
+            v = s.iloc[i]
+            if pd.notna(v):
+                pts.append({
+                    "t": _iso(times[i]),
+                    "p": round(float(v), 2),
+                })
+        if len(pts) < 2:
+            continue
+        step = max(1, len(pts) // 60)
+        lines.append({
+            "period": period, "tone": tone,
+            "label": f"EMA {period}",
+            "points": pts[::step],
+        })
+    if len(lines) < 2:
+        return None
+    e9 = float(series[9].iloc[-1])
+    e21 = float(series[21].iloc[-1])
+    e50 = float(series[50].iloc[-1])
+    close = float(win["c"].iloc[-1])
+    if e9 > e21 > e50:
+        verdict = "Momentum · bullish stack — EMA 9 > 21 > 50"
+    elif e9 < e21 < e50:
+        verdict = "Momentum · bearish stack — EMA 9 < 21 < 50"
+    elif e9 > e21:
+        verdict = "Momentum · turning up — EMA 9 crossing above 21"
+    else:
+        verdict = "Momentum · turning down — EMA 9 crossing below 21"
+    tone = "bull" if e9 > e21 else "bear"
+    return {
+        "kind": "ema", "lines": lines,
+        "label": verdict, "tone": tone,
+        "above": bool(close > e9),
+    }
+
+
+def _swing_labels(df: pd.DataFrame | None, atr: float) -> list[dict]:
+    """kind: "swing" — HH / HL / LH / LL structure reads at confirmed
+    swings. This is the exact map a price-action trader keeps in their
+    head: higher highs and higher lows = uptrend alive, etc.
+    """
+    if df is None or len(df) < 40:
+        return []
+    win = df.tail(DRAW_WINDOW_BARS + 20)
+    pts = ind.swings(win, 2, 2)
+    out: list[dict] = []
+    last_high = last_low = None
+    for p in pts:
+        if p["kind"] == "high":
+            if last_high is not None:
+                tag = "HH" if p["price"] > last_high else "LH"
+                out.append({
+                    "kind": "swing", "t": _iso(p["t"]),
+                    "price": round(float(p["price"]), 2),
+                    "tag": tag, "side": "high",
+                    "label": (
+                        "Higher High — bullish structure" if tag == "HH"
+                        else "Lower High — weakening structure"
+                    ),
+                    "tone": "bull" if tag == "HH" else "bear",
+                })
+            last_high = float(p["price"])
+        else:
+            if last_low is not None:
+                tag = "HL" if p["price"] > last_low else "LL"
+                out.append({
+                    "kind": "swing", "t": _iso(p["t"]),
+                    "price": round(float(p["price"]), 2),
+                    "tag": tag, "side": "low",
+                    "label": (
+                        "Higher Low — bullish structure" if tag == "HL"
+                        else "Lower Low — bearish structure"
+                    ),
+                    "tone": "bull" if tag == "HL" else "bear",
+                })
+            last_low = float(p["price"])
+    return out[-6:]
+
+
+def _sessions(df: pd.DataFrame | None, tf: str) -> list[dict]:
+    """kind: "session" — ICT kill-zone bands (Asia / London / NY).
+
+    The WHEN layer: institutions move size inside these UTC windows, so
+    the pro marks them before marking anything else. Bands merge into
+    contiguous runs of same-session bars inside the drawing window and
+    render as whisper-quiet vertical shading — visible only on the
+    intraday views where they mean something.
+    """
+    if df is None or len(df) < 30 or tf not in ("M1", "M5", "M15"):
+        return []
+    win = df.tail(DRAW_WINDOW_BARS)
+    name_map = {
+        "asia": "Asia Kill Zone",
+        "london": "London Kill Zone",
+        "ny-am": "New York AM Kill Zone",
+        "ny-pm": "New York PM Kill Zone",
+    }
+    out: list[dict] = []
+    cur_name: str | None = None
+    band_start: Any = None
+    band_end: Any = None
+    for row_t in win["time_utc"].tolist():
+        kz = smc.kill_zone(pd.Timestamp(row_t))
+        name = kz["name"] if kz["in"] else None
+        if name != cur_name:
+            if cur_name is not None and band_start is not None \
+                    and band_end is not None:
+                out.append({
+                    "kind": "session", "t0": _iso(band_start),
+                    "t1": _iso(band_end),
+                    "name": name_map.get(cur_name, cur_name),
+                    "label": name_map.get(cur_name, cur_name),
+                    "tone": "gold" if cur_name in ("london", "ny-am")
+                    else "neutral",
+                })
+            cur_name = name
+            band_start = row_t if name else None
+            band_end = row_t if name else None
+        else:
+            band_end = row_t
+    if cur_name is not None and band_start is not None and band_end is not None:
+        out.append({
+            "kind": "session", "t0": _iso(band_start), "t1": _iso(band_end),
+            "name": name_map.get(cur_name, cur_name),
+            "label": name_map.get(cur_name, cur_name),
+            "tone": "gold" if cur_name in ("london", "ny-am") else "neutral",
+        })
+    return out
 
 
 # ----------------------------------------------------------------- hlines
@@ -187,6 +346,21 @@ def _key_levels(
         poc = (snap.get("volume_profile") or {}).get("poc")
         if poc:
             add(poc, "Point of Control (POC)", "gold", "solid")
+        # D-058 — ICT equilibrium: the 50% of the dealing range. The line
+        # every premium/discount read hangs off ("price is expensive
+        # above it, cheap below it").
+        pd_state = snap.get("premium_discount") or {}
+        eq = pd_state.get("eq")
+        if eq is None and pd_state.get("range_lo") is not None \
+                and pd_state.get("range_hi") is not None:
+            try:
+                eq = (float(pd_state["range_lo"]) +
+                      float(pd_state["range_hi"])) / 2.0
+            except (TypeError, ValueError):
+                eq = None
+        if eq:
+            add(float(eq), "Equilibrium · 50% of dealing range",
+                "gold", "dash")
     # keep the ones a trader cares about: nearest above + below price,
     # PDH/PDL/POC + the strongest time-at-price marks
     above = sorted([d for d in out if d["price"] > price], key=lambda d: d["price"])[:4]
@@ -551,9 +725,14 @@ def _setup(
     else:
         return None
 
-    # D-057 — the SHARED geometry: the same entry/SL/TP the signal engine
-    # places its order at (setup_geometry is the single source of truth)
-    geo = setup_geometry(s5, s15, direction, price, atr_fallback=atr5)
+    # D-058 — EXACT window parity with the engine's _drawing_geometry():
+    # both sides build their M5/M15 snapshots through setup_snapshot()
+    # (GEOMETRY_BARS windows == services/analysis.py BARS_PER_TF), so the
+    # box the user watches is numerically identical to the order the
+    # broker receives — no 240-vs-GEOMETRY window drift ever again.
+    s5_geo = setup_snapshot(m5, "M5")
+    s15_geo = setup_snapshot(frames.get("M15"), "M15")
+    geo = setup_geometry(s5_geo, s15_geo, direction, price, atr_fallback=atr5)
     if geo is None:
         return None
     tag, lo, hi, t0 = geo["tag"], geo["lo"], geo["hi"], geo["t0"]
@@ -713,4 +892,13 @@ def _build(
     out.extend(_structure_events(snap, t_start))
     out.extend(_arrows(snap, price))
 
-    return out[:MAX_DRAWINGS]
+    # D-058 — the deep-professional layers (user directive: "ICT, SMC,
+    # price action… বেস্ট গুলো অ্যাড করবেন"):
+    # 10. momentum ribbon (EMA 9/21/50) — under price, whisper-thin
+    # 11. HH/HL/LH/LL swing structure reads
+    # 12. ICT kill-zone session bands (intraday views only)
+    out.append(_ema_ribbon(base))
+    out.extend(_swing_labels(base, atr))
+    out.extend(_sessions(base, tf))
+
+    return [d for d in out if d is not None][:MAX_DRAWINGS]

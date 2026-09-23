@@ -37,7 +37,9 @@ from app.analysis import smc
 # Per-TF geometry windows that make the engine's frames == the drawing
 # layer's frames (services/analysis.py BARS_PER_TF): same slice -> same
 # smc detections -> the same zones/liquidity the chart draws.
-GEOMETRY_BARS = {"M5": 200, "M15": 160}
+# D-058 — deepened with BARS_PER_TF (more history = cleaner
+# swing/liquidity detection for BOTH the drawing and the order).
+GEOMETRY_BARS = {"M5": 300, "M15": 240}
 
 # how close (in M5-ATR units) price must be to a zone for the setup to
 # exist — identical to drawings.SETUP_NEAR_ATR (the box the user sees)

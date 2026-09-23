@@ -14,7 +14,6 @@ import { useEffect, useMemo, useState } from "react";
 import { useTick } from "../state/feed";
 import { getAnalysis } from "../lib/api";
 import {
-  TIMEFRAMES,
   type AnalysisResponse,
   type Candle,
   type Mt5Status,
@@ -113,67 +112,50 @@ export default function ChartsView({
 
   return (
     <div className="flex min-w-0 flex-col gap-3">
-      {/* header: pair + tf + live quote */}
-      <Card padded={false} className="p-3">
-        <div className="flex min-w-0 flex-col gap-2.5">
-          <div className="flex min-w-0 items-center gap-2">
-            {symbols.length > 1 && (
-              <div className="flex min-w-0 gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                {symbols.map((s) => (
-                  <button
-                    key={s}
-                    type="button"
-                    onClick={() => onSymbolChange(s)}
-                    className={`shrink-0 rounded-full border px-3.5 py-1.5 text-xs font-bold transition-colors ${
-                      s === symbol
-                        ? "border-gold/60 bg-gold/15 text-gold"
-                        : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200"
-                    }`}
-                  >
-                    {s}
-                  </button>
-                ))}
-              </div>
-            )}
-            <div className="ml-auto flex shrink-0 items-center gap-2">
-              {tick ? (
-                <span className="font-mono text-sm font-bold tabular-nums text-zinc-100">
-                  {tick.bid.toFixed(2)}
-                </span>
-              ) : (
-                <span className="h-4 w-14 animate-pulse rounded bg-zinc-800" />
-              )}
-              <span
-                className={`flex items-center gap-1 text-[10px] font-semibold ${
-                  wsState === "open"
-                    ? "text-emerald-400"
-                    : wsState === "connecting"
-                      ? "text-amber-400"
-                      : "text-red-400"
-                }`}
-              >
-                <Dot tone={wsState === "open" ? "green" : wsState === "connecting" ? "amber" : "red"} />
-                {wsState === "open" ? "live" : wsState === "connecting" ? "connecting" : "offline"}
-              </span>
+      {/* header: pair pills + live quote (the TF selector lives in the
+       *  chart's own header now — D-058 user directive) */}
+      <Card padded={false} className="p-2.5">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          {symbols.length > 1 && (
+            <div className="flex min-w-0 gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              {symbols.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => onSymbolChange(s)}
+                  className={`shrink-0 rounded-full border px-3.5 py-1.5 text-xs font-bold transition-colors ${
+                    s === symbol
+                      ? "border-gold/60 bg-gold/15 text-gold"
+                      : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {s}
+                </button>
+              ))}
             </div>
-          </div>
-          <div className="flex min-w-0 gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-            {TIMEFRAMES.map((t) => (
-              <button
-                key={t}
-                type="button"
-                onClick={() => onTfChange(t)}
-                className={`shrink-0 rounded-lg border px-3 py-1 font-mono text-[11px] font-bold transition-colors ${
-                  t === tf
-                    ? "border-gold/60 bg-gold/15 text-gold"
-                    : "border-zinc-800 bg-zinc-900/60 text-zinc-500 hover:text-zinc-300"
-                }`}
-              >
-                {t}
-              </button>
-            ))}
+          )}
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            {tick ? (
+              <span className="font-mono text-sm font-bold tabular-nums text-zinc-100">
+                {tick.bid.toFixed(2)}
+              </span>
+            ) : (
+              <span className="h-4 w-14 animate-pulse rounded bg-zinc-800" />
+            )}
+            <span
+              className={`flex items-center gap-1 text-[10px] font-semibold ${
+                wsState === "open"
+                  ? "text-emerald-400"
+                  : wsState === "connecting"
+                    ? "text-amber-400"
+                    : "text-red-400"
+              }`}
+            >
+              <Dot tone={wsState === "open" ? "green" : wsState === "connecting" ? "amber" : "red"} />
+              {wsState === "open" ? "live" : wsState === "connecting" ? "connecting" : "offline"}
+            </span>
             {feedProvider?.mt5 && (
-              <span className="ml-auto shrink-0 self-center text-[10px] text-zinc-600">
+              <span className="shrink-0 self-center text-[10px] text-zinc-600">
                 Institutional feed
               </span>
             )}
@@ -181,71 +163,84 @@ export default function ChartsView({
         </div>
       </Card>
 
-      {/* chart — D-053: signals variant (setup + signal marks ONLY) */}
-      <div className="h-[52vh] min-h-[320px] w-full min-w-0 sm:h-[56vh] lg:h-[60vh]">
-        <ErrorBoundary label="Chart">
-          <PriceChart
-            symbol={symbol}
-            tf={tf}
-            candles={candles}
-            candlesLoading={candlesLoading}
-            signals={chartSignals}
-            selectedSignal={selected?.status === "active" ? selected : null}
-            market={market}
-            wsConnected={wsState === "open"}
-            onDesync={onDesync}
-            analysis={analysis}
-            variant="signals"
-          />
-        </ErrorBoundary>
-      </div>
+      {/* D-058 — the desktop split: chart fills the main column (TF
+       *  dropdown + marks + fullscreen live in its own header), the
+       *  analysis + signal panels stack in the right rail. Mobile keeps
+       *  the single column. */}
+      <div className="flex min-w-0 flex-col gap-3 xl:flex-row xl:items-start">
+        {/* chart — D-053: signals variant (setup + signal marks ONLY) */}
+        <div className="min-w-0 flex-1 xl:sticky xl:top-16">
+          <div className="h-[52vh] min-h-[320px] w-full min-w-0 lg:h-[calc(100vh-10rem)]">
+            <ErrorBoundary label="Chart">
+              <PriceChart
+                symbol={symbol}
+                tf={tf}
+                onTfChange={onTfChange}
+                candles={candles}
+                candlesLoading={candlesLoading}
+                signals={chartSignals}
+                selectedSignal={selected?.status === "active" ? selected : null}
+                market={market}
+                wsConnected={wsState === "open"}
+                onDesync={onDesync}
+                analysis={analysis}
+                variant="signals"
+                headerQuote={tick?.bid ?? null}
+              />
+            </ErrorBoundary>
+          </div>
+        </div>
 
-      {/* D-042 — live ICT/SMC analysis strip */}
-      <LiveAnalysisStrip analysis={analysis} tf={tf} />
+        {/* the analysis rail */}
+        <div className="flex w-full min-w-0 flex-col gap-3 xl:w-[340px] 2xl:w-[380px] xl:shrink-0">
+          {/* D-042 — live ICT/SMC analysis strip */}
+          <LiveAnalysisStrip analysis={analysis} tf={tf} />
 
-      {/* signal analysis panel */}
-      <Card>
-        <SectionTitle
-          title="Signal Analysis"
-          right={
-            <Badge tone="zinc">
-              {symbolSignals.length} signal{symbolSignals.length === 1 ? "" : "s"}
-            </Badge>
-          }
-        />
-        {symbolSignals.length === 0 ? (
-          <EmptyState
-            title="No signals yet for this pair"
-            hint="The engine analyzes every M1 close (H1 trend + M5/M15 confirmation + pattern trigger). The first confirmed signal appears here with its full analysis."
-          />
-        ) : (
-          <div className="flex min-w-0 flex-col gap-3">
-            {/* recent signals list */}
-            <div className="flex max-h-64 min-w-0 flex-col gap-1.5 overflow-y-auto pr-1">
-              {symbolSignals.slice(0, 30).map((s) => (
-                <SignalRow
-                  key={s.id}
-                  signal={s}
-                  selected={selected?.id === s.id}
-                  onSelect={() => setSelectedId(s.id)}
-                />
-              ))}
-            </div>
-            {selected && (
-              <div className="border-t border-zinc-800/70 pt-3">
-                <SignalDetail signal={selected} />
+          {/* signal analysis panel */}
+          <Card>
+            <SectionTitle
+              title="Signal Analysis"
+              right={
+                <Badge tone="zinc">
+                  {symbolSignals.length} signal{symbolSignals.length === 1 ? "" : "s"}
+                </Badge>
+              }
+            />
+            {symbolSignals.length === 0 ? (
+              <EmptyState
+                title="No signals yet for this pair"
+                hint="The engine analyzes every M1 close (H1 trend + M5/M15 confirmation + pattern trigger). The first confirmed signal appears here with its full analysis."
+              />
+            ) : (
+              <div className="flex min-w-0 flex-col gap-3">
+                {/* recent signals list */}
+                <div className="flex max-h-64 min-w-0 flex-col gap-1.5 overflow-y-auto pr-1 xl:max-h-[46vh]">
+                  {symbolSignals.slice(0, 30).map((s) => (
+                    <SignalRow
+                      key={s.id}
+                      signal={s}
+                      selected={selected?.id === s.id}
+                      onSelect={() => setSelectedId(s.id)}
+                    />
+                  ))}
+                </div>
+                {selected && (
+                  <div className="border-t border-zinc-800/70 pt-3">
+                    <SignalDetail signal={selected} />
+                  </div>
+                )}
               </div>
             )}
-          </div>
-        )}
-      </Card>
+          </Card>
 
-      {/* engine activity (recent log lines) */}
-      {selected && (
-        <p className="px-1 text-center text-[10px] text-zinc-600">
-          Signal times are UTC · entry {selected.entry.toFixed(2)} · taken {fmtTime(selected.ts)}
-        </p>
-      )}
+          {/* engine activity (recent log lines) */}
+          {selected && (
+            <p className="px-1 text-center text-[10px] text-zinc-600">
+              Signal times are UTC · entry {selected.entry.toFixed(2)} · taken {fmtTime(selected.ts)}
+            </p>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

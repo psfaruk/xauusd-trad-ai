@@ -1039,6 +1039,41 @@ export interface SetupDrawing {
   note: string;
 }
 
+/** D-058 — the EMA momentum ribbon (EMA 9 / 21 / 50) under price. */
+export interface EmaDrawing {
+  kind: "ema";
+  lines: {
+    period: number;
+    tone: DrawingTone;
+    label: string;
+    points: { t: string; p: number }[];
+  }[];
+  label: string;
+  tone: DrawingTone;
+  above: boolean;
+}
+
+/** D-058 — HH / HL / LH / LL structure read at a confirmed swing. */
+export interface SwingDrawing {
+  kind: "swing";
+  t: string;
+  price: number;
+  tag: "HH" | "HL" | "LH" | "LL";
+  side: "high" | "low";
+  label: string;
+  tone: DrawingTone;
+}
+
+/** D-058 — ICT kill-zone session band (Asia / London / New York). */
+export interface SessionDrawing {
+  kind: "session";
+  t0: string;
+  t1: string;
+  name: string;
+  label: string;
+  tone: DrawingTone;
+}
+
 export type ChartDrawing =
   | HLineDrawing
   | ZoneDrawing
@@ -1049,4 +1084,7 @@ export type ChartDrawing =
   | TrendlineDrawing
   | FibDrawing
   | NoteDrawing
-  | SetupDrawing;
+  | SetupDrawing
+  | EmaDrawing
+  | SwingDrawing
+  | SessionDrawing;

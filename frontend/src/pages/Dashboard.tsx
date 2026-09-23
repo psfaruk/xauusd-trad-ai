@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import BottomNav from "../components/BottomNav";
+import SideNav from "../components/SideNav";
 import ErrorBoundary from "../components/ErrorBoundary";
 import HomeView from "../views/HomeView";
 import ChartsView from "../views/ChartsView";
@@ -282,116 +283,137 @@ export default function Dashboard() {
 
   /* --------------------------------------------------------------- render */
   return (
-    <div className="flex min-h-screen flex-col overflow-x-hidden bg-zinc-950">
-      {/* slim app header — brand + live connection */}
-      <header className="sticky top-0 z-30 border-b border-zinc-800/70 bg-zinc-950/90 backdrop-blur-md">
-        <div className="mx-auto flex h-12 w-full max-w-3xl items-center gap-2 px-4">
-          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-gold/15 text-[11px] font-black text-gold">
-            Au
-          </span>
-          <span className="truncate text-sm font-bold tracking-tight text-zinc-100">
-            Gold&nbsp;AI&nbsp;Trader
-          </span>
-          <span className="ml-auto flex shrink-0 items-center gap-2 text-[10px] font-semibold">
-            {mt5?.status === "connected" && (
-              <span className="flex items-center gap-1 text-emerald-400">
-                <span className="relative flex h-1.5 w-1.5">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-                  <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+    <div className="flex min-h-screen flex-col overflow-x-hidden bg-zinc-950 lg:flex-row">
+      {/* D-058 — desktop: LEFT rail nav (the mobile bottom bar's twin);
+       *  it absorbs the viewport width so the content fills the rest —
+       *  no max-w gutters, no dead space on either side (user
+       *  directive: "2 পাশে অনেক ফাঁকা জায়গা… কোথাও কোনো ফাঁকা থাকতে
+       *  পারবে না"). Mobile keeps the classic bottom bar. */}
+      <div className="hidden lg:block">
+        <SideNav active={activeTab} onChange={navigate} />
+      </div>
+
+      <div className="flex min-h-screen min-w-0 flex-1 flex-col">
+        {/* slim app header — brand + live connection (full width) */}
+        <header className="sticky top-0 z-30 border-b border-zinc-800/70 bg-zinc-950/90 backdrop-blur-md">
+          <div className="flex h-12 w-full items-center gap-2 px-3 sm:px-5">
+            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-gold/15 text-[11px] font-black text-gold">
+              Au
+            </span>
+            <span className="truncate text-sm font-bold tracking-tight text-zinc-100">
+              Gold&nbsp;AI&nbsp;Trader
+            </span>
+            <span className="ml-auto flex shrink-0 items-center gap-2 text-[10px] font-semibold">
+              {mt5?.status === "connected" && (
+                <span className="flex items-center gap-1 text-emerald-400">
+                  <span className="relative flex h-1.5 w-1.5">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                  </span>
+                  LIVE
                 </span>
-                LIVE
-              </span>
+              )}
+              {mt5?.status === "reconnecting" && (
+                <span className="flex items-center gap-1 text-amber-400">reconnecting…</span>
+              )}
+              {mt5?.status === "disconnected" && (
+                <span className="flex items-center gap-1 text-red-400">offline</span>
+              )}
+              <button
+                type="button"
+                onClick={() => void signOut()}
+                className="rounded-lg border border-zinc-800 px-2 py-1 text-zinc-500 hover:text-zinc-300"
+                aria-label="Sign out"
+              >
+                exit
+              </button>
+            </span>
+          </div>
+        </header>
+
+        {/* D-058 — the content column fills EVERYTHING to the right of
+          *  the rail (no max-w-3xl cap: that cap was the source of the
+          *  dead gutters on PC) */}
+        <main className="w-full min-w-0 flex-1 px-2.5 pb-24 pt-3 sm:px-4 lg:pb-8 lg:pr-5">
+          <ErrorBoundary label="App">
+            {activeTab === "home" && (
+              <HomeView
+                symbol={symbol}
+                symbols={symbols}
+                onSymbolChange={onSymbolChange}
+                mt5={mt5}
+                broker={broker}
+                tradingAccount={tradingAccount}
+                autoArmed={autoArmed}
+                autoWhy={autoWhy}
+                signals={signals}
+                stats={stats}
+                onOpenAi={() => navigate("ai")}
+                onOpenSignal={openSignalAnalysis}
+                tf={tf}
+                onTfChange={setTf}
+                candles={candles}
+                candlesLoading={candlesQuery.isLoading}
+                wsConnected={wsState === "open"}
+                onDesync={onDesync}
+                token={token ?? ""}
+              />
             )}
-            {mt5?.status === "reconnecting" && (
-              <span className="flex items-center gap-1 text-amber-400">reconnecting…</span>
+            {activeTab === "charts" && (
+              <ChartsView
+                symbol={symbol}
+                symbols={symbols}
+                onSymbolChange={onSymbolChange}
+                tf={tf}
+                onTfChange={setTf}
+                candles={candles}
+                candlesLoading={candlesQuery.isLoading}
+                signals={signals}
+                mt5={mt5}
+                wsState={wsState}
+                onDesync={onDesync}
+                focusSignalId={focusSignalId}
+                onFocusSignalConsumed={() => setFocusSignalId(null)}
+                token={token ?? ""}
+              />
             )}
-            {mt5?.status === "disconnected" && (
-              <span className="flex items-center gap-1 text-red-400">offline</span>
+            {activeTab === "ai" && (
+              <div className="mx-auto w-full max-w-5xl">
+                <AiView
+                  token={token ?? ""}
+                  symbol={symbol}
+                  autoStatus={autoStatus}
+                  autoEvents={autoEvents}
+                  refreshKey={aiRefreshKey}
+                  signals={signals}
+                  onArmChanged={refreshSlow}
+                />
+              </div>
             )}
-            <button
-              type="button"
-              onClick={() => void signOut()}
-              className="rounded-lg border border-zinc-800 px-2 py-1 text-zinc-500 hover:text-zinc-300"
-              aria-label="Sign out"
-            >
-              exit
-            </button>
-          </span>
+            {activeTab === "settings" && (
+              <div className="mx-auto w-full max-w-5xl">
+                <SettingsView
+                  token={token ?? ""}
+                  mt5={mt5}
+                  broker={broker}
+                  isAdmin={isAdmin}
+                  dataSource={dataSource}
+                  engineLogs={engineLogs}
+                  onBrokerConnected={() => {
+                    refreshSlow();
+                    void queryClient.invalidateQueries({ queryKey: ["candles"] });
+                  }}
+                />
+              </div>
+            )}
+          </ErrorBoundary>
+        </main>
+
+        {/* mobile: bottom nav; desktop: the left rail already handles it */}
+        <div className="lg:hidden">
+          <BottomNav active={activeTab} onChange={navigate} />
         </div>
-      </header>
-
-      <main className="mx-auto w-full max-w-3xl flex-1 px-3 pb-28 pt-3 sm:px-4">
-        <ErrorBoundary label="App">
-          {activeTab === "home" && (
-            <HomeView
-              symbol={symbol}
-              symbols={symbols}
-              onSymbolChange={onSymbolChange}
-              mt5={mt5}
-              broker={broker}
-              tradingAccount={tradingAccount}
-              autoArmed={autoArmed}
-              autoWhy={autoWhy}
-              signals={signals}
-              stats={stats}
-              onOpenAi={() => navigate("ai")}
-              onOpenSignal={openSignalAnalysis}
-              tf={tf}
-              onTfChange={setTf}
-              candles={candles}
-              candlesLoading={candlesQuery.isLoading}
-              wsConnected={wsState === "open"}
-              onDesync={onDesync}
-              token={token ?? ""}
-            />
-          )}
-          {activeTab === "charts" && (
-            <ChartsView
-              symbol={symbol}
-              symbols={symbols}
-              onSymbolChange={onSymbolChange}
-              tf={tf}
-              onTfChange={setTf}
-              candles={candles}
-              candlesLoading={candlesQuery.isLoading}
-              signals={signals}
-              mt5={mt5}
-              wsState={wsState}
-              onDesync={onDesync}
-              focusSignalId={focusSignalId}
-              onFocusSignalConsumed={() => setFocusSignalId(null)}
-              token={token ?? ""}
-            />
-          )}
-          {activeTab === "ai" && (
-            <AiView
-              token={token ?? ""}
-              symbol={symbol}
-              autoStatus={autoStatus}
-              autoEvents={autoEvents}
-              refreshKey={aiRefreshKey}
-              signals={signals}
-              onArmChanged={refreshSlow}
-            />
-          )}
-          {activeTab === "settings" && (
-            <SettingsView
-              token={token ?? ""}
-              mt5={mt5}
-              broker={broker}
-              isAdmin={isAdmin}
-              dataSource={dataSource}
-              engineLogs={engineLogs}
-              onBrokerConnected={() => {
-                refreshSlow();
-                void queryClient.invalidateQueries({ queryKey: ["candles"] });
-              }}
-            />
-          )}
-        </ErrorBoundary>
-      </main>
-
-      <BottomNav active={activeTab} onChange={navigate} />
+      </div>
     </div>
   );
 }

@@ -35,7 +35,11 @@ logger = logging.getLogger("xauusd.analysis")
 CACHE_TTL_S = 20.0
 # D-052 — every chart timeframe (M1..D1) gets a snapshot + its own
 # drawing set; M30/D1 carry a bit less depth (bars cost fetch time).
-BARS_PER_TF = {"M1": 260, "M5": 200, "M15": 160, "M30": 140, "H1": 140,
+# D-058 — windows deepened (user directive: "ড্রয়িং এর জন্য আরও বেশি
+# পিছনে ক্যান্ডেল প্রয়োজন… ইচ্ছা মতো ক্যান্ডেল নিয়ে ড্রয়িং করবেন"):
+# deeper history -> cleaner swing/liquidity/zone detection, the same
+# M5/M15 slices the trade geometry (setup_geometry.GEOMETRY_BARS) uses.
+BARS_PER_TF = {"M1": 360, "M5": 300, "M15": 240, "M30": 200, "H1": 160,
                 "H4": 120, "D1": 120}
 
 

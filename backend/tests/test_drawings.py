@@ -104,7 +104,9 @@ def test_setup_drawing_on_bullish_ict_tape():
     frames["M5"] = _m5_demand_supply_around(float(frames["M1"]["c"].iloc[-1]))
     price = float(frames["M1"]["c"].iloc[-1])
     out = build_drawings(frames, _snaps(frames), price, [])
-    assert len(out) <= 26
+    # D-058 — the momentum ribbon / swing labels / session bands joined
+    # the sheet; the cap is 42, this fixture lands ~30
+    assert len(out) <= 36
     setups = [d for d in out if d["kind"] == "setup"]
     assert len(setups) == 1
     s = setups[0]
@@ -177,6 +179,84 @@ def test_trendline_and_fib_from_htf_frames():
     assert f["t0"] != f["t1"]
 
 
+# ------------------------------------------------------ D-058 drawings
+
+
+def test_d058_momentum_ribbon_structure_and_sessions():
+    """The deep-professional layers: EMA momentum ribbon, HH/HL/LH/LL
+    swing reads, kill-zone session bands + the ICT equilibrium line."""
+    frames = _frames()
+    snaps = _snaps(frames)
+    price = float(frames["M1"]["c"].iloc[-1])
+    out = build_drawings(frames, snaps, price, [], tf="M1")
+
+    # 1. momentum ribbon — 3 EMA lines with a worded verdict
+    emas = [d for d in out if d["kind"] == "ema"]
+    assert emas, "M1 view must carry the EMA momentum ribbon"
+    e = emas[0]
+    assert len(e["lines"]) >= 2
+    for line in e["lines"]:
+        assert {line["period"] for line in e["lines"]} <= {9, 21, 50}
+        assert len(line["points"]) >= 2
+        for p in line["points"]:
+            assert isinstance(p["t"], str) and p["p"] > 0
+    assert "momentum" in e["label"].lower()
+    assert e["tone"] in ("bull", "bear")
+    # payload stays light: <= 64 samples per line
+    for line in e["lines"]:
+        assert len(line["points"]) <= 64
+
+    # 2. swing structure reads — HH/HL/LH/LL with full-word labels
+    swings = [d for d in out if d["kind"] == "swing"]
+    assert swings, "wavy HH/HL frames must yield swing reads"
+    for s in swings:
+        assert s["tag"] in ("HH", "HL", "LH", "LL")
+        assert len(s["label"]) > 10  # full words, never cryptic tags
+
+    # 3. kill-zone session bands — intraday views only
+    sessions = [d for d in out if d["kind"] == "session"]
+    assert sessions, "M1 view must carry kill-zone bands"
+    for b in sessions:
+        assert b["t0"] < b["t1"]
+        assert "Kill Zone" in b["label"]
+
+    # 4. ICT equilibrium line — the 50% of the dealing range
+    eqs = [d for d in out if d["kind"] == "hline"
+           and d["label"].startswith("Equilibrium")]
+    assert eqs, "the equilibrium line must be drawn"
+    pd_state = snaps["M1"].get("premium_discount") or {}
+    if pd_state.get("eq") is not None:
+        assert abs(eqs[0]["price"] - float(pd_state["eq"])) < 0.51
+
+    # H4 view: no session bands (they only mean something intraday)
+    out_h4 = build_drawings(frames, snaps, price, [], tf="H4")
+    assert not [d for d in out_h4 if d["kind"] == "session"]
+    # H4 still carries the momentum ribbon
+    assert any(d["kind"] == "ema" for d in out_h4)
+
+
+def test_d058_setup_geometry_parity_with_engine_windows():
+    """The box and the engine order read the SAME M5/M15 windows: the
+    drawing's setup box must match setup_snapshot(build) exactly — no
+    analyze_frame-240 vs GEOMETRY_BARS drift."""
+    from app.analysis.setup_geometry import setup_snapshot
+
+    frames = _frames()
+    frames["M5"] = _m5_demand_supply_around(float(frames["M1"]["c"].iloc[-1]))
+    price = float(frames["M1"]["c"].iloc[-1])
+    out = build_drawings(frames, _snaps(frames), price, [])
+    setups = [d for d in out if d["kind"] == "setup"]
+    assert setups, "fixture must yield a setup box"
+    s = setups[0]
+    # the engine's own snapshot build must produce the identical numbers
+    s5 = setup_snapshot(frames.get("M5"), "M5")
+    s15 = setup_snapshot(frames.get("M15"), "M15")
+    from app.analysis.setup_geometry import setup_geometry
+    geo = setup_geometry(s5, s15, s["dir"], price)
+    assert geo is not None
+    assert (geo["entry"], geo["sl"], geo["tp"]) == (s["entry"], s["sl"], s["tp"])
+
+
 # ------------------------------------------------------ D-052 drawings
 
 
@@ -212,7 +292,9 @@ def test_d052_every_tf_gets_its_own_drawing_set():
     for tf, out in sets.items():
         assert out, f"{tf} view must carry drawings"
         # every mark is bounded (a pro chart never floods)
-        assert len(out) <= 34
+        # D-058 — cap raised: the momentum ribbon / swing reads / kill-
+        # zone bands ride along, all whisper-thin on the canvas
+        assert len(out) <= 42
         # hlines survive on every view (no time anchor to lose)
         assert any(d["kind"] == "hline" for d in out)
     # the sets are distinct objects per view (not one shared list)
@@ -245,7 +327,7 @@ def test_d052_hline_labels_are_full_words():
     # the label must LEAD with a full word (a parenthetical abbreviation
     # like "Point of Control (POC)" is fine; a bare "POC" is not)
     full_words = (
-        "Previous", "Buy", "Sell", "Point", "Time",
+        "Previous", "Buy", "Sell", "Point", "Time", "Equilibrium",
     )
     for d in hlines:
         assert d["label"].split()[0] in full_words, f"{d['label']} not worded"
