@@ -1,7 +1,13 @@
 /**
- * ChartsView (D-041) — the chart tab: pair + timeframe pills, the live chart,
- * and the SIGNAL ANALYSIS panel (when each signal fired, its entries, and the
- * exact factors the AI verified — the user's requested panel).
+ * ChartsView (D-041/D-053) — the chart tab: pair + timeframe pills, the
+ * live chart, and the SIGNAL ANALYSIS panel (when each signal fired, its
+ * entries, and the exact factors the AI verified — the user's requested
+ * panel).
+ *
+ * D-053 — this tab's chart runs in "signals" mode: ONLY the entry-setup
+ * drawing + signal markers render. The problem-analysis marks (FVG / OB /
+ * liquidity / structure) live on the HOME chart instead — user directive:
+ * they bury the signals here ("এতে করে সিগন্যাল বুঝা যায় না").
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -175,7 +181,7 @@ export default function ChartsView({
         </div>
       </Card>
 
-      {/* chart */}
+      {/* chart — D-053: signals variant (setup + signal marks ONLY) */}
       <div className="h-[52vh] min-h-[320px] w-full min-w-0 sm:h-[56vh] lg:h-[60vh]">
         <ErrorBoundary label="Chart">
           <PriceChart
@@ -189,6 +195,7 @@ export default function ChartsView({
             wsConnected={wsState === "open"}
             onDesync={onDesync}
             analysis={analysis}
+            variant="signals"
           />
         </ErrorBoundary>
       </div>

@@ -255,6 +255,24 @@ def test_d052_drawings_window_is_bounded():
             assert pd.Timestamp(d["t"]) >= t_start - pd.Timedelta(minutes=1)
 
 
+def test_d053_drawing_state_marks_faded_marks():
+    """D-053 — fadeable marks carry an explicit state so the frontend can
+    render broken trendlines / tested order blocks THIN (user directive:
+    faded drawings get thin text + thin lines, active ones stay hard)."""
+    frames = _frames()
+    snaps = _snaps(frames)
+    price = float(frames["M1"]["c"].iloc[-1])
+    for tf in ("M1", "M5", "M15"):
+        out = build_drawings(frames, snaps, price, [], tf=tf)
+        for d in out:
+            if d["kind"] == "trendline":
+                assert d["state"] in ("active", "faded")
+                assert (d["state"] == "faded") == bool(d.get("broken"))
+            if d["kind"] == "zone" and d["side"] in ("ob_bull", "ob_bear"):
+                assert d["state"] in ("active", "faded")
+                assert (d["state"] == "faded") == d["label"].endswith("· tested")
+
+
 async def test_d052_analysis_service_serves_per_tf_drawings():
     """The /api/analysis snapshot carries drawings_by_tf — one drawing set
     per timeframe, so the frontend overlay never goes blank on a TF

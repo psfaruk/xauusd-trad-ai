@@ -259,6 +259,9 @@ def _zone_drawings(
                 "t": _iso(ob.get("t")), "label": label,
                 "tone": "bull" if side == "bullish" else "bear",
                 "source_tf": source_tf,
+                # D-053 — mitigated blocks render THIN (user directive:
+                # "মোছে যাওয়া অঙ্কনগুলোর লেখা চিকন")
+                "state": "faded" if ob.get("mitigated") else "active",
             })
         for g in (s.get("fvgs") or [])[-3:]:
             if g.get("filled"):
@@ -320,6 +323,8 @@ def _trendlines(df: pd.DataFrame | None, atr: float) -> list[dict]:
             "t2": _iso(p2["t"]), "p2": round(float(p2["price"]), 2),
             "label": name + (" · broken" if broken else ""),
             "tone": tone, "broken": broken,
+            # D-053 — broken lines render THIN + faded
+            "state": "faded" if broken else "active",
         })
     return out
 

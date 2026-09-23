@@ -906,7 +906,8 @@ export interface HLineDrawing {
 }
 
 /** D-052 — labeled zone box (supply/demand/order block/FVG), drawn from
- *  its origin time to the right edge exactly like the reference charts. */
+ *  its origin time to the right edge exactly like the reference charts.
+ *  D-053 — `state` drives the THIN ghost render for faded marks. */
 export interface ZoneDrawing {
   kind: "zone";
   side: "supply" | "demand" | "ob_bull" | "ob_bear" | "fvg_bull" | "fvg_bear";
@@ -916,6 +917,7 @@ export interface ZoneDrawing {
   label: string;
   tone: DrawingTone;
   source_tf: string;
+  state?: "active" | "faded";
 }
 
 /** D-052 — channel: upper + lower parallel lines + dashed median. */
@@ -959,7 +961,8 @@ export interface ArrowDrawing {
   tone: DrawingTone;
 }
 
-/** Trendline through the last two swing points, projected forward. */
+/** Trendline through the last two swing points, projected forward.
+ *  D-053 — `state` drives the THIN ghost render for broken lines. */
 export interface TrendlineDrawing {
   kind: "trendline";
   t1: string;
@@ -969,6 +972,7 @@ export interface TrendlineDrawing {
   label: string;
   tone: DrawingTone;
   broken: boolean;
+  state?: "active" | "faded";
 }
 
 /** Fibonacci retracement of the active leg + OTE (0.62–0.79) band. */

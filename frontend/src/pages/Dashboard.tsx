@@ -336,6 +336,13 @@ export default function Dashboard() {
               stats={stats}
               onOpenAi={() => navigate("ai")}
               onOpenSignal={openSignalAnalysis}
+              tf={tf}
+              onTfChange={setTf}
+              candles={candles}
+              candlesLoading={candlesQuery.isLoading}
+              wsConnected={wsState === "open"}
+              onDesync={onDesync}
+              token={token ?? ""}
             />
           )}
           {activeTab === "charts" && (
