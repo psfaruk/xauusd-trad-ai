@@ -90,11 +90,12 @@ def size_lot(
 
 @dataclass(frozen=True)
 class KillSwitchVerdict:
-    """Outcome of the pre-order checks (SPEC §9 kill switches)."""
+    """Outcome of the pre-order checks (SPEC §9 kill switches + D-052)."""
 
     allowed: bool
     reason: str = ""
     kill_daily_loss: bool = False  # triggers close-all + auto_trade=false
+    kill_profit: bool = False      # D-052: target reached -> lock profit, OFF
 
 
 async def evaluate_kill_switches(
@@ -106,16 +107,18 @@ async def evaluate_kill_switches(
     day_start_equity: float | None = None,
     positions: list | None = None,
 ) -> KillSwitchVerdict:
-    """Check all three kill switches before EVERY order (SPEC §9).
+    """Check all kill switches before EVERY order (SPEC §9 + D-052).
 
     The daily-loss emergency is evaluated FIRST — even when max_positions
     would skip the order, a breached daily loss must still close everything
     and disarm (a bleeding open position must never be left unhandled).
 
-    1. daily realized+floating loss >= daily_max_loss_pct -> close all,
-       auto_trade=false, CRITICAL log (handled by the caller via the flag)
-    2. max_positions reached -> skip
-    3. current spread > max_spread_points -> skip
+    1. daily realized+floating loss >= daily_loss_usd (D-052, USD window)
+       OR >= daily_max_loss_pct -> close all, auto_trade=false, CRITICAL log
+    2. daily profit >= daily_profit_usd (D-052) -> lock profit, close all,
+       auto_trade=false (user directive: any completed limit -> button OFF)
+    3. max_positions reached -> skip
+    4. current spread > max_spread_points -> skip
     """
     if positions is None:
         positions = await source.get_positions()
@@ -125,7 +128,20 @@ async def evaluate_kill_switches(
         info = await info
     if info is not None and day_start_equity:
         equity = float(info.get("equity", 0.0))
-        loss_pct = (day_start_equity - equity) / day_start_equity * 100.0
+        pnl = equity - day_start_equity
+        if cfg.daily_loss_usd > 0 and pnl <= -cfg.daily_loss_usd:
+            return KillSwitchVerdict(
+                False,
+                f"daily loss ${abs(pnl):.2f} >= stop loss ${cfg.daily_loss_usd:.2f}",
+                kill_daily_loss=True,
+            )
+        if cfg.daily_profit_usd > 0 and pnl >= cfg.daily_profit_usd:
+            return KillSwitchVerdict(
+                False,
+                f"daily profit ${pnl:.2f} >= target ${cfg.daily_profit_usd:.2f}",
+                kill_profit=True,
+            )
+        loss_pct = -pnl / day_start_equity * 100.0
         if loss_pct >= cfg.daily_max_loss_pct:
             return KillSwitchVerdict(
                 False,
@@ -359,12 +375,17 @@ class OrderExecutor:
     async def apply_config(self, cfg: EngineConfig) -> None:
         self._cfg = cfg
 
-    def arm(self, enabled: bool) -> None:
+    def arm(self, enabled: bool, day_start_equity: float | None = None) -> None:
         self.auto_trade = enabled
         self.last_skip_reason = None
         if enabled:
-            # reset the daily-loss anchor on arming
-            self._day_start_equity = None
+            # D-052 — the day anchor: the balance the user entered in the
+            # money-management window ("আজকের ট্রেডিং ব্যালেন্স"), else the
+            # account equity at arm time. All USD loss/profit checks
+            # measure from here.
+            self._day_start_equity = day_start_equity or None
+            self._day_key = None
+            self._day_trades = 0
 
     def set_owner(self, owner: str | None) -> None:
         """D-036 — re-scope the trades-table linkage (live plane: the arming
@@ -439,22 +460,35 @@ class OrderExecutor:
                 positions=positions,
             )
             if not verdict.allowed:
-                self.last_skip_reason = verdict.reason
                 if verdict.kill_daily_loss:
                     await self._emergency_stop()
+                elif verdict.kill_profit:
+                    await self._profit_lock_stop()
                 else:
+                    self.last_skip_reason = verdict.reason
                     await self._notify(verdict)
+                # NOTE: the reason is set AFTER the stops — arm(False)
+                # resets last_skip_reason, so ordering matters
+                if verdict.kill_daily_loss or verdict.kill_profit:
+                    self.last_skip_reason = verdict.reason
                 return None
 
             if not self._register_daily_trade():
+                # D-052 — the day's signal budget is COMPLETE: the button
+                # turns itself OFF (user directive: "এর যেকোনো একটি যদি
+                # সম্পুর্ণ হয়ে যায় বাটন টি অটো অফ হয়ে যাবে"). arm(False)
+                # resets last_skip_reason — disarm FIRST, state the reason
+                # after so the UI can surface why the AI turned itself off.
+                self.arm(False)
                 self.last_skip_reason = (
-                    f"daily trade budget reached "
+                    f"daily signal limit reached "
                     f"({self._cfg.max_trades_per_day}/day)"
                 )
                 await self._log(
                     "info",
-                    f"order skipped: {self.last_skip_reason} — "
-                    f"auto-trade resumes next UTC day",
+                    f"DAILY SIGNAL LIMIT REACHED ({self._cfg.max_trades_per_day} "
+                    f"signals) — auto-trade turned OFF; it can be turned "
+                    f"back on after filling the money-management window again",
                 )
                 return None
 
@@ -542,11 +576,31 @@ class OrderExecutor:
                 logger.info("kill-switch close %s -> %s", p.ticket, res.comment)
             except Exception:  # noqa: BLE001 — keep closing the rest
                 logger.exception("kill-switch close failed for %s", p.ticket)
-        self.arm(False)
         await self._log(
             "critical",
-            "KILL SWITCH: daily loss limit reached — auto-trade disarmed, all positions closed",
+            "KILL SWITCH: daily loss limit reached — auto-trade OFF, all positions closed",
         )
+        self.arm(False)
+
+    async def _profit_lock_stop(self) -> None:
+        """D-052 — daily target profit reached: lock the profit in (close
+        everything) and turn auto-trade OFF (the user's daily mission is
+        complete — no more risk today)."""
+        logger.info(
+            "DAILY PROFIT TARGET REACHED — locking profit, auto-trade OFF"
+        )
+        positions = await self._source.get_positions()
+        for p in positions:
+            try:
+                await self._source.close_position(p.ticket)
+            except Exception:  # noqa: BLE001 — keep closing the rest
+                logger.exception("profit-lock close failed for %s", p.ticket)
+        await self._log(
+            "info",
+            "DAILY PROFIT TARGET REACHED — profit locked, positions closed, "
+            "auto-trade turned OFF",
+        )
+        self.arm(False)
 
     async def _notify(self, verdict: KillSwitchVerdict) -> None:
         level = "critical" if verdict.kill_daily_loss else "info"

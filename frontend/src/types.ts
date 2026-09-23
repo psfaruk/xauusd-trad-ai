@@ -700,6 +700,12 @@ export interface UserSettings {
   rr: number;
   min_sl_atr: number;
   max_spread_points: number;
+  /** D-052 — daily stop loss in USD (0 = off) */
+  daily_loss_usd?: number;
+  /** D-052 — daily target profit in USD (0 = off) */
+  daily_profit_usd?: number;
+  /** D-052 — today's trading balance (the USD-window anchor) */
+  day_start_balance?: number;
   balance?: number;
   currency?: string;
 }
@@ -869,8 +875,11 @@ export interface AnalysisResponse {
   per_tf: Record<string, AnalysisSnapshot>;
   mtf: { bias: string; score: number; notes: string[] };
   errors: string[];
-  /** D-043 — professional auto-drawings (hlines/trendlines/fib/notes/setup) */
+  /** D-043 — professional auto-drawings (M1 view; legacy field) */
   drawings?: ChartDrawing[];
+  /** D-052 — per-timeframe drawing sets: switching TF re-draws its own
+   *  marks (recent 80–150 candles of that TF) — never a blank overlay */
+  drawings_by_tf?: Record<string, ChartDrawing[]>;
   /** D-044 — order-flow statistics (USD value, delta, whale zones) */
   flow?: FlowStats;
   /** D-047 — time-at-price profile: where the market SPENT TIME (S/R) */
@@ -887,13 +896,67 @@ export interface AnalysisResponse {
 
 export type DrawingTone = "bull" | "bear" | "gold" | "violet" | "neutral";
 
-/** Horizontal level a trader would mark (PDH/PDL/POC/BSL/SSL…). */
+/** Horizontal level a trader would mark (support/resistance/liquidity…). */
 export interface HLineDrawing {
   kind: "hline";
   price: number;
   label: string;
   tone: DrawingTone;
   style: "solid" | "dash";
+}
+
+/** D-052 — labeled zone box (supply/demand/order block/FVG), drawn from
+ *  its origin time to the right edge exactly like the reference charts. */
+export interface ZoneDrawing {
+  kind: "zone";
+  side: "supply" | "demand" | "ob_bull" | "ob_bear" | "fvg_bull" | "fvg_bear";
+  lo: number;
+  hi: number;
+  t: string | null;
+  label: string;
+  tone: DrawingTone;
+  source_tf: string;
+}
+
+/** D-052 — channel: upper + lower parallel lines + dashed median. */
+export interface ChannelDrawing {
+  kind: "channel";
+  dir: "up" | "down";
+  label: string;
+  tone: DrawingTone;
+  upper: { t1: string; p1: number; t2: string; p2: number };
+  lower: { t1: string; p1: number; t2: string; p2: number };
+  median: { t1: string; p1: number; t2: string; p2: number };
+}
+
+/** D-052 — liquidity sweep marker ("stop hunt" line at the swept pool). */
+export interface SweepDrawing {
+  kind: "sweep";
+  t: string | null;
+  price: number;
+  side: "high" | "low";
+  label: string;
+  tone: DrawingTone;
+}
+
+/** D-052 — BOS / CHoCH event chip anchored on the break candle. */
+export interface StructureDrawing {
+  kind: "structure";
+  t: string | null;
+  price: number;
+  dir: "up" | "down";
+  label: string;
+  tone: DrawingTone;
+}
+
+/** D-052 — direction projection arrow at a sweep / structure event. */
+export interface ArrowDrawing {
+  kind: "arrow";
+  t: string | null;
+  price: number;
+  dir: "up" | "down";
+  label: string;
+  tone: DrawingTone;
 }
 
 /** Trendline through the last two swing points, projected forward. */
@@ -947,6 +1010,11 @@ export interface SetupDrawing {
 
 export type ChartDrawing =
   | HLineDrawing
+  | ZoneDrawing
+  | ChannelDrawing
+  | SweepDrawing
+  | StructureDrawing
+  | ArrowDrawing
   | TrendlineDrawing
   | FibDrawing
   | NoteDrawing

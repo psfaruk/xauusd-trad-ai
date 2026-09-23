@@ -88,14 +88,21 @@ class AnalysisService:
             "mtf": mtf_bias(snapshots),
             "errors": errors,
         }
-        # D-043 — professional auto-drawings (hlines / trendlines / fib /
-        # notes / entry setups), rebuilt on every snapshot
-        if frames.get("M1") is not None and price > 0:
-            payload["drawings"] = build_drawings(
-                frames, snapshots, price, recent_signals
-            )
+        # D-052 — professional auto-drawings PER TIMEFRAME: every view
+        # (M1/M5/M15/H1/H4) gets its own drawing set anchored on its OWN
+        # recent 80–150 candles, so switching timeframes never destroys
+        # the overlay — each TF simply re-draws its own marks from the
+        # same 20s-cached snapshot (user directive: "টাইম ফ্রম পরিবর্তন
+        # করলেও ড্রয়িং নষ্ট হবে না").
+        if price > 0:
+            payload["drawings_by_tf"] = {
+                tf: build_drawings(frames, snapshots, price, recent_signals, tf=tf)
+                for tf in frames
+            }
         else:
-            payload["drawings"] = []
+            payload["drawings_by_tf"] = {}
+        # backward-compatible default view (M1 marks) for older clients
+        payload["drawings"] = payload["drawings_by_tf"].get("M1", [])
         # D-044 — order-flow statistics off the M1 tape
         payload["flow"] = flow_stats(frames["M1"]) if frames.get("M1") is not None else {}
         # D-047 — time-at-price profile: where the market SPENT TIME becomes

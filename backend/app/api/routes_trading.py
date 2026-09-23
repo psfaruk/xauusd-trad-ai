@@ -166,9 +166,23 @@ class SettingsBody(BaseModel):
     fixed_lot: float | None = Field(default=None, ge=0.01, le=100.0)
     max_positions: int | None = Field(default=None, ge=1, le=50)
     daily_max_loss_pct: float | None = Field(default=None, ge=0.5, le=100.0)
+    max_trades_per_day: int | None = Field(default=None, ge=1, le=100)
     rr: float | None = Field(default=None, ge=0.5, le=10.0)
     min_sl_atr: float | None = Field(default=None, ge=0.3, le=6.0)
     max_spread_points: int | None = Field(default=None, ge=5, le=500)
+    # ------------------------------------------------ D-052 money window
+    daily_loss_usd: float | None = Field(
+        default=None, ge=0.0,
+        description="daily stop loss in USD (0 = off)",
+    )
+    daily_profit_usd: float | None = Field(
+        default=None, ge=0.0,
+        description="daily target profit in USD (0 = off)",
+    )
+    day_start_balance: float | None = Field(
+        default=None, ge=0.0,
+        description="today's trading balance — the USD-window anchor",
+    )
 
 
 @router.get("/settings")

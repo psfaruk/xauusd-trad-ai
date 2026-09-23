@@ -321,7 +321,10 @@ class TestDailyTradeBudget:
         assert r1 is not None and r2 is not None
         r3 = await ex.execute_signal({**sig, "id": "s3"}, "XAUUSD", 0.01)
         assert r3 is None
-        assert "daily trade budget" in (ex.last_skip_reason or "")
+        # D-052 — the completed budget turns the AI OFF automatically
+        # (user directive: any completed limit -> button auto-off)
+        assert "daily signal limit" in (ex.last_skip_reason or "")
+        assert ex.auto_trade is False
 
     @pytest.mark.asyncio
     async def test_skips_do_not_consume_budget(self):

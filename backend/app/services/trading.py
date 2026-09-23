@@ -50,10 +50,14 @@ DEMO_START_BALANCE = 10_000.0
 #: user's risk profile is their own). D-049 — max_trades_per_day added:
 #: the user controls balance / risk / daily trade count; the app controls
 #: entries, SL and TP (user directive).
+#: D-052 — the money-management window's EXACT fields (Bengali directive):
+#: today's balance, stop loss USD, target profit USD, lot size, signals
+#: today, concurrent trades. One of them completing turns the AI OFF.
 USER_SETTING_FIELDS = (
     "risk_mode", "risk_percent", "fixed_lot", "max_positions",
     "daily_max_loss_pct", "max_trades_per_day", "rr", "min_sl_atr",
-    "max_spread_points",
+    "max_spread_points", "daily_loss_usd", "daily_profit_usd",
+    "day_start_balance",
 )
 
 #: D-046 — upsert of the user's settings row. NOTE: the jsonb cast MUST be
@@ -678,6 +682,9 @@ class UserTradingManager:
             "rr": (0.5, 10.0),
             "min_sl_atr": (0.3, 6.0),
             "max_spread_points": (5, 500),
+            "daily_loss_usd": (0.0, 1_000_000.0),
+            "daily_profit_usd": (0.0, 1_000_000.0),
+            "day_start_balance": (0.0, 100_000_000.0),
         }
         for k, v in (patch or {}).items():
             if k not in USER_SETTING_FIELDS or v is None:
@@ -698,6 +705,8 @@ class UserTradingManager:
                 int(num) if k in ("max_positions", "max_spread_points",
                                   "max_trades_per_day") else num
             )
+            if k in ("daily_loss_usd", "daily_profit_usd", "day_start_balance"):
+                clean[k] = round(num, 2)
         if self._db is None:
             return clean
         import json
@@ -929,13 +938,30 @@ class UserTradingManager:
 
     async def set_auto_trade(self, owner: str, enabled: bool) -> dict:
         """D-044 — arm/disarm the USER's own plane (practice account by
-        default; no broker link needed). Persists the arm state."""
+        default; no broker link needed). Persists the arm state.
+
+        D-052 — arming anchors the day on the balance the user entered in
+        the money-management window ("আজকের ট্রেডিং ব্যালেন্স"); every USD
+        loss/profit limit is measured from that anchor, and completing ANY
+        of them (stop loss / target profit / signal count) turns the AI
+        back OFF automatically.
+        """
         plane = self._planes.get(owner)
         if plane is None:
             if not enabled:
                 return {"auto_trade": False}
             plane = await self.ensure_plane(owner)  # practice plane always available
-        plane.executor.arm(enabled)
+        if enabled:
+            cfg = await self._user_cfg(owner)
+            anchor = float(cfg.day_start_balance or 0.0)
+            if anchor <= 0:
+                info = plane.source.account_info()
+                if asyncio.iscoroutine(info):
+                    info = await info
+                anchor = float((info or {}).get("equity", 0.0))
+            plane.executor.arm(True, day_start_equity=anchor or None)
+        else:
+            plane.executor.arm(False)
         if self._db is not None:
             try:
                 from sqlalchemy import text

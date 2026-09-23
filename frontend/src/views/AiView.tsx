@@ -85,7 +85,26 @@ function ToggleSwitch({
   );
 }
 
-/* ------------------------------------------- D-044 money management modal */
+/* ------------------------------------------- D-052 money management modal */
+
+/** The EXACT five questions from the user's directive (Bengali):
+ * [আপনার আজকের ট্রেডিং ব্যালেন্স অ্যাড করেন]
+ * [স্টপ লস কত টার্গেট প্রফিট কত usd]
+ * [লট সাইজ কত হবে]
+ * [আজকে কত গুলো সিগন্যাল Ai অটো প্লেস করবে]
+ * [একসাথে কত গুলো ট্রেড প্লেস করবে Ai]
+ * Every field must be filled before the button turns on, and the AI
+ * button turns itself OFF the moment any one limit completes.
+ */
+const MM_NUM_FIELDS = [
+  "day_start_balance",
+  "daily_loss_usd",
+  "daily_profit_usd",
+  "fixed_lot",
+  "max_trades_per_day",
+  "max_positions",
+] as const;
+type MmField = (typeof MM_NUM_FIELDS)[number];
 
 function MoneyManagementModal({
   token,
@@ -104,28 +123,43 @@ function MoneyManagementModal({
 
   useEffect(() => {
     getTradingSettings(token)
-      .then(setForm)
+      .then((s) => {
+        // prefill today's balance from the account when not set yet
+        if (!s.day_start_balance && balance != null && balance > 0) {
+          s.day_start_balance = Math.round(balance * 100) / 100;
+        }
+        setForm(s);
+      })
       .catch((e) => setError(e instanceof Error ? e.message : "failed to load"));
-  }, [token]);
+  }, [token, balance]);
 
-  const set = (k: keyof UserSettings, v: string) =>
-    setForm((f) => (f ? { ...f, [k]: v } : f));
+  const set = (k: MmField, v: string) =>
+    setForm((f) => (f ? { ...f, [k]: parseFloat(v) || 0 } : f));
+
+  const num = (k: MmField): number => {
+    const v = form?.[k];
+    return typeof v === "number" && Number.isFinite(v) ? v : 0;
+  };
+  const missing = MM_NUM_FIELDS.filter((k) => num(k) <= 0);
+  const allFilled = missing.length === 0;
 
   const saveAndArm = async () => {
-    if (!form) return;
+    if (!form || !allFilled) return;
     setBusy(true);
     setError(null);
     try {
       await putTradingSettings(token, {
-        risk_mode: form.risk_mode,
-        risk_percent: parseFloat(String(form.risk_percent)) || 0.5,
-        fixed_lot: parseFloat(String(form.fixed_lot)) || 0.01,
-        max_positions: parseInt(String(form.max_positions), 10) || 3,
-        daily_max_loss_pct: parseFloat(String(form.daily_max_loss_pct)) || 3,
-        max_trades_per_day: parseInt(String(form.max_trades_per_day), 10) || 6,
-        rr: parseFloat(String(form.rr)) || 1.6,
-        min_sl_atr: parseFloat(String(form.min_sl_atr)) || 1.5,
-        max_spread_points: parseInt(String(form.max_spread_points), 10) || 35,
+        // D-052 money-management window (the user's five questions)
+        day_start_balance: num("day_start_balance"),
+        daily_loss_usd: num("daily_loss_usd"),
+        daily_profit_usd: num("daily_profit_usd"),
+        fixed_lot: num("fixed_lot"),
+        max_trades_per_day: Math.round(num("max_trades_per_day")),
+        max_positions: Math.round(num("max_positions")),
+        // lot size governs every AI order (fixed-lot mode)
+        risk_mode: "fixed",
+        // the USD stop loss replaces the percent fallback for today
+        daily_max_loss_pct: 100,
       });
       await postMt5AutoTrade(token, { enabled: true });
       onDone();
@@ -146,7 +180,7 @@ function MoneyManagementModal({
           <div className="min-w-0">
             <p className="text-sm font-bold text-zinc-100">Money Management</p>
             <p className="text-[10px] text-zinc-500">
-              Protect your balance — the AI trades inside these limits
+              Fill every field to turn the AI on — it trades inside these limits
             </p>
           </div>
           <button
@@ -167,107 +201,114 @@ function MoneyManagementModal({
             </div>
           ) : (
             <>
-              {/* lot sizing mode */}
-              <Field label="Position sizing">
-                <div className="grid grid-cols-2 gap-2">
-                  {(["percent", "fixed"] as const).map((m) => (
-                    <button
-                      key={m}
-                      type="button"
-                      onClick={() => set("risk_mode", m)}
-                      className={`rounded-lg border px-3 py-2 text-xs font-semibold transition-colors ${
-                        form.risk_mode === m
-                          ? "border-gold/60 bg-gold/15 text-gold"
-                          : "border-zinc-700 bg-zinc-900 text-zinc-400"
-                      }`}
-                    >
-                      {m === "percent" ? "% of balance" : "Fixed lot"}
-                    </button>
-                  ))}
-                </div>
+              {/* 1 — today's trading balance */}
+              <Field
+                label="Today's Trading Balance (USD)"
+                hint={
+                  balance != null && balance > 0
+                    ? `Your account balance right now: $${balance.toFixed(2)}`
+                    : "The balance all daily limits are measured from"
+                }
+              >
+                <input
+                  className={inputCls}
+                  value={String(form.day_start_balance ?? "")}
+                  onChange={(e) => set("day_start_balance", e.target.value)}
+                  inputMode="decimal"
+                  placeholder="0.00"
+                />
               </Field>
 
-              {form.risk_mode === "percent" ? (
-                <Field
-                  label="Risk per trade (% of balance)"
-                  hint={
-                    balance != null && balance > 0
-                      ? `≈ $${((balance * (parseFloat(String(form.risk_percent)) || 0)) / 100).toFixed(2)} per trade at $${balance.toFixed(0)} balance`
-                      : "0.5% keeps a losing streak survivable"
-                  }
-                >
-                  <input
-                    className={inputCls}
-                    value={String(form.risk_percent)}
-                    onChange={(e) => set("risk_percent", e.target.value)}
-                    inputMode="decimal"
-                  />
-                </Field>
-              ) : (
-                <Field label="Lot size" hint="Fixed volume for every AI order">
-                  <input
-                    className={inputCls}
-                    value={String(form.fixed_lot)}
-                    onChange={(e) => set("fixed_lot", e.target.value)}
-                    inputMode="decimal"
-                  />
-                </Field>
-              )}
-
+              {/* 2 — stop loss / target profit (USD) */}
               <div className="grid grid-cols-2 gap-2.5">
-                <Field label="Max open trades" hint="Multiple entries can run together">
+                <Field label="Stop Loss (USD)" hint="AI turns OFF if the day loses this much">
                   <input
                     className={inputCls}
-                    value={String(form.max_positions)}
-                    onChange={(e) => set("max_positions", e.target.value)}
-                    inputMode="numeric"
-                  />
-                </Field>
-                <Field label="Trades per day" hint="Auto orders allowed per UTC day">
-                  <input
-                    className={inputCls}
-                    value={String(form.max_trades_per_day)}
-                    onChange={(e) => set("max_trades_per_day", e.target.value)}
-                    inputMode="numeric"
-                  />
-                </Field>
-                <Field label="Daily loss limit (%)">
-                  <input
-                    className={inputCls}
-                    value={String(form.daily_max_loss_pct)}
-                    onChange={(e) => set("daily_max_loss_pct", e.target.value)}
+                    value={String(form.daily_loss_usd ?? "")}
+                    onChange={(e) => set("daily_loss_usd", e.target.value)}
                     inputMode="decimal"
+                    placeholder="0.00"
                   />
                 </Field>
-                <Field
-                  label="Fallback R:R"
-                  hint="TP multiple when no zone/liquidity target is near — targets are otherwise predicted from market structure"
-                >
+                <Field label="Target Profit (USD)" hint="AI turns OFF when profit reaches this">
                   <input
                     className={inputCls}
-                    value={String(form.rr)}
-                    onChange={(e) => set("rr", e.target.value)}
+                    value={String(form.daily_profit_usd ?? "")}
+                    onChange={(e) => set("daily_profit_usd", e.target.value)}
                     inputMode="decimal"
-                  />
-                </Field>
-                <Field label="Min stop (ATR×)" hint="Wider stop = less spread noise">
-                  <input
-                    className={inputCls}
-                    value={String(form.min_sl_atr)}
-                    onChange={(e) => set("min_sl_atr", e.target.value)}
-                    inputMode="decimal"
+                    placeholder="0.00"
                   />
                 </Field>
               </div>
 
-              <Field label="Max spread (points)" hint="AI skips signals when the spread is wider">
+              {/* 3 — lot size */}
+              <Field label="Lot Size" hint="Every AI order uses this volume">
                 <input
                   className={inputCls}
-                  value={String(form.max_spread_points)}
-                  onChange={(e) => set("max_spread_points", e.target.value)}
-                  inputMode="numeric"
+                  value={String(form.fixed_lot ?? "")}
+                  onChange={(e) => set("fixed_lot", e.target.value)}
+                  inputMode="decimal"
+                  placeholder="0.01"
                 />
               </Field>
+
+              {/* 4 + 5 — signals today / trades at once */}
+              <div className="grid grid-cols-2 gap-2.5">
+                <Field label="Signals AI Will Place Today" hint="Daily auto-signal budget">
+                  <input
+                    className={inputCls}
+                    value={String(form.max_trades_per_day ?? "")}
+                    onChange={(e) => set("max_trades_per_day", e.target.value)}
+                    inputMode="numeric"
+                    placeholder="6"
+                  />
+                </Field>
+                <Field label="Trades at the Same Time" hint="Maximum open positions together">
+                  <input
+                    className={inputCls}
+                    value={String(form.max_positions ?? "")}
+                    onChange={(e) => set("max_positions", e.target.value)}
+                    inputMode="numeric"
+                    placeholder="3"
+                  />
+                </Field>
+              </div>
+
+              {/* the auto-off rule, stated clearly */}
+              <div className="rounded-xl border border-amber-500/25 bg-amber-500/5 px-3 py-2.5">
+                <p className="text-[11px] leading-relaxed text-amber-200/90">
+                  <span className="font-semibold text-amber-300">Auto-OFF rule:</span>{" "}
+                  when any ONE of these completes — stop loss hit, target profit
+                  reached, or the day's signal count finished — the AI button
+                  turns itself OFF automatically.
+                </p>
+              </div>
+
+              {/* missing-fields checklist (the gate) */}
+              {!allFilled && (
+                <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 px-3 py-2">
+                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                    Fill these to enable the button
+                  </p>
+                  <ul className="flex flex-col gap-0.5">
+                    {missing.map((k) => (
+                      <li key={k} className="text-[11px] text-zinc-400">
+                        <span className="mr-1.5 text-amber-400">•</span>
+                        {
+                          {
+                            day_start_balance: "Today's Trading Balance",
+                            daily_loss_usd: "Stop Loss (USD)",
+                            daily_profit_usd: "Target Profit (USD)",
+                            fixed_lot: "Lot Size",
+                            max_trades_per_day: "Signals AI Will Place Today",
+                            max_positions: "Trades at the Same Time",
+                          }[k]
+                        }
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
               {error && (
                 <p className="break-words rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
@@ -276,8 +317,17 @@ function MoneyManagementModal({
               )}
 
               <div className="flex flex-col gap-2 pt-1">
-                <Btn variant="success" onClick={() => void saveAndArm()} disabled={busy} className="w-full">
-                  {busy ? "Arming…" : "Save & Turn ON Auto-Trading"}
+                <Btn
+                  variant="success"
+                  onClick={() => void saveAndArm()}
+                  disabled={busy || !allFilled}
+                  className="w-full"
+                >
+                  {busy
+                    ? "Arming…"
+                    : allFilled
+                      ? "Save & Turn ON Auto-Trading"
+                      : "Fill every field to turn ON"}
                 </Btn>
                 <p className="text-center text-[10px] leading-relaxed text-zinc-500">
                   Orders execute on YOUR account with SL/TP attached and
@@ -350,8 +400,8 @@ function ArmCard({
         <>
           <p className="min-w-0 text-[11px] leading-relaxed text-zinc-400">
             {armed
-              ? "Engine armed. Every M1 bar close is analyzed (H1/H4 structure, M5 + M15 confirmation, ICT zones & liquidity, order flow, news windows, pattern trigger) and confirmed signals execute on your account automatically."
-              : why?.text ?? "Turn the switch on to enable automatic execution."}
+              ? "Engine armed. Every M1 bar close is analyzed (H1/H4 structure, M5 + M15 confirmation, ICT zones & liquidity, order flow, news windows, pattern trigger) and confirmed signals execute on your account automatically. The button turns itself OFF when your stop loss, target profit, or the day's signal count completes."
+              : why?.text ?? "Turn the switch on — the money-management window opens first: today's balance, stop loss, target profit, lot size, signals today and trades at once."}
           </p>
 
           {/* the switch (D-042 — replaces typing "ENABLE") */}
@@ -456,6 +506,10 @@ function fmtUsd(v: number | undefined | null): string {
 
 function MarketIntelligenceCard({ token, symbol }: { token: string; symbol: string }) {
   const [snap, setSnap] = useState<AnalysisResponse | null>(null);
+  // D-052 — collapsed by default: the summary row stays, the detail
+  // blocks (POI zones, TPO, news, CFTC) open on tap — a decluttered
+  // mobile layout (user directive: গুছানো সহজ ডিজাইন)
+  const [open, setOpen] = useState(false);
 
   const reload = useCallback(() => {
     getAnalysis(token, symbol)
@@ -480,12 +534,16 @@ function MarketIntelligenceCard({ token, symbol }: { token: string; symbol: stri
       <SectionTitle
         title="Market Intelligence"
         right={
-          <Badge tone={news?.blackout_now ? "red" : "zinc"}>
-            {news?.blackout_now ? "NEWS WINDOW" : "live"}
-          </Badge>
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            className="rounded-full border border-zinc-700 bg-zinc-800/60 px-3 py-1 text-[10px] font-bold text-zinc-400 hover:text-zinc-200"
+          >
+            {open ? "Hide details ▲" : "Details ▼"}
+          </button>
         }
       />
-      {/* order flow */}
+      {/* order flow — always visible summary */}
       <div className="grid grid-cols-3 gap-2">
         <Stat label="Flow 24h" value={fmtUsd(flow?.usd_24h)} hint="est. traded value" />
         <Stat label="Flow 1h" value={fmtUsd(flow?.usd_1h)} hint="est. traded value" />
@@ -515,8 +573,11 @@ function MarketIntelligenceCard({ token, symbol }: { token: string; symbol: stri
             whale flow {flow.bias}
           </Badge>
         )}
+        {news?.blackout_now && <Badge tone="red">NEWS WINDOW</Badge>}
       </div>
 
+      {!open ? null : (
+        <>
       {/* institutional entry zones (whale) */}
       {flow?.whale_zones && flow.whale_zones.length > 0 && (
         <div className="mt-3 min-w-0">
@@ -685,6 +746,8 @@ function MarketIntelligenceCard({ token, symbol }: { token: string; symbol: stri
           <p className="text-[11px] text-zinc-500">Positioning report unavailable.</p>
         )}
       </div>
+        </>
+      )}
     </Card>
   );
 }
@@ -1053,11 +1116,14 @@ export default function AiView({
         </Card>
       )}
 
+      {/* D-052 — ordered mobile-app flow: what the AI does now, then your
+          account (positions + history), then manual tools, market context
+          last (collapsible) */}
       <EventFeed events={autoEvents} />
-      <MarketIntelligenceCard token={token} symbol={symbol} />
-      <ManualTradeCard token={token} symbols={symbols} refresh={bump} />
       <PositionsCard token={token} refreshKey={refreshKey + tick} onChanged={bump} />
+      <ManualTradeCard token={token} symbols={symbols} refresh={bump} />
       <HistoryCard token={token} refreshKey={refreshKey + tick} />
+      <MarketIntelligenceCard token={token} symbol={symbol} />
     </div>
   );
 }

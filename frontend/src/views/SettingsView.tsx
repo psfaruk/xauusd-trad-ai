@@ -137,18 +137,21 @@ function BrokerCard({
 
 /* -------------------------------------------------------- engine settings */
 
+/** D-052 — STRATEGY-ONLY engine fields, full-word labels.
+ *
+ * Money-management criteria (balance, stop loss, target profit, lot
+ * size, signals per day, concurrent trades) live ONLY in the AI tab's
+ * money-management window — never duplicated here (user directive:
+ * "একই বিষয় দুই জায়গায় থাকবে না"). Trade-stopping instructions are
+ * likewise absent from this section.
+ */
 const ENGINE_NUM_FIELDS: { key: keyof EngineConfig; label: string; hint?: string; step?: string }[] = [
-  { key: "rr", label: "Risk:Reward", hint: "TP distance = RR × SL distance", step: "0.1" },
-  { key: "min_sl_atr", label: "Min SL (×ATR)", hint: "stop never closer than this — spread floor", step: "0.1" },
-  { key: "min_atr", label: "Min ATR", hint: "skip dead markets", step: "0.05" },
-  { key: "risk_percent", label: "Risk %", step: "0.1" },
-  { key: "fixed_lot", label: "Fixed lot", step: "0.01" },
-  { key: "max_spread_points", label: "Max spread (points)" },
-  { key: "cooldown_bars", label: "Cooldown (bars)" },
-  { key: "expiry_bars", label: "Expiry (bars)" },
-  { key: "trusted_min_votes", label: "Trusted votes", hint: "D-051: trusted core (whale ×2, M1 structure, sweep, zone) fires the signal", step: "0.5" },
-  { key: "pending_target_usd", label: "Pending target $", hint: "preferred entry distance from market", step: "0.5" },
-  { key: "pending_max_usd", label: "Pending max $", hint: "hard cap — orders further than this never fill", step: "0.5" },
+  { key: "trusted_min_votes", label: "Trusted Strategy Votes", hint: "how many trusted strategies must vote together — whale flow counts double", step: "0.5" },
+  { key: "pending_target_usd", label: "Preferred Pending Distance (USD)", hint: "how far from the market pending orders are placed", step: "0.5" },
+  { key: "pending_max_usd", label: "Maximum Pending Distance (USD)", hint: "hard cap — orders further than this never fill", step: "0.5" },
+  { key: "min_atr", label: "Minimum Volatility (ATR)", hint: "skip dead markets — signals need movement", step: "0.05" },
+  { key: "cooldown_bars", label: "Cooldown After Each Signal (bars)", step: "1" },
+  { key: "expiry_bars", label: "Pending Order Expiry (bars)", hint: "unfilled orders cancel after this many bars", step: "1" },
 ];
 
 /** D-051 — the markets on offer (broker suffixes normalize server-side). */
@@ -231,7 +234,7 @@ function EngineCard({ token, isAdmin }: { token: string; isAdmin: boolean }) {
   if (!cfg) {
     return (
       <Card>
-        <SectionTitle title="AI Engine Settings" />
+        <SectionTitle title="AI Engine" />
         <div className="flex flex-col gap-2">
           <div className="h-4 w-2/3 animate-pulse rounded bg-zinc-800" />
           <div className="h-4 w-1/2 animate-pulse rounded bg-zinc-800" />
@@ -243,23 +246,26 @@ function EngineCard({ token, isAdmin }: { token: string; isAdmin: boolean }) {
   return (
     <Card>
       <SectionTitle
-        title="AI Engine Settings"
+        title="AI Engine"
         right={
           <Badge tone="blue">
-            {cfg.timeframe} · {(cfg.confirm_tfs ?? []).join("+")} confirm · {cfg.trend_tf} trend
+            {cfg.timeframe} · {(cfg.confirm_tfs ?? []).join(" + ")} confirm · {cfg.trend_tf} trend
           </Badge>
         }
       />
       <p className="mb-3 text-[11px] leading-relaxed text-zinc-400">
-        The engine trades the <b className="text-zinc-200">{cfg.timeframe}</b> timeframe:
-        {" "}{cfg.trend_tf} sets the trend, {(cfg.confirm_tfs ?? []).join(" + ") || "higher TFs"} must
-        confirm, then an M1 pattern (liquidity sweep or trend pullback) triggers the entry.
+        Strategy engine — trades the <b className="text-zinc-200">{cfg.timeframe}</b>{" "}
+        timeframe: {cfg.trend_tf} sets the trend,{" "}
+        {(cfg.confirm_tfs ?? []).join(" + ") || "higher timeframes"} confirm, then an
+        M1 pattern (liquidity sweep or trend pullback) triggers the entry.
+        Money-management limits live in the AI tab's money-management window —
+        not here.
       </p>
 
       {/* D-051 — per-market controls: which markets SIGNAL, which EXECUTE */}
       <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
         <MarketToggles
-          label="Signal markets"
+          label="Signal Markets"
           hint="One engine per market — signals always generate, auto-trade or not."
           options={MARKETS}
           value={cfg.signal_symbols ?? ["XAUUSD"]}
@@ -271,8 +277,8 @@ function EngineCard({ token, isAdmin }: { token: string; isAdmin: boolean }) {
           }}
         />
         <MarketToggles
-          label="Auto-trade markets"
-          hint="Orders execute ONLY here (users activate which markets auto-trade runs on)."
+          label="Auto-Trade Markets"
+          hint="Orders execute ONLY on these markets (you choose which ones)."
           options={cfg.signal_symbols ?? MARKETS}
           value={cfg.auto_trade_symbols ?? []}
           disabled={!isAdmin}
@@ -303,14 +309,7 @@ function EngineCard({ token, isAdmin }: { token: string; isAdmin: boolean }) {
           disabled={!isAdmin}
           onClick={() => patch({ pullback_enabled: !cfg.pullback_enabled })}
         >
-          Pullback trigger: {cfg.pullback_enabled ? "ON" : "OFF"}
-        </Btn>
-        <Btn
-          variant={cfg.risk_mode === "percent" ? "gold" : "default"}
-          disabled={!isAdmin}
-          onClick={() => patch({ risk_mode: cfg.risk_mode === "percent" ? "fixed" : "percent" })}
-        >
-          Risk mode: {cfg.risk_mode}
+          Pullback Trigger: {cfg.pullback_enabled ? "ON" : "OFF"}
         </Btn>
       </div>
 

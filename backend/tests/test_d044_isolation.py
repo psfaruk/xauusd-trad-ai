@@ -225,7 +225,12 @@ class _Resp:
 
 
 class _Http:
-    """Fake httpx client serving ForexFactory-shaped fixtures."""
+    """Fake httpx client serving ForexFactory-shaped fixtures.
+
+    D-052 fix: fixture dates are RELATIVE to now (the old fixed
+    2026-09-22..25 dates fell out of the rolling [now-1h, now+7d] window
+    the day after they were written, turning this test red for no reason).
+    """
 
     def __init__(self, fail=False):
         self.fail = fail
@@ -233,23 +238,25 @@ class _Http:
     async def get(self, url, **kw):
         if self.fail:
             return _Resp(status_code=429, data=[])
+        now = datetime.now(tz=UTC)
+        in_ = lambda hours: (now + timedelta(hours=hours)).isoformat()  # noqa: E731
         if "ff_calendar_thisweek" in url:
             return _Resp(data=[
                 {"title": "Fed Interest Rate Decision", "country": "USD",
-                 "date": "2026-09-22T14:30:00-04:00", "impact": "High",
+                 "date": in_(2), "impact": "High",
                  "forecast": "4.25%", "previous": "4.50%"},
                 {"title": "EU Summit", "country": "EUR",
-                 "date": "2026-09-23T05:00:00-04:00", "impact": "High"},
+                 "date": in_(26), "impact": "High"},
                 {"title": "Core CPI m/m", "country": "USD",
-                 "date": "2026-09-24T08:30:00-04:00", "impact": "Medium"},
+                 "date": in_(48), "impact": "Medium"},
                 {"title": "Low-impact thing", "country": "USD",
-                 "date": "2026-09-24T10:00:00-04:00", "impact": "Low"},
+                 "date": in_(50), "impact": "Low"},
             ])
         if "ff_calendar_nextweek" in url:
             return _Resp(data=[])
         if "economic_calendar" in url:
             return _Resp(data=[
-                {"date": "2026-09-25T10:00:00-04:00", "country": "US",
+                {"date": in_(72), "country": "US",
                  "impact": "High", "event": "GDP q/q", "estimate": "2.1%",
                  "previous": "1.8%"}
             ])

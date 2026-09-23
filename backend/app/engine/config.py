@@ -147,6 +147,27 @@ class EngineConfig(BaseModel):
     fixed_lot: float = Field(0.01, gt=0)
     max_positions: int = Field(3, ge=1)
     daily_max_loss_pct: float = Field(3.0, gt=0)
+    # -------------------------------------------------- D-052 money window
+    daily_loss_usd: float = Field(
+        0.0, ge=0,
+        description="D-052 — user-directed DAILY STOP LOSS in USD (0 = off): "
+                    "when realized+floating loss from the day-start balance "
+                    "reaches this, auto-trade turns OFF (button auto-off, "
+                    "user directive: 'স্টপ লস কত টার্গেট প্রফিট কত usd')",
+    )
+    daily_profit_usd: float = Field(
+        0.0, ge=0,
+        description="D-052 — user-directed DAILY TARGET PROFIT in USD "
+                    "(0 = off): when reached, profit is locked, all "
+                    "positions close and auto-trade turns OFF",
+    )
+    day_start_balance: float = Field(
+        0.0, ge=0,
+        description="D-052 — 'আজকের ট্রেডিং ব্যালেন্স' the user enters in "
+                    "the money-management window: the anchor the USD "
+                    "loss/profit checks measure from (0 = use account "
+                    "equity at arm time)",
+    )
     max_trades_per_day: int = Field(
         6, ge=1, le=100,
         description="D-049 — user-directed daily auto-trade budget: how "

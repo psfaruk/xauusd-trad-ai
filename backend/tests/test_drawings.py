@@ -137,6 +137,149 @@ def test_trendline_and_fib_from_htf_frames():
     assert f["t0"] != f["t1"]
 
 
+# ------------------------------------------------------ D-052 drawings
+
+
+def test_d052_zone_drawings_with_full_word_labels():
+    """Labeled zone boxes (S/D + OB + FVG) carry full-word labels."""
+    frames = _frames()
+    snaps = _snaps(frames)
+    price = float(frames["M1"]["c"].iloc[-1])
+    for tf in ("M1", "M5", "M15"):
+        out = build_drawings(frames, snaps, price, [], tf=tf)
+        zones = [d for d in out if d["kind"] == "zone"]
+        assert zones, f"{tf}: swing-rich frames must yield zone boxes"
+        for z in zones:
+            assert z["lo"] < z["hi"]
+            assert isinstance(z["label"], str) and len(z["label"]) > 4
+            # full words, never cryptic 2-letter tags
+            assert z["label"].split()[0] in (
+                "Supply", "Demand", "Bullish", "Bearish", "Fair",
+            )
+            assert z["source_tf"] in ("M1", "M5", "M15", "H1", "H4")
+
+
+def test_d052_every_tf_gets_its_own_drawing_set():
+    """The per-TF contract: each view draws from its OWN frame — switching
+    timeframes never wipes the overlay (user directive)."""
+    frames = _frames()
+    snaps = _snaps(frames)
+    price = float(frames["M1"]["c"].iloc[-1])
+    sets = {
+        tf: build_drawings(frames, snaps, price, [], tf=tf)
+        for tf in ("M1", "M5", "M15", "H1")
+    }
+    for tf, out in sets.items():
+        assert out, f"{tf} view must carry drawings"
+        # every mark is bounded (a pro chart never floods)
+        assert len(out) <= 34
+        # hlines survive on every view (no time anchor to lose)
+        assert any(d["kind"] == "hline" for d in out)
+    # the sets are distinct objects per view (not one shared list)
+    assert sets["M1"] is not sets["M5"]
+
+
+def test_d052_channel_with_median_line():
+    """A swing-rich rising frame yields a channel with upper/lower/median."""
+    base = pd.Timestamp("2025-01-06 12:00", tz="UTC")
+    frames = {"M15": wavy_frame(base, 15, start=81.6, bars=120)}
+    snaps = _snaps(frames)
+    price = float(frames["M15"]["c"].iloc[-1])
+    out = build_drawings(frames, snaps, price, [], tf="M15")
+    channels = [d for d in out if d["kind"] == "channel"]
+    assert channels, "wavy HH/HL frame must yield a channel"
+    ch = channels[0]
+    assert ch["label"] in ("Ascending Channel", "Descending Channel")
+    for part in ("upper", "lower", "median"):
+        assert ch[part]["t1"] and ch[part]["p1"] is not None
+
+
+def test_d052_hline_labels_are_full_words():
+    """No cryptic PDH/POC/BSL-only tags — every level label is worded."""
+    frames = _frames()
+    snaps = _snaps(frames)
+    price = float(frames["M1"]["c"].iloc[-1])
+    out = build_drawings(frames, snaps, price, [], tf="M1")
+    hlines = [d for d in out if d["kind"] == "hline"]
+    assert hlines
+    # the label must LEAD with a full word (a parenthetical abbreviation
+    # like "Point of Control (POC)" is fine; a bare "POC" is not)
+    full_words = (
+        "Previous", "Buy", "Sell", "Point", "Time",
+    )
+    for d in hlines:
+        assert d["label"].split()[0] in full_words, f"{d['label']} not worded"
+        assert len(d["label"]) > 6
+
+
+def test_d052_structure_and_sweep_drawings():
+    """BOS/CHoCH chips + sweep lines use full-word labels with anchors."""
+    frames = _frames()
+    snaps = _snaps(frames)
+    price = float(frames["M1"]["c"].iloc[-1])
+    out = build_drawings(frames, snaps, price, [], tf="M1")
+    kinds = {d["kind"] for d in out}
+    # structure events exist on the ICT tape (it has breaks)
+    if "structure" in kinds:
+        s = next(d for d in out if d["kind"] == "structure")
+        assert s["label"].split()[0] in ("BOS", "CHoCH")
+        assert "Break of Structure" in s["label"] or "Change of Character" in s["label"]
+    # sweeps (when present) are worded
+    for d in (x for x in out if x["kind"] == "sweep"):
+        assert d["label"] in ("Liquidity Sweep High", "Liquidity Sweep Low")
+        assert d["side"] in ("high", "low")
+    # arrows (when present) carry a direction + worded label
+    for d in (x for x in out if x["kind"] == "arrow"):
+        assert d["dir"] in ("up", "down")
+        assert len(d["label"]) > 6
+
+
+def test_d052_drawings_window_is_bounded():
+    """Time-anchored marks sit in the recent 80-150 candles of the view."""
+    from app.analysis.drawings import DRAW_WINDOW_BARS
+
+    assert 80 <= DRAW_WINDOW_BARS <= 150
+    frames = _frames()
+    snaps = _snaps(frames)
+    price = float(frames["M1"]["c"].iloc[-1])
+    out = build_drawings(frames, snaps, price, [], tf="M15")
+    base = frames["M15"]
+    n = min(DRAW_WINDOW_BARS, len(base))
+    t_start = pd.Timestamp(base["time_utc"].iloc[-n])
+    for d in out:
+        if d["kind"] in ("zone",) and d.get("t"):
+            assert pd.Timestamp(d["t"]) >= t_start - pd.Timedelta(minutes=1)
+        if d["kind"] in ("structure", "sweep") and d.get("t"):
+            assert pd.Timestamp(d["t"]) >= t_start - pd.Timedelta(minutes=1)
+
+
+async def test_d052_analysis_service_serves_per_tf_drawings():
+    """The /api/analysis snapshot carries drawings_by_tf — one drawing set
+    per timeframe, so the frontend overlay never goes blank on a TF
+    switch (user directive: "টাইম ফ্রম পরিবর্তন করলেও ড্রয়িং নষ্ট হবে না")."""
+    from app.services.analysis import AnalysisService
+
+    class _Src:
+        platform_symbols = ["XAUUSD"]
+
+        async def get_rates(self, symbol, tf, limit):
+            return _frames().get(tf)
+
+        def get_tick(self, symbol):
+            return None
+
+    svc = AnalysisService(ttl_s=0.0)
+    payload = await svc.get(_Src(), "XAUUSD", [])
+    assert payload["drawings_by_tf"], "per-TF drawing sets must be present"
+    for tf in ("M1", "M5", "M15", "H1", "H4"):
+        assert tf in payload["drawings_by_tf"]
+        marks = payload["drawings_by_tf"][tf]
+        assert isinstance(marks, list)
+        assert any(d["kind"] == "hline" for d in marks), f"{tf} levels"
+    # the legacy default field stays backward compatible (M1 marks)
+    assert payload["drawings"] == payload["drawings_by_tf"]["M1"]
+
+
 # ------------------------------------------------- analyze_frame regression
 
 
