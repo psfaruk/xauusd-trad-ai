@@ -209,7 +209,8 @@ export function SignalDetail({ signal }: { signal: Signal }) {
         const trap = ctx.trap ?? null;
         const ses = ctx.session ?? null;
         const st = ctx.structure ?? null;
-        if (!phase && !trap && !ses && !st && !ctx.news) return null;
+        const fl = ctx.flow ?? null;
+        if (!phase && !trap && !ses && !st && !ctx.news && !fl) return null;
         return (
           <div className="min-w-0 rounded-xl border border-zinc-700/60 bg-zinc-800/40 p-2.5">
             <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
@@ -241,6 +242,20 @@ export function SignalDetail({ signal }: { signal: Signal }) {
                   P(REV) {Math.round(st.p_reversal * 100)}%
                 </Badge>
               )}
+              {/* D-067 — the candle battle at signal time: who was
+               * dominating when the trade fired */}
+              {fl && fl.state && fl.state !== "tug" && (
+                <Badge
+                  tone={
+                    fl.note && (fl.state === "sellers" ? "SELL" : "BUY") !== signal.direction
+                      ? "amber"
+                      : fl.state === "buyers" ? "green" : "red"
+                  }
+                >
+                  BATTLE · {fl.state.toUpperCase()}{" "}
+                  {Math.round(fl.state === "buyers" ? (fl.buy_pct ?? 0) : (fl.sell_pct ?? 0))}%
+                </Badge>
+              )}
             </div>
             {ctx.amd?.note && (
               <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-400">
@@ -250,6 +265,18 @@ export function SignalDetail({ signal }: { signal: Signal }) {
             {st?.action && (
               <p className="mt-1.5 text-[10px] leading-relaxed text-amber-200/75">
                 {st.action}
+              </p>
+            )}
+            {/* D-067 — the battle verdict sentence + the engine's flow
+             * note on this trade (penalty applied if it fought the flow) */}
+            {fl?.verdict && (
+              <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-400">
+                {fl.verdict}
+              </p>
+            )}
+            {fl?.note && (
+              <p className="mt-1 text-[10px] leading-relaxed text-amber-300/80">
+                {fl.note}
               </p>
             )}
             {st && st.magnets?.length > 0 && (

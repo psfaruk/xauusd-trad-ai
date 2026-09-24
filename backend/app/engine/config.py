@@ -437,6 +437,54 @@ class EngineConfig(BaseModel):
                     "pattern: down, rest, small counter-move, continue — "
                     "the entry at the rest rejection is the good one)",
     )
+    # -------------------------------------------------- D-067 candle-flow block
+    flow_guard: bool = Field(
+        True,
+        description="D-067 (user directive: 'একটি রানিং ক্যান্ডেল বা কয়েক টি "
+                    "ক্যান্ডেল buyer Sellar position, কারা কাদের কে "
+                    "ডোমেনেট করছে, কারা জিতেছে... রানিং ক্যান্ডেল এর "
+                    "রিয়েকশন') — the candle-battle read (last N closed "
+                    "candles' buyer/seller war + the running candle's live "
+                    "reaction) rides every pulse and signal context; a "
+                    "signal that fights a DOMINATING opposing flow (>= "
+                    "flow_domination with a >= flow_streak winning streak "
+                    "against it) pays a confidence penalty — visible, "
+                    "never a silent block (D-049 precedence)",
+    )
+    flow_window: int = Field(
+        6, ge=3, le=12,
+        description="D-067 — how many of the last closed M1 candles the "
+                    "battle reads (the 'লাস্ট কয়েক টি ক্যান্ডেল' window: "
+                    "short enough to be the live fight, long enough to "
+                    "see the streak)",
+    )
+    flow_domination: float = Field(
+        0.72, ge=0.55, le=1.0,
+        description="D-067 — the buy/sell split at/above which one side "
+                    "DOMINATES the flow (72% = a decided battle, not a "
+                    "tug of war); below it the state is 'tug' and costs "
+                    "nothing",
+    )
+    flow_streak: int = Field(
+        3, ge=2, le=8,
+        description="D-067 — candles won in a row by the opposing side "
+                    "required before the domination penalty applies (a "
+                    "single green candle does not veto a SELL — the "
+                    "streak does)",
+    )
+    flow_penalty: float = Field(
+        0.08, ge=0.0, le=0.3,
+        description="D-067 — confidence penalty when the signal fights a "
+                    "dominating opposing candle-battle (the user's exact "
+                    "trap report: SELL printed into candles buyers were "
+                    "already winning)",
+    )
+    flow_bonus: float = Field(
+        0.04, ge=0.0, le=0.2,
+        description="D-067 — confidence bonus when the signal fires WITH "
+                    "a dominating aligned candle-battle (the flow pushing "
+                    "the trade's direction)",
+    )
     # -------------------------------------------------- D-051 trusted-vote block
     trusted_min_votes: float = Field(
         2.0, ge=1.0, le=6.0,

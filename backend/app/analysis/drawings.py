@@ -54,7 +54,9 @@ logger = logging.getLogger("xauusd.drawings")
 #: distribution) that labels the institutional trap on the chart
 #: D-064 — 48: +3 for the structure set (REST boxes, pullback magnets,
 #: the leg-count ladder badge)
-MAX_DRAWINGS = 48
+#: D-067 — 52: +4 for the candle-battle set (the war badge + the last
+#: decisive wick rejections)
+MAX_DRAWINGS = 52
 #: drawings live on the recent 80–150 candles of the ACTIVE timeframe
 DRAW_WINDOW_BARS = 150
 #: how close (in ATR units) price must be to a zone for the SETUP box
@@ -458,6 +460,82 @@ def _structure_marks(base: pd.DataFrame, tf: str, price: float) -> list[dict]:
             "tone": tone,
         })
     return out[:5]
+
+
+def _battle_marks(base: pd.DataFrame, tf: str) -> list[dict]:
+    """kind: "battle" / "reject" — the candle-by-candle WAR (D-067).
+
+    User directive (Bengali): "কারা কাদের কে ডোমেনেট করছে, কারা জিতেছে,
+    লাস্ট কয়েক টি ক্যান্ডেল এর ভিতর কি ঘটেছে" — the chart now shows:
+
+    - the BATTLE badge: who dominates the last 6 candles of THIS
+      timeframe (volume-weighted flow split), who won how many, the
+      net displacement in ATR and the winning streak;
+    - REJECT marks: the last decisive wick rejections — WHERE sellers
+      rejected the high / buyers absorbed the dip inside those
+      candles ("what happened INSIDE the last few candles").
+
+    The RUNNING candle's live verdict is rendered by the UI from the
+    forming bar on every tick — the backend only labels closes.
+    """
+    if base is None or len(base) < 60 or tf not in (
+        "M1", "M5", "M15", "M30"
+    ):
+        return []
+    try:
+        from app.analysis.orderflow import battle_read
+
+        b = battle_read(base, n=6)
+    except Exception:  # noqa: BLE001 — battle marks must never break
+        return []
+    if not b or not b.get("n"):
+        return []
+    out: list[dict] = []
+
+    # 1. the war badge — who owns the flow right now
+    state = b.get("state")
+    if state in ("buyers", "sellers"):
+        pct = b.get("buy_pct" if state == "buyers" else "sell_pct")
+        wins = b.get("wins") or {}
+        n_won = wins.get(state, 0)
+        streak = b.get("streak") or {}
+        s_len = int(streak.get("len") or 0)
+        label = (
+            f"BATTLE · {state.upper()} {round(pct)}% · "
+            f"won {n_won}/{b.get('n')} · {b.get('net_atr'):+.1f} ATR"
+            + (f" · {s_len} streak" if s_len >= 2 else "")
+        )
+        out.append({
+            "kind": "battle",
+            "t": _iso(base["time_utc"].iloc[-1]),
+            "price": round(float(base["c"].iloc[-1]), 2),
+            "state": state,
+            "buy_pct": b.get("buy_pct"),
+            "sell_pct": b.get("sell_pct"),
+            "net_atr": b.get("net_atr"),
+            "label": label,
+            "note": b.get("verdict"),
+            "tone": "bull" if state == "buyers" else "bear",
+        })
+
+    # 2. the decisive moments INSIDE the candles — wick rejections
+    for e in (b.get("events") or []):
+        if e.get("kind") != "rejection":
+            continue
+        out.append({
+            "kind": "reject",
+            "t": e.get("t"),
+            "price": e.get("price"),
+            "side": e.get("side"),
+            "depth_atr": e.get("depth_atr"),
+            "label": (
+                f"{str(e.get('side')).upper()} REJECTED · "
+                f"{e.get('depth_atr')} ATR wick"
+            ),
+            "note": e.get("note"),
+            "tone": "bull" if e.get("side") == "buyers" else "bear",
+        })
+    return out[:4]
 
 
 # ----------------------------------------------------------------- hlines
@@ -1112,5 +1190,8 @@ def _build(
     out.extend(_sessions(base, tf))
     out.extend(_amd_marks(base, tf))
     out.extend(_structure_marks(base, tf, price))
+    # 15. D-067 — the candle battle: who dominates the last few
+    #     candles, who won, and the decisive rejections inside them
+    out.extend(_battle_marks(base, tf))
 
     return [d for d in out if d is not None][:MAX_DRAWINGS]

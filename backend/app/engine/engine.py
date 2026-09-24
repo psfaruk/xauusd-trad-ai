@@ -421,6 +421,39 @@ def evaluate(
     except Exception:  # noqa: BLE001 — the structure read is best-effort
         pass
 
+    # D-067 — the CANDLE BATTLE read (user directive: "একটি রানিং
+    # ক্যান্ডেল বা কয়েক টি ক্যান্ডেল buyer Sellar position, কারা কাদের
+    # কে ডোমেনেট করছে, কারা জিতেছে, লাস্ট কয়েক টি ক্যান্ডেল এর ভিতর
+    # কি ঘটেছে"): every close reports the last flow_window closed
+    # candles' buyer-vs-seller war — who dominates (volume-weighted
+    # split), who WON (candle count + net ATR), what happened INSIDE
+    # (decisive rejections / absorptions / momentum bodies) and the
+    # winning streak. The RUNNING candle's live reaction is recomputed
+    # by the UI from the forming bar on every tick between closes.
+    battle: dict = {}
+    try:
+        from app.analysis.orderflow import battle_read
+
+        battle = battle_read(base, n=cfg.flow_window)
+        pulse["battle"] = {
+            "n": battle.get("n"),
+            "state": battle.get("state"),
+            "buy_pct": battle.get("buy_pct"),
+            "sell_pct": battle.get("sell_pct"),
+            "wins": battle.get("wins"),
+            "streak": battle.get("streak"),
+            "net_atr": battle.get("net_atr"),
+            "participation": battle.get("participation"),
+            "events": [
+                {"kind": e.get("kind"), "side": e.get("side"),
+                 "price": e.get("price"), "note": e.get("note")}
+                for e in (battle.get("events") or [])[-3:]
+            ],
+            "verdict": battle.get("verdict"),
+        }
+    except Exception:  # noqa: BLE001 — the battle read is best-effort
+        pass
+
     # D-048/D-049 — trigger ARBITRATION by QUALITY (user directive:
     # "সব গুলো স্ট্রাটেজি একই সময় AGREE নাও থাকতে পারে" + "best strategy"):
     # every candidate setup is gathered first, each scored on its own
@@ -881,6 +914,51 @@ def evaluate(
                 )
                 struct_adjust += cfg.structure_rest_bonus
 
+    # D-067 — the candle-battle gate (user directive: "কারা কাদের কে
+    # ডোমেনেট করছে, কারা জিতেছে... রানিং ক্যান্ডেল এর রিয়েকশন"):
+    # a signal that fires AGAINST a dominating candle-battle (the flow
+    # AND the streak against it) pays confidence — the exact shape of
+    # the user's trap report (SELL printed while buyers were stacking
+    # bullish candles). Aligned domination earns a small bonus. A tug
+    # of war costs nothing, and NOTHING is hard-blocked (D-049
+    # "সিগনাল মিস করা যাবে না" — the trap gate owns hard blocks).
+    flow_adjust = 0.0
+    flow_note = ""
+    if cfg.flow_guard and battle:
+        b_state = battle.get("state")
+        if b_state in ("buyers", "sellers"):
+            streak = battle.get("streak") or {}
+            streak_len = int(streak.get("len") or 0)
+            dom_pct = float(
+                battle.get("buy_pct" if b_state == "buyers" else "sell_pct") or 50.0,
+            )
+            against = (
+                (b_state == "buyers" and trigger_tag.direction == "SELL")
+                or (b_state == "sellers" and trigger_tag.direction == "BUY")
+            )
+            with_it = (
+                (b_state == "buyers" and trigger_tag.direction == "BUY")
+                or (b_state == "sellers" and trigger_tag.direction == "SELL")
+            )
+            if against and dom_pct >= cfg.flow_domination * 100.0 \
+                    and streak_len >= cfg.flow_streak:
+                flow_adjust -= cfg.flow_penalty
+                flow_note = (
+                    f"{trigger_tag.direction} fires into a dominating "
+                    f"{b_state} battle — {round(dom_pct)}% of the flow, "
+                    f"{streak_len} candles in a row for the {b_state} "
+                    "(confidence reduced)"
+                )
+                trace.add("flow_guard", True, flow_note)
+            elif with_it and dom_pct >= cfg.flow_domination * 100.0:
+                flow_adjust += cfg.flow_bonus
+                flow_note = (
+                    f"{trigger_tag.direction} fires WITH the dominating "
+                    f"{b_state} battle — {round(dom_pct)}% of the flow "
+                    "pushing the trade's direction"
+                )
+                trace.add("flow_guard", True, flow_note)
+
     trace.add(
         "targets", True,
         f"TP predicted at {target_note} — realized rr {realized_rr:.2f}",
@@ -938,6 +1016,10 @@ def evaluate(
         # D-064 — the structure ladder's verdict: chasing an extended
         # run costs confidence; the rest-zone continuation entry earns it
         confidence = max(0.0, min(1.0, confidence + struct_adjust))
+    if flow_adjust:
+        # D-067 — the candle battle's verdict: fighting a dominating
+        # flow costs confidence; riding it earns a small bonus
+        confidence = max(0.0, min(1.0, confidence + flow_adjust))
     trace_dict = trace.to_dict()
     trace_dict["trigger"] = trigger  # survives inside signals.trace JSON (D-041)
     trace_dict["confluence_factors"] = factors  # D-042 — Signal Analysis panel
@@ -974,6 +1056,16 @@ def evaluate(
             "choch": struct.get("choch_fresh") if struct else None,
             "magnets": (struct.get("magnets") or [])[:3] if struct else [],
         },
+        "flow": {  # D-067 — the candle battle at signal time
+            "state": battle.get("state") if battle else None,
+            "buy_pct": battle.get("buy_pct") if battle else None,
+            "sell_pct": battle.get("sell_pct") if battle else None,
+            "streak": battle.get("streak") if battle else None,
+            "net_atr": battle.get("net_atr") if battle else None,
+            "wins": battle.get("wins") if battle else None,
+            "verdict": battle.get("verdict") if battle else None,
+            "note": flow_note or None,
+        },
         "news": news.value,
     }
     trace_dict["context"] = context
@@ -992,6 +1084,9 @@ def evaluate(
         "entry_note": entry_note,  # D-050 — the POI anchor description
         "trace": trace_dict,
         "context": context,  # D-061 — AMD phase / trap / session / news
+        # D-067 — flow note rides the payload top level too (the signals
+        # list renders it without digging into context)
+        "flow_note": flow_note or None,
         "bar_time": base["time_utc"].iloc[-1],
         "session": session_name,
         "spread_points": spread_points,
@@ -1011,6 +1106,12 @@ def evaluate(
             "risk": trap_risk_val,
             "warned": trap_warned,
             "phase": (trap.get("phase") or (amd.get("phase") if amd else None)),
+        },
+        "flow": {  # D-067 — the fired trade's candle-battle verdict
+            "state": (battle.get("state") if battle else None),
+            "buy_pct": (battle.get("buy_pct") if battle else None),
+            "sell_pct": (battle.get("sell_pct") if battle else None),
+            "note": flow_note or None,
         },
     }
     _pulse_miss(pulse, trace)  # fills checks (+ no near-miss on a fire)

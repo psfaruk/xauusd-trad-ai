@@ -128,6 +128,19 @@ export interface SignalContext {
     } | null;
     magnets: { price: number; kind: string; dist_atr: number }[];
   } | null;
+  /** D-067 — the candle battle at signal time: who dominated the last
+   * candles, who was winning, and the engine's flow verdict on THIS
+   * trade (penalized if it fought the domination). */
+  flow?: {
+    state: string | null;
+    buy_pct: number | null;
+    sell_pct: number | null;
+    streak: { side: string | null; len: number } | null;
+    net_atr: number | null;
+    wins: { buyers: number; sellers: number } | null;
+    verdict: string | null;
+    note: string | null;
+  } | null;
   news: string | null;
 }
 
@@ -630,6 +643,13 @@ export interface WsStrategyPulseMsg {
     confidence: number;
     trigger: string;
     whale: boolean;
+    /** D-067 — the fired trade's candle-battle verdict. */
+    flow?: {
+      state: string | null;
+      buy_pct: number | null;
+      sell_pct: number | null;
+      note: string | null;
+    } | null;
   } | null;
   trigger?: string;
   near_miss: string | null;
@@ -685,6 +705,28 @@ export interface WsStrategyPulseMsg {
     bars: number | null;
     note: string | null;
   }[];
+  /** D-067 — the CANDLE BATTLE over the last flow_window closed M1
+   * candles: who dominates (volume-weighted split), who won how many,
+   * the winning streak, net displacement in ATR, the decisive events
+   * INSIDE the candles, and the human verdict. The RUNNING candle's
+   * live reaction is recomputed client-side from the forming bar. */
+  battle?: {
+    n: number | null;
+    state: "buyers" | "sellers" | "tug" | null;
+    buy_pct: number | null;
+    sell_pct: number | null;
+    wins: { buyers: number; sellers: number } | null;
+    streak: { side: string | null; len: number } | null;
+    net_atr: number | null;
+    participation: number | null;
+    events: {
+      kind: string | null;
+      side: string | null;
+      price: number | null;
+      note: string | null;
+    }[];
+    verdict: string | null;
+  } | null;
 }
 
 export type WsMessage =
@@ -1259,6 +1301,35 @@ export interface LadderDrawing {
   tone: DrawingTone;
 }
 
+/** D-067 — the candle-battle badge: who dominates the last few
+ *  candles of this TF (volume-weighted flow split), who won how many,
+ *  the net displacement in ATR and the winning streak. */
+export interface BattleDrawing {
+  kind: "battle";
+  t: string | null;
+  price: number;
+  state: "buyers" | "sellers";
+  buy_pct: number | null;
+  sell_pct: number | null;
+  net_atr: number | null;
+  label: string;
+  note?: string | null;
+  tone: DrawingTone;
+}
+
+/** D-067 — a decisive wick rejection INSIDE the last candles: where
+ *  sellers rejected the high / buyers absorbed the dip. */
+export interface RejectDrawing {
+  kind: "reject";
+  t: string | null;
+  price: number;
+  side: "buyers" | "sellers";
+  depth_atr: number | null;
+  label: string;
+  note?: string | null;
+  tone: DrawingTone;
+}
+
 export type ChartDrawing =
   | HLineDrawing
   | ZoneDrawing
@@ -1276,4 +1347,6 @@ export type ChartDrawing =
   | AmdDrawing
   | RestDrawing
   | MagnetDrawing
-  | LadderDrawing;
+  | LadderDrawing
+  | BattleDrawing
+  | RejectDrawing;

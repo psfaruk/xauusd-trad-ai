@@ -29,19 +29,41 @@ interface LiveDominance {
   buyPct: number;
   sellPct: number;
   dir: "bull" | "bear" | "flat";
+  /** D-067 — the running candle's full read: the wick war + who
+   * controls the bar (same math as the backend's
+   * running_candle_read, recomputed on every tick). */
+  wick: "upper" | "lower" | "none";
+  wickWar: string | null;
+  control: "buyers" | "sellers" | "none";
 }
 
-/** Same proxy the backend's candle_pulse uses, run on the forming bar. */
+/** Same proxy the backend's candle_pulse / running_candle_read use,
+ * run on the forming bar — updated on every bar_update frame. */
 function liveDominance(bar: Candle | null): LiveDominance | null {
   if (!bar) return null;
   const rng = bar.h - bar.l;
   if (rng <= 0) return null;
   const delta = ((bar.c - bar.l) / rng) * 2 - 1;
+  const upperWick = bar.h - Math.max(bar.o, bar.c);
+  const lowerWick = Math.min(bar.o, bar.c) - bar.l;
+  let wick: "upper" | "lower" | "none" = "none";
+  let wickWar: string | null = null;
+  if (upperWick > 0.45 * rng) {
+    wick = "upper";
+    wickWar = "sellers rejecting the top";
+  } else if (lowerWick > 0.45 * rng) {
+    wick = "lower";
+    wickWar = "buyers absorbing the dip";
+  }
+  const mid = (bar.h + bar.l) / 2;
   return {
     delta,
     buyPct: Math.round(((delta + 1) / 2) * 100),
     sellPct: Math.round((1 - (delta + 1) / 2) * 100),
     dir: bar.c >= bar.o ? "bull" : "bear",
+    wick,
+    wickWar,
+    control: bar.c > mid ? "buyers" : bar.c < mid ? "sellers" : "none",
   };
 }
 
@@ -178,7 +200,26 @@ function MarketRadar({ symbol }: { symbol: string }) {
               M1 candle — buyers vs sellers
             </p>
             {live ? (
-              <DominanceBar buy={live.buyPct} sell={live.sellPct} />
+              <>
+                <DominanceBar buy={live.buyPct} sell={live.sellPct} />
+                <p className="mt-1.5 truncate text-[10px] leading-relaxed text-zinc-500">
+                  <span
+                    className={
+                      live.control === "buyers"
+                        ? "text-emerald-400"
+                        : live.control === "sellers"
+                          ? "text-red-400"
+                          : "text-zinc-500"
+                    }
+                  >
+                    running candle:
+                  </span>{" "}
+                  {live.control === "none"
+                    ? "even fight inside the bar"
+                    : `${live.control} control the bar`}
+                  {live.wickWar ? ` — ${live.wickWar}` : ""}
+                </p>
+              </>
             ) : (
               <p className="text-[11px] text-zinc-500">forming bar warming up…</p>
             )}
@@ -195,6 +236,49 @@ function MarketRadar({ symbol }: { symbol: string }) {
               </p>
             )}
           </div>
+
+          {/* D-067 — the CANDLE BATTLE over the last closed candles: who
+           * dominates whom, who won, what happened INSIDE them (user
+           * directive: "কারা কাদের কে ডোমেনেট করছে, কারা জিতেছে, লাস্ট
+           * কয়েক টি ক্যান্ডেল এর ভিতর কি ঘটেছে") */}
+          {pulse.battle && pulse.battle.n ? (
+            <div className="min-w-0 rounded-xl border border-zinc-800/70 bg-zinc-900/40 px-3 py-2.5">
+              <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                  Candle battle — last {pulse.battle.n}
+                </p>
+                {pulse.battle.state && pulse.battle.state !== "tug" && (
+                  <Badge tone={pulse.battle.state === "buyers" ? "green" : "red"} pulse>
+                    {pulse.battle.state === "buyers" ? "buyers" : "sellers"}
+                  </Badge>
+                )}
+              </div>
+              <DominanceBar
+                buy={Math.round(pulse.battle.buy_pct ?? 50)}
+                sell={Math.round(pulse.battle.sell_pct ?? 50)}
+              />
+              {pulse.battle.wins && (
+                <p className="mt-1.5 truncate text-[10px] tabular-nums text-zinc-500">
+                  won {pulse.battle.wins.buyers}/{pulse.battle.n} by buyers ·{" "}
+                  {pulse.battle.wins.sellers}/{pulse.battle.n} by sellers
+                  {pulse.battle.net_atr != null
+                    ? ` · net ${pulse.battle.net_atr > 0 ? "+" : ""}${pulse.battle.net_atr} ATR`
+                    : ""}
+                  {pulse.battle.streak && pulse.battle.streak.len >= 2
+                    ? ` · ${pulse.battle.streak.len} streak`
+                    : ""}
+                </p>
+              )}
+              <p className="mt-1 truncate text-[11px] leading-relaxed text-zinc-400">
+                {pulse.battle.verdict}
+              </p>
+              {pulse.battle.events?.length ? (
+                <p className="mt-1 truncate text-[10px] leading-relaxed text-zinc-500">
+                  inside: {pulse.battle.events[pulse.battle.events.length - 1].note}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
 
           {/* trigger candidates + whale pulse */}
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
@@ -434,6 +518,19 @@ function FiredOrMiss({ pulse }: { pulse: WsStrategyPulseMsg }) {
           <Badge tone="gold" pulse>SIGNAL FIRED</Badge>
           <Badge tone={f.direction === "BUY" ? "green" : "red"}>{f.direction}</Badge>
           {f.whale && <Badge tone="blue">whale ✓</Badge>}
+          {/* D-067 — the fired trade's candle-battle verdict: did it fire
+           * WITH the dominating flow or INTO it? */}
+          {f.flow?.state && f.flow.state !== "tug" && (
+            <Badge
+              tone={
+                f.flow.state === (f.direction === "BUY" ? "buyers" : "sellers")
+                  ? "green"
+                  : "amber"
+              }
+            >
+              {f.flow.state} {Math.round(f.flow.buy_pct ?? f.flow.sell_pct ?? 0)}%
+            </Badge>
+          )}
           <span className="ml-auto shrink-0 font-mono text-[10px] tabular-nums text-zinc-500">
             {f.trigger}
           </span>
@@ -488,6 +585,7 @@ export function CandlePulseCard({ symbol }: { symbol: string }) {
   const forming = useFormingBar(symbol, "M1");
   const live = liveDominance(forming);
   const closed = pulse?.candle ?? null;
+  const battle = pulse?.battle ?? null;
 
   return (
     <Card>
@@ -500,10 +598,47 @@ export function CandlePulseCard({ symbol }: { symbol: string }) {
         }
       />
       {live ? (
-        <DominanceBar buy={live.buyPct} sell={live.sellPct} />
+        <>
+          <DominanceBar buy={live.buyPct} sell={live.sellPct} />
+          <p className="mt-1.5 min-w-0 truncate text-[10px] leading-relaxed text-zinc-500">
+            <span
+              className={
+                live.control === "buyers"
+                  ? "text-emerald-400"
+                  : live.control === "sellers"
+                    ? "text-red-400"
+                    : "text-zinc-500"
+              }
+            >
+              running candle:
+            </span>{" "}
+            {live.control === "none"
+              ? "even fight inside the bar"
+              : `${live.control} control the bar`}
+            {live.wickWar ? ` — ${live.wickWar}` : ""}
+          </p>
+        </>
       ) : (
         <p className="text-[11px] text-zinc-500">waiting for the first M1 tick…</p>
       )}
+      {/* D-067 — the multi-candle war under the running bar */}
+      {battle && battle.n ? (
+        <div className="mt-2 min-w-0 border-t border-zinc-800/70 pt-2">
+          <div className="mb-1 flex min-w-0 items-center justify-between gap-2">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+              battle — last {battle.n} candles
+            </p>
+            {battle.state && battle.state !== "tug" && (
+              <Badge tone={battle.state === "buyers" ? "green" : "red"}>
+                {battle.state}
+              </Badge>
+            )}
+          </div>
+          <p className="min-w-0 truncate text-[11px] leading-relaxed text-zinc-400">
+            {battle.verdict}
+          </p>
+        </div>
+      ) : null}
       <p className="mt-1.5 min-w-0 truncate text-[11px] leading-relaxed text-zinc-400">
         {closed ? (
           <>

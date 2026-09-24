@@ -103,6 +103,11 @@ class MarketStream:
         self._last_real_sent = 0.0
         self._ticks_since_send = 0
         self._last_bar_sent: dict[str, float] = {}
+        # D-067 — per-bar "first movement frame" bookkeeping: a bar that
+        # received a SECOND tick always earns a bar_update frame even
+        # inside the 10/s throttle window (quiet-market bars must never
+        # show only open + close).
+        self._bar_updated: dict[str, bool] = {}
         self._event_times: deque[float] = deque(maxlen=512)
         # D-042 — interpolation state (anchored to the last REAL tick)
         self._real_mid: float = 0.0
@@ -165,6 +170,24 @@ class MarketStream:
             logger.exception("market stream died")
             raise
 
+    def _bar_frame_due(self, tf: str, now_mono: float) -> bool:
+        """True when a bar_update frame must go out for this TF.
+
+        D-067 flake root-cause: the plain 10/s throttle can suppress
+        EVERY movement frame of a bar when the event loop batches ticks
+        (a thin bar in a quiet market would then show only open +
+        close). The FIRST movement of every bar is never lost; after
+        that the throttle keeps the ≤10/s budget.
+        """
+        if not self._bar_updated.get(tf, False):
+            self._bar_updated[tf] = True
+            self._last_bar_sent[tf] = now_mono
+            return True
+        if now_mono - self._last_bar_sent.get(tf, 0.0) >= BAR_SEND_MIN_S:
+            self._last_bar_sent[tf] = now_mono
+            return True
+        return False
+
     async def _handle_tick(self, tick: Tick) -> None:
         now_mono = time_mod.monotonic()
         self._event_times.append(now_mono)
@@ -212,6 +235,7 @@ class MarketStream:
                     "bar_open", self._symbol, tf, {"candle": fb.as_dict()}
                 )
                 self._last_bar_sent[tf] = now_mono
+                self._bar_updated[tf] = False
             elif fb.t != bucket:
                 await self._close_bar(tf, fb)
                 nb = FormingBar(t=bucket, o=mid, h=mid, low=mid, c=mid, v=1)
@@ -222,6 +246,7 @@ class MarketStream:
                     "bar_open", self._symbol, tf, {"candle": nb.as_dict()}
                 )
                 self._last_bar_sent[tf] = now_mono
+                self._bar_updated[tf] = False
             else:
                 fb.h = max(fb.h, mid)
                 fb.low = min(fb.low, mid)
@@ -234,8 +259,8 @@ class MarketStream:
                     db.low = min(db.low, mid)
                     db.c = mid
                 # forming bar ALWAYS absorbs the tick; frames are throttled
-                if now_mono - self._last_bar_sent.get(tf, 0.0) >= BAR_SEND_MIN_S:
-                    self._last_bar_sent[tf] = now_mono
+                # (but the FIRST movement of a bar always goes out)
+                if self._bar_frame_due(tf, now_mono):
                     shown = self._disp.get(tf) or fb
                     await self._hub.broadcast_market(
                         "bar_update", self._symbol, tf, {"candle": shown.as_dict()}
@@ -301,8 +326,7 @@ class MarketStream:
                         db.h = max(db.h, mid)
                         db.low = min(db.low, mid)
                         db.c = mid
-                    if now - self._last_bar_sent.get(tf, 0.0) >= BAR_SEND_MIN_S:
-                        self._last_bar_sent[tf] = now
+                    if self._bar_frame_due(tf, now):
                         await self._hub.broadcast_market(
                             "bar_update", self._symbol, tf,
                             {"candle": db.as_dict()},

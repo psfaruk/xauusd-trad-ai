@@ -112,7 +112,7 @@ function isFaded(d: { state?: "active" | "faded"; broken?: boolean; label?: stri
   return Boolean(d.broken) || Boolean(d.label?.includes("· tested"));
 }
 
-type LayerKey = "setup" | "zones" | "levels" | "structure" | "fib" | "whales" | "momentum";
+type LayerKey = "setup" | "zones" | "levels" | "structure" | "fib" | "whales" | "momentum" | "flow";
 
 /** One row of the external MARKS legend (outside the chart canvas). */
 export interface LegendMark {
@@ -298,6 +298,33 @@ function buildLegend(drawings: ChartDrawing[], tf: string): LegendMark[] {
           layer: "structure",
         });
         break;
+      // D-067 — the candle battle: who dominates the last candles of
+      // this TF + the decisive rejections inside them
+      case "battle":
+        marks.push({
+          key,
+          swatch: TONE[d.tone].text,
+          short: `BATTLE · ${d.state === "buyers" ? "BUYERS" : "SELLERS"}`,
+          detail:
+            d.buy_pct != null && d.sell_pct != null
+              ? `${Math.round(d.buy_pct)}/${Math.round(d.sell_pct)}`
+              : "",
+          text: d.note || d.label,
+          faded: false,
+          layer: "flow",
+        });
+        break;
+      case "reject":
+        marks.push({
+          key,
+          swatch: TONE[d.tone].text,
+          short: `${d.side === "buyers" ? "BUYER" : "SELLER"} REJECT`,
+          detail: d.price.toFixed(2),
+          text: d.note || d.label,
+          faded: false,
+          layer: "flow",
+        });
+        break;
     }
   });
   return marks;
@@ -407,9 +434,14 @@ export default function PriceChart({
     fib: true, // fibonacci retracement + OTE band
     whales: true, // whale/institutional event markers
     momentum: true, // D-058 — EMA 9/21/50 momentum ribbon
+    flow: true, // D-067 — the candle battle badge + running candle
   });
   const layersRef = useRef(layers);
   layersRef.current = layers;
+  // D-067 — lets the live bar-update effect trigger overlay redraws
+  // (the RUNNING candle badge must visibly move with every tick)
+  const drawRef = useRef<() => void>(null as unknown as () => void);
+  const lastFlowDrawRef = useRef(0);
 
   /* ------------------------------------- D-058 chart header dropdowns */
   const [tfOpen, setTfOpen] = useState(false);
@@ -673,6 +705,14 @@ export default function PriceChart({
         }
       }
       animRef.current.tgt = { ...bar };
+      // D-067 — the RUNNING candle badge + battle marks redraw with
+      // the live bar (throttled to ~7/s — bar_update frames arrive up
+      // to 10/s per TF)
+      const now = Date.now();
+      if (now - lastFlowDrawRef.current > 140) {
+        lastFlowDrawRef.current = now;
+        drawRef.current?.();
+      }
     });
 
     const offTick = feed.subscribeTick(symbol, () => {
@@ -1184,6 +1224,107 @@ export default function PriceChart({
       }
     }
 
+    /* ----------------------------------- D-067 candle battle (flow) */
+    // The user's own words: "কারা কাদের কে ডোমেনেট করছে, কারা জিতেছে,
+    // লাস্ট কয়েক টি ক্যান্ডেল এর ভিতর কি ঘটেছে" — the BATTLE badge
+    // says who owns the last candles of THIS TF, the REJECT ticks mark
+    // the decisive wick rejections inside them, and the RUNNING badge
+    // (recomputed from the live forming bar on every redraw) tells who
+    // is winning the unfinished candle right now.
+    if (L.flow && !isSignals) {
+      let battleY: number | null = null; // remember for the running badge
+      for (const d of drawings) {
+        if (d.kind === "battle") {
+          const y = yOf(d.price);
+          if (y == null) continue;
+          const x = d.t ? xOf(d.t) : null;
+          const bx = x == null ? rightEdge - 150 : Math.min(x + 60, rightEdge);
+          // buyers badge under the candles, sellers badge above — the
+          // side that owns the flow "sits" on its side of the price
+          const above = d.state === "sellers";
+          const by = above
+            ? Math.max(40, y - 40)
+            : Math.min(h - 22, y + 44);
+          battleY = by;
+          ctx.save();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = TONE[d.tone].text;
+          const wText = ctx.measureText(d.label).width;
+          ctx.fillText(
+            d.label,
+            Math.max(2, Math.min(bx - wText / 2, rightEdge - wText - 2)),
+            by,
+          );
+          ctx.restore();
+        } else if (d.kind === "reject") {
+          const x = d.t ? xOf(d.t) : null;
+          const y = yOf(d.price);
+          if (x == null || y == null || x < 0 || x > rightEdge) continue;
+          // the rejection tick — a short slash at the wick extreme
+          ctx.save();
+          ctx.strokeStyle = TONE[d.tone].text;
+          ctx.globalAlpha = 0.85;
+          ctx.lineWidth = 1;
+          const up = d.side === "sellers"; // rejected the high -> above
+          const dy = up ? -4 : 4;
+          ctx.beginPath();
+          ctx.moveTo(x - 3, y + (up ? 2 : -2));
+          ctx.lineTo(x + 3, y + dy + (up ? 2 : -2));
+          ctx.stroke();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = TONE[d.tone].text;
+          ctx.fillText(
+            `${up ? "▲" : "▼"}${d.depth_atr ?? ""}`,
+            x + 5,
+            y + (up ? -6 : 12),
+          );
+          ctx.restore();
+        }
+      }
+      // the RUNNING candle — the live forming bar of THIS timeframe,
+      // the same math the backend's running_candle_read uses, recomputed
+      // on every redraw (drawOverlay fires on each bar_update frame)
+      const bar = animRef.current.tgt ?? animRef.current.cur;
+      if (bar) {
+        const rng = bar.h - bar.l;
+        if (rng > 0) {
+          const delta = ((bar.c - bar.l) / rng) * 2 - 1;
+          const buyPct = Math.round(((delta + 1) / 2) * 100);
+          const upperWick = bar.h - Math.max(bar.o, bar.c);
+          const lowerWick = Math.min(bar.o, bar.c) - bar.l;
+          let label: string;
+          let color: string;
+          if (buyPct >= 60) {
+            label = `RUNNING · buyers ${buyPct}%`;
+            color = "rgba(52,211,153,0.95)";
+          } else if (buyPct <= 40) {
+            label = `RUNNING · sellers ${100 - buyPct}%`;
+            color = "rgba(248,113,113,0.95)";
+          } else {
+            label = `RUNNING · even ${buyPct}/${100 - buyPct}`;
+            color = "rgba(203,213,225,0.85)";
+          }
+          if (upperWick > 0.45 * rng) label += " · sellers rejecting top";
+          else if (lowerWick > 0.45 * rng) label += " · buyers absorbing dip";
+          // top-right HUD slot — never collides with price-anchored marks
+          const yRun =
+            battleY != null && battleY < 90 ? battleY + 14 : 16;
+          ctx.save();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = color;
+          const wText = ctx.measureText(label).width;
+          ctx.fillText(label, Math.max(2, rightEdge - wText - 4), yRun);
+          ctx.restore();
+        }
+      }
+    }
+
     /* -------------------------------------------- zone boxes (D-053) */
     if (L.zones) {
       for (const d of drawings) {
@@ -1546,6 +1687,9 @@ export default function PriceChart({
       console.warn("[PriceChart] overlay draw skipped:", err);
     }
   }, [drawings, signals, selectedSignal, tf, isSignals]);
+  // D-067 — keep the live-bar redraw hook pointed at the latest
+  // drawOverlay (deps change -> the RUNNING badge keeps fresh closures)
+  drawRef.current = drawOverlay;
 
   // redraw on data/symbol changes + continuously while zooming/panning
   useEffect(() => {
@@ -1613,6 +1757,7 @@ export default function PriceChart({
     { key: "levels", label: "Levels" },
     { key: "structure", label: "Structure" },
     { key: "momentum", label: "Momentum" },
+    { key: "flow", label: "Battle" },
     { key: "fib", label: "Fibonacci" },
     { key: "whales", label: "Whales" },
   ];
