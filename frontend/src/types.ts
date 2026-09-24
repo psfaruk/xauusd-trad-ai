@@ -622,6 +622,17 @@ export interface PulseZone {
   quality: number;
   source: string;
   dist_usd: number;
+  /**
+   * D-069 — the frame an HTF zone was born on ("M5" | "M15" for
+   * institutional FVG/zone origins; null = the base trigger TF).
+   */
+  tf?: string | null;
+  /**
+   * D-069 — FVG zones only: the gap's measured importance — width in
+   * frame-ATRs and how deep price has traded into it (the CE read).
+   */
+  gap_atr?: number;
+  fill_pct?: number;
 }
 
 /**

@@ -330,7 +330,8 @@ def test_evaluate_zone_fires_without_mtf_agreement() -> None:
         ]
         htf[tf] = pd.DataFrame(rows, columns=["time_utc", "o", "h", "l", "c", "v"])
     close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-    cfg = EngineConfig(entry_mode="market", regime_guard=False)  # D-050 — zone/MTF arbitration on the legacy entry
+    # D-050 — zone/MTF arbitration on the legacy entry
+    cfg = EngineConfig(entry_mode="market", regime_guard=False)
     ev = evaluate(df, htf, close_time, cfg, spread_points=20)
     assert ev.signal is not None, ev.trace["checks"]
     assert ev.signal["trigger"] == "zone"

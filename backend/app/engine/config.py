@@ -549,6 +549,60 @@ class EngineConfig(BaseModel):
                     "user's complaint — 'বেশি ভোলাটেলিটি তে সিগন্যাল বেশি "
                     "ভুল হচ্ছে' — made visible and paid for",
     )
+    # -------------------------------------------------- D-069 FVG block
+    fvg_importance: bool = Field(
+        True,
+        description="D-069 (user directive: 'ছোট বড় অনেক fvg তৈরি হয়, সব fvg "
+                    "গুরুত্ব পূর্ণ না' — many FVGs form, NOT all matter) — "
+                    "the FVG importance model: only REAL inefficiencies "
+                    "become POIs (>= fvg_min_atr wide on the frame's OWN "
+                    "ATR, minted by a >= fvg_min_disp displacement leg); "
+                    "freshness is consequent-encroachment aware; M5/M15 "
+                    "institutional gaps join the ranked POI list; "
+                    "gap-in-gap stacking and premium/discount adjust the "
+                    "quality; False restores the pre-D-069 behavior "
+                    "exactly (A/B escape hatch)",
+    )
+    fvg_min_atr: float = Field(
+        0.30, ge=0.0, le=3.0,
+        description="D-069 — noise floor: a gap narrower than this many "
+                    "frame-ATRs is spread noise and NEVER becomes a POI "
+                    "(self-scaling per timeframe — the answer to 'FVG "
+                    "হলেই কি এন্ট্রি সিগন্যাল আসে?' is NO: the gap must "
+                    "be real first)",
+    )
+    fvg_min_disp: float = Field(
+        0.40, ge=0.0, le=3.0,
+        description="D-069 — the 3-bar net displacement (frame-ATRs) that "
+                    "must have minted the gap: disp >= gap mathematically "
+                    "for every FVG, so a floor above fvg_min_atr gives the "
+                    "rule teeth — the displacement leg must carry NET "
+                    "PROGRESS past the gap itself, not a spike that "
+                    "round-trips (ICT: gaps born of drift are noise, gaps "
+                    "born of continuation are institutional footprints)",
+    )
+    fvg_htf_enabled: bool = Field(
+        True,
+        description="D-069 — M5/M15 FVGs join the ranked POI list with the "
+                    "HTF quality bonus (the multi-timeframe gap handling: "
+                    "a base-TF gap stacked inside a same-side HTF gap is "
+                    "the gap-in-gap alignment, and the institutional gaps "
+                    "the chart already draws become tradable POIs)",
+    )
+    fvg_stack_bonus: float = Field(
+        0.10, ge=0.0, le=0.5,
+        description="D-069 — quality bonus when a base-TF gap sits inside a "
+                    "same-side M5/M15 gap (nested inefficiency = multi-TF "
+                    "agreement on the same level)",
+    )
+    fvg_pd_adjust: float = Field(
+        0.05, ge=0.0, le=0.2,
+        description="D-069 — quality +/- for range position: a demand gap "
+                    "in the discount half of the recent range / a supply "
+                    "gap in the premium half earns +; the wrong half pays "
+                    "the same amount (buying premium gaps / selling "
+                    "discount gaps is the classic wrong-entry)",
+    )
     # -------------------------------------------------- D-051 trusted-vote block
     trusted_min_votes: float = Field(
         2.0, ge=1.0, le=6.0,

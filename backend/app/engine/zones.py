@@ -203,13 +203,41 @@ def detect_zone_retest(
 
 
 def zone_retest_note(sig: ZoneRetestSignal) -> str:
-    """Human-readable trace line for a FIRED zone retest."""
+    """Human-readable trace line for a FIRED zone retest.
+
+    D-069 — FVG-sourced zones carry their importance telemetry in the
+    note: gap size in ATRs, fill depth (the CE read), gap-in-gap
+    stacking and the premium/discount half — the same facts the
+    SignalDetail panel shows, so the user can see WHY this gap mattered.
+    """
     tag = "counter-trend" if sig.counter_trend else "with-trend"
     sweep = ", SWEEP+RECLAIM" if sig.sweep_reclaim else ""
+    src = str(sig.zone.get("source", "?"))
+    extra = ""
+    if src == "fvg":
+        bits: list[str] = []
+        try:
+            bits.append(f"{float(sig.zone.get('gap_atr', 0.0)):.2f} ATR gap")
+        except (TypeError, ValueError):
+            pass
+        pct = sig.zone.get("fill_pct")
+        if isinstance(pct, (int, float)) and pct > 0:
+            bits.append(f"fill {float(pct):.0%}")
+        if sig.zone.get("stacked"):
+            bits.append(
+                f"stacked in {sig.zone.get('htf_tf') or 'HTF'} gap"
+            )
+        elif sig.zone.get("htf_tf"):
+            bits.append(f"born on {sig.zone['htf_tf']}")
+        pd_pos = sig.zone.get("pd")
+        if pd_pos in ("premium", "discount"):
+            bits.append(str(pd_pos))
+        if bits:
+            extra = " (" + ", ".join(bits) + ")"
     return (
         f"{sig.direction} at {sig.zone['side'].upper()} POI "
         f"{sig.zone['lo']:.2f}-{sig.zone['hi']:.2f} "
-        f"({sig.zone['source']}, quality {sig.quality:.2f}, {tag}, "
+        f"({src}{extra}, quality {sig.quality:.2f}, {tag}, "
         f"rejection {sig.rejection:.2f}{sweep})"
     )
 

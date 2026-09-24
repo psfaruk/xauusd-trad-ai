@@ -262,7 +262,9 @@ def test_evaluate_blocks_the_trapped_direction() -> None:
     mani.trap_risk = _fake
     try:
         ev = evaluate(
-            df, htf, close_time, EngineConfig(entry_mode="market", regime_guard=False, trap_filter=True),
+            df, htf, close_time, EngineConfig(
+                entry_mode="market", regime_guard=False, trap_filter=True,
+            ),
             spread_points=20,
         )
     finally:
@@ -281,7 +283,9 @@ def test_evaluate_blocks_the_trapped_direction() -> None:
     mani.trap_risk = _fake
     try:
         ev2 = evaluate(
-            df, htf, close_time, EngineConfig(entry_mode="market", regime_guard=False, trap_filter=False),
+            df, htf, close_time, EngineConfig(
+                entry_mode="market", regime_guard=False, trap_filter=False,
+            ),
             spread_points=20,
         )
     finally:

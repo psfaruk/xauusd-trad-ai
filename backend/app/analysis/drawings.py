@@ -708,10 +708,24 @@ def _zone_drawings(
             if not _in_window(g.get("t"), t_start):
                 continue
             side = g.get("side")
+            # D-069 — the label states the gap's measured importance
+            # (size in the frame's own ATRs + fill depth) so the chart
+            # shows WHY one gap matters and the next is noise
+            size_note = ""
+            try:
+                gap_atr = float(g.get("gap_atr") or 0.0)
+                fill_pct = float(g.get("fill_pct") or 0.0)
+                if gap_atr > 0:
+                    size_note = f" ({gap_atr:.2f} ATR"
+                    if fill_pct > 0:
+                        size_note += f", {fill_pct:.0%} filled"
+                    size_note += ")"
+            except (TypeError, ValueError):
+                size_note = ""
             label = (
                 "Fair Value Gap · bullish" if side == "bullish"
                 else "Fair Value Gap · bearish"
-            ) + tag
+            ) + size_note + tag
             out.append({
                 "kind": "zone",
                 "side": "fvg_bull" if side == "bullish" else "fvg_bear",

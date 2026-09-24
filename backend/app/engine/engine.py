@@ -492,7 +492,7 @@ def evaluate(
     if cfg.zone_trigger_enabled or cfg.smc_enabled or cfg.entry_mode == "poi_limit":
         from app.analysis.poi import poi_zones
 
-        zones = poi_zones(base, htf)
+        zones = poi_zones(base, htf, cfg=cfg)
 
     # D-051 — the zone map for the strategy radar: nearest levels with
     # their USD distance from the current price (support/resistance the
@@ -509,6 +509,15 @@ def evaluate(
                     "hi": round(float(z["hi"]), 2),
                     "quality": round(float(z.get("quality", 0.0)), 2),
                     "source": z.get("source", "?"),
+                    # D-069 — FVG zones carry the frame they were born on
+                    # (base/M5/M15) + the gap's measured importance
+                    "tf": z.get("htf_tf") or (None if not z.get("htf") else "M15"),
+                    **(
+                        {"gap_atr": z["gap_atr"], "fill_pct": z["fill_pct"]}
+                        if z.get("source") == "fvg"
+                        and "gap_atr" in z and "fill_pct" in z
+                        else {}
+                    ),
                     "dist_usd": round(
                         min(
                             abs(price_now - float(z["lo"])),

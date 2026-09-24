@@ -184,7 +184,9 @@ def build_confluence(
     })
 
     # 4 — fair-value-gap fill on the trigger TF (filling NOW counts —
-    # price trading into an unfilled gap and rejecting is the entry)
+    # price trading into an unfilled gap and rejecting is the entry).
+    # D-069: the hit carries the gap's importance telemetry (size in
+    # ATRs, fill depth — the CE read) so the panel states WHY it counts
     gaps = smc.detect_fvg(base.iloc[-120:])
     fvg_hit = next(
         (g for g in reversed(gaps)
@@ -194,14 +196,23 @@ def build_confluence(
               and g["fill_t"] >= recent_from)),
         None,
     )
+    if fvg_hit is not None:
+        try:
+            gap_atr = float(fvg_hit.get("gap_atr", 0.0) or 0.0)
+            fill_pct = float(fvg_hit.get("fill_pct", 0.0) or 0.0)
+            size_note = f", {gap_atr:.2f} ATR, {fill_pct:.0%} deep"
+        except (TypeError, ValueError):
+            size_note = ""
+        fvg_detail = (
+            f"price filling {side} FVG "
+            f"{fvg_hit['lo']:.2f}-{fvg_hit['hi']:.2f}{size_note}"
+        )
+    else:
+        fvg_detail = f"no fresh {side} fair value gap near entry"
     factors.append({
         "name": "fvg_fill",
         "ok": fvg_hit is not None,
-        "detail": (
-            f"price filling {side} FVG {fvg_hit['lo']:.2f}-{fvg_hit['hi']:.2f}"
-            if fvg_hit else
-            f"no fresh {side} fair value gap near entry"
-        ),
+        "detail": fvg_detail,
     })
 
     # 5 — liquidity sweep into the trade (manipulation confirming intent)
@@ -414,6 +425,23 @@ def bonus_score(factors: list[dict]) -> int:
                if f["name"] in CONFLUENCE_BONUS and f["ok"])
 
 
+def _fvg_fill_span(zone: dict) -> float:
+    """D-069 — how far price has provenly traded INTO an FVG zone.
+
+    fill_pct x gap width, the distance from the near edge to the deepest
+    excursion (the fill watermark). 0.0 for untouched gaps and for zones
+    without the telemetry (sd/ob/tpo/pd and legacy fixtures).
+    """
+    try:
+        p = float(zone.get("fill_pct", 0.0) or 0.0)
+        if p <= 0.0 or p >= 1.0:
+            return 0.0
+        width = float(zone["hi"]) - float(zone["lo"])
+        return p * width if width > 0 else 0.0
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
 def _target_ladder(
     base: pd.DataFrame,
     direction: str,
@@ -440,12 +468,24 @@ def _target_ladder(
     want_bull = direction == "BUY"
     noise = NOISE_FLOOR_ATR * (ind.atr(base, 14) or 1e-9)
 
-    # opposing POI zones — the near edge is where reaction starts
+    # opposing POI zones — the near edge is where reaction starts.
+    # D-069 — an FVG zone's honest barrier is its FILL WATERMARK (the
+    # near edge advanced by how deep price has already traded into the
+    # gap): the traversed portion is proven ground, the air beyond the
+    # watermark is the real unfilled inefficiency. The raw near edge of
+    # a big partially-filled gap sits behind the market and used to veto
+    # trades at 0.3R that actually had 2R+ of room to the untraded air.
     for z in zones or []:
         if want_bull and z.get("side") == "supply":
-            ladder.append((float(z["lo"]), f"supply zone {z['lo']:.2f}"))
+            lvl = float(z["lo"])
+            if z.get("source") == "fvg":
+                lvl = lvl + _fvg_fill_span(z)
+            ladder.append((lvl, f"supply zone {lvl:.2f}"))
         elif not want_bull and z.get("side") == "demand":
-            ladder.append((float(z["hi"]), f"demand zone {z['hi']:.2f}"))
+            lvl = float(z["hi"])
+            if z.get("source") == "fvg":
+                lvl = lvl - _fvg_fill_span(z)
+            ladder.append((lvl, f"demand zone {lvl:.2f}"))
 
     # liquidity pools the trade runs toward (BSL above for BUY, SSL below)
     liq = smc.detect_liquidity(base.iloc[-160:])

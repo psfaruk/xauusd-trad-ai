@@ -250,9 +250,29 @@ def _time_pos(t_arr: np.ndarray, t: Any) -> int:
 
 
 def detect_fvg(df: pd.DataFrame, max_gaps: int = 8) -> list[dict]:
-    """3-candle imbalances. Bullish FVG: bar[k-1].high < bar[k+1].low.
+    """3-candle imbalances with D-069 importance telemetry.
 
-    D-048: numpy hot path (see detect_order_blocks).
+    Bullish FVG: bar[k-1].high < bar[k+1].low — the gap band is
+    [prev_hi (lo), nxt_lo (hi)] and price returns DOWN into it.
+
+    Every gap carries (D-069 — the FVG importance model):
+      gap      — raw gap size in price units
+      gap_atr  — gap size in ATRs of the SAME frame (self-scaling
+                 importance: 0.30 ATR is a real inefficiency, 0.05 ATR
+                 is spread noise whatever the volatility regime)
+      disp     — the 3-bar net displacement |open[k-1] -> close[k+1]|
+                 in ATRs (ICT: a tradeable FVG is born from a
+                 displacement leg, not a drift)
+      fill_pct — how deep price has traded INTO the gap since creation
+                 (0 = untouched, 0.5 = consequent encroachment, 1.0 =
+                 fully traded through)
+      fill_t   — when price FIRST entered the gap (near-edge touch —
+                 the retest moment)
+      full_t   — when the gap was fully filled (None while unbroken)
+      filled   — True once fully filled (legacy semantic preserved)
+
+    D-048: numpy hot path (see detect_order_blocks). D-069: one
+    vectorized pass per gap computes depth, first-touch and full-fill.
     """
     out: list[dict] = []
     n = len(df)
@@ -260,34 +280,56 @@ def detect_fvg(df: pd.DataFrame, max_gaps: int = 8) -> list[dict]:
         return out
     h = df["h"].to_numpy(dtype=float)
     low = df["l"].to_numpy(dtype=float)
+    o = df["o"].to_numpy(dtype=float)
+    c = df["c"].to_numpy(dtype=float)
     t_arr = df["time_utc"].to_numpy()
+    a = atr_last(df, 14) or 1e-9
     for k in range(1, n - 1):
         prev_hi, prev_lo = h[k - 1], low[k - 1]
         nxt_hi, nxt_lo = h[k + 1], low[k + 1]
         if nxt_lo > prev_hi:
             gap = nxt_lo - prev_hi
+            disp = abs(c[k + 1] - o[k - 1])
             out.append({"side": "bullish", "t": t_arr[k],
                         "hi": nxt_lo, "lo": prev_hi, "gap": gap,
-                        "filled": False, "filled_pct": 0})
+                        "gap_atr": gap / a, "disp": disp / a,
+                        "filled": False, "filled_pct": 0.0,
+                        "fill_pct": 0.0, "fill_t": None, "full_t": None})
         elif nxt_hi < prev_lo:
             gap = prev_lo - nxt_hi
+            disp = abs(c[k + 1] - o[k - 1])
             out.append({"side": "bearish", "t": t_arr[k],
                         "hi": prev_lo, "lo": nxt_hi, "gap": gap,
-                        "filled": False, "filled_pct": 0})
-    # fill check: when did price first trade through the gap's near edge
+                        "gap_atr": gap / a, "disp": disp / a,
+                        "filled": False, "filled_pct": 0.0,
+                        "fill_pct": 0.0, "fill_t": None, "full_t": None})
+    # fill telemetry — ONE vectorized pass per gap: depth price traded
+    # into the band, the first near-edge touch and the first full fill
     for g in out:
         k0 = _time_pos(t_arr, g["t"])
         start = k0 + 2 if k0 >= 0 else 0
-        g["fill_t"] = None
-        if start < n:
-            if g["side"] == "bullish":
-                mask = low[start:] <= g["lo"]
-            else:
-                mask = h[start:] >= g["hi"]
-            hit = int(np.argmax(mask)) if mask.any() else -1
-            if hit >= 0:
-                g["filled"] = True
-                g["fill_t"] = t_arr[start + hit]
+        if start >= n:
+            continue
+        width = max(g["hi"] - g["lo"], 1e-9)
+        if g["side"] == "bullish":
+            seg = low[start:]
+            # price descends INTO a bullish gap: depth = (hi - min_low)
+            depth = (g["hi"] - float(seg.min())) / width
+            entered = seg <= g["hi"]   # near edge = hi (nxt_lo)
+            fully = seg <= g["lo"]     # far edge  = lo (prev_hi)
+        else:
+            seg = h[start:]
+            # price ascends INTO a bearish gap: depth = (max_high - lo)
+            depth = (float(seg.max()) - g["lo"]) / width
+            entered = seg >= g["lo"]   # near edge = lo (nxt_hi)
+            fully = seg >= g["hi"]     # far edge  = hi (prev_lo)
+        g["fill_pct"] = round(min(max(depth, 0.0), 1.0), 3)
+        if bool(entered.any()):
+            g["fill_t"] = t_arr[start + int(np.argmax(entered))]
+        if bool(fully.any()):
+            g["filled"] = True
+            g["full_t"] = t_arr[start + int(np.argmax(fully))]
+            g["filled_pct"] = 1.0
     return [g for g in out if g["gap"] > 0][-max_gaps:]
 
 

@@ -264,7 +264,11 @@ class TestEvaluateD049:
         df = self._demand_frame()
         htf = _bias_htf("SELL")  # H4/H1/M15/M5 all falling
         close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-        cfg = EngineConfig(counter_trend_quality=0.58, entry_mode="market", regime_guard=False)  # D-068 isolated
+        # D-068 isolated
+        cfg = EngineConfig(
+            counter_trend_quality=0.58, entry_mode="market",
+            regime_guard=False,
+        )
         ev = evaluate(df, htf, close_time, cfg, spread_points=20)
         assert ev.signal is not None, ev.trace["checks"]
         assert ev.signal["direction"] == "BUY"

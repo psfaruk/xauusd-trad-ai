@@ -50,6 +50,44 @@ TPO_FULL_MINUTES = 30.0
 TPO_MIN_MINUTES = 8.0
 #: FVG fills older than this (minutes) stop being POIs
 FVG_FILL_WINDOW_MIN = 20.0
+# ------------------------------------------------------------- D-069 FVG
+# (user directive: "ছোট বড় অনেক fvg তৈরি হয়, সব fvg গুরুত্ব পূর্ণ না" —
+#  many small and large FVGs form, NOT all of them matter)
+#: hard noise floor — a gap below this fraction of the frame's OWN ATR
+#: is spread noise and NEVER becomes a POI (self-scaling: M1 gaps are
+#: measured on M1-ATR, M15 gaps on M15-ATR)
+FVG_MIN_ATR = 0.30
+#: the 3-bar displacement (in ATRs) that must have minted the gap —
+#: note disp >= gap mathematically for every FVG (close[k+1] sits above
+#: the gap, open[k-1] below it), so a floor ABOVE FVG_MIN_ATR is what
+#: gives the rule teeth: the leg must carry NET PROGRESS past the gap
+#: itself, not a spike-and-round-trip
+FVG_MIN_DISP = 0.40
+#: gap width that earns the full size component (in frame ATRs)
+FVG_SIZE_FULL_ATR = 1.00
+#: displacement that earns the full displacement component (in ATRs)
+FVG_DISP_FULL_ATR = 1.00
+#: consequent encroachment — once price has traded this deep into the
+#: gap the inefficiency is considered mitigated (freshness drops)
+FVG_CE = 0.50
+#: partial fill, CE intact, NOT recent — discounted freshness
+FVG_FILL_STALE = 0.65
+#: FVG-specific quality weights (size + disp + fresh + age + tpo = 1.0)
+FVG_W_SIZE = 0.35
+FVG_W_DISP = 0.15
+FVG_W_FRESH = 0.30
+FVG_W_AGE = 0.15
+FVG_W_TPO = 0.05
+#: gap-in-gap bonus — a base-TF gap stacked inside a same-side HTF gap
+#: (the multi-timeframe alignment the chart shows as nested boxes)
+FVG_STACK_BONUS = 0.10
+#: premium/discount adjustment — a demand gap in the discount half of
+#: the recent range (buy low) / a supply gap in the premium half (sell
+#: high) earns +, the wrong half pays -
+FVG_PD_ADJ = 0.05
+#: HTF frames whose FVGs join the ranked POI list (institutional gaps —
+#: the same frames the chart drawings layer renders)
+FVG_HTF_TFS = ("M5", "M15")
 #: hard-coded quality weights (sum of the first four = 1.0; HTF is a bonus)
 W_IMPULSE = 0.35
 W_FRESH = 0.30
@@ -143,6 +181,130 @@ def zone_quality(
     return round(_clamp01(q), 3)
 
 
+def _fvg_freshness(g: dict, recent_from: Any) -> float:
+    """CE-aware FVG freshness (D-069 — the ICT consequent-encroachment
+    rule the old model could not see: any gap price had not FULLY
+    filled scored "untouched" 1.0, so a half-mitigated gap was as fresh
+    as a virgin one).
+
+      untouched            FRESH_UNTOUCHED 1.00
+      filling NOW, CE ok   FRESH_FIRST_TOUCH 0.85 — the retest IS the
+                           entry
+      partial, CE ok, old  FVG_FILL_STALE 0.65 — still tradeable
+      past CE (>= 0.50)    FRESH_STALE 0.45 — the gap is mitigated
+      fully filled         FRESH_STALE 0.45 (only fills younger than
+                           FVG_FILL_WINDOW_MIN survive the drop below)
+    """
+    pct = float(g.get("fill_pct", 0.0) or 0.0)
+    if pct <= 0.0:
+        return FRESH_UNTOUCHED
+    if pct >= FVG_CE:
+        return FRESH_STALE
+    ft = g.get("fill_t")
+    try:
+        if ft is not None and pd.Timestamp(ft) >= pd.Timestamp(recent_from):
+            return FRESH_FIRST_TOUCH
+    except (TypeError, ValueError):
+        pass
+    return FVG_FILL_STALE
+
+
+def fvg_zone_quality(
+    *,
+    gap_atr: float,
+    disp: float,
+    fresh_q: float,
+    age_q: float,
+    tpo_minutes: float,
+    htf: bool,
+) -> float:
+    """0..1+ — the D-069 FVG importance model (un-clamped: the caller
+    adds the stack/pd adjustments, then clamps).
+
+    size  0.35 — gap width in frame-ATRs (FVG_MIN_ATR -> 0,
+                   FVG_SIZE_FULL_ATR -> 1): the inefficiency must be
+                   REAL before anything else matters
+    disp  0.15 — the displacement leg that minted the gap (ICT: gaps
+                   born of drifts are noise, gaps born of displacement
+                   are institutional footprints)
+    fresh 0.30 — CE-aware (see _fvg_freshness)
+    age   0.15 — the same age model every other zone uses
+    tpo   0.05 — time-at-price reinforcement (small: gaps are momentum
+                   artifacts, not rest levels)
+    htf  +0.10 — born on M5/M15 (the institutional frames)
+    """
+    size_q = _clamp01(
+        (gap_atr - FVG_MIN_ATR) / (FVG_SIZE_FULL_ATR - FVG_MIN_ATR)
+    )
+    disp_q = _clamp01(disp / FVG_DISP_FULL_ATR)
+    tpo_q = 0.0
+    if tpo_minutes >= TPO_MIN_MINUTES:
+        tpo_q = _clamp01(tpo_minutes / TPO_FULL_MINUTES)
+    q = (
+        FVG_W_SIZE * size_q
+        + FVG_W_DISP * disp_q
+        + FVG_W_FRESH * _clamp01(fresh_q)
+        + FVG_W_AGE * _clamp01(age_q)
+        + FVG_W_TPO * tpo_q
+    )
+    if htf:
+        q += W_HTF_BONUS
+    return q
+
+
+def _pd_position(side: str, lo: float, hi: float,
+                 range_lo: float, range_hi: float) -> str:
+    """Range half the gap sits in ("premium" / "discount" / "mid").
+
+    Demand below the range midpoint = discount (the half BUYs belong
+    to); supply above it = premium (the half SELLs belong to).
+    """
+    try:
+        mid = (float(range_lo) + float(range_hi)) / 2.0
+        zmid = (float(lo) + float(hi)) / 2.0
+    except (TypeError, ValueError):
+        return "mid"
+    if abs(zmid - mid) <= 0.10 * max(range_hi - range_lo, 1e-9):
+        return "mid"
+    if zmid < mid:
+        return "discount"
+    return "premium"
+
+
+_FVG_MEMO: dict[tuple, list[dict]] = {}
+
+
+def _htf_fvgs(tf: str, frame: pd.DataFrame, max_gaps: int) -> list[dict]:
+    """detect_fvg on an HTF frame, memoized on content identity.
+
+    HTF frames only change when their own bar closes (closed-bars-only
+    slices), so (tf, last-timestamp, length) tracks content within ONE
+    symbol's series — but the engine evaluates multiple markets (XAUUSD
+    + BTCUSD) whose M5/M15 frames share timestamps and lengths, so the
+    key also carries the frame's first/last closes (price-series
+    identity — two symbols never coincide there).
+    """
+    try:
+        key = (
+            tf, str(pd.Timestamp(frame["time_utc"].iloc[-1])),
+            int(len(frame)), int(max_gaps),
+            round(float(frame["c"].iloc[0]), 4),
+            round(float(frame["c"].iloc[-1]), 4),
+        )
+    except Exception:  # noqa: BLE001 — memo must never break analysis
+        key = None
+    if key is not None:
+        hit = _FVG_MEMO.get(key)
+        if hit is not None:
+            return hit
+    out = smc.detect_fvg(frame, max_gaps=max_gaps)
+    if key is not None:
+        if len(_FVG_MEMO) > 8:
+            _FVG_MEMO.clear()
+        _FVG_MEMO[key] = out
+    return out
+
+
 def _broken(
     closes: np.ndarray,
     side: str,
@@ -180,10 +342,31 @@ def _origin_index(t_arr: np.ndarray, t: Any) -> int:
     return 2  # not found (never expected) — conservative early start
 
 
+def _cfg_flag(cfg: Any, name: str, default: bool) -> bool:
+    """Duck-typed config read (EngineConfig-like; None = hard-coded)."""
+    try:
+        return bool(getattr(cfg, name, default))
+    except Exception:  # noqa: BLE001 — config reads must never break POIs
+        return default
+
+
+def _cfg_num(cfg: Any, name: str, default: float) -> float:
+    try:
+        v = float(getattr(cfg, name, default))
+    except (TypeError, ValueError):
+        return default
+    return v if v == v else default  # NaN guard
+
+
+#: TF minute lengths for the frame-relative FVG fill window
+_FVG_TF_MIN = {"M1": 1.0, "M5": 5.0, "M15": 15.0}
+
+
 def poi_zones(
     base: pd.DataFrame,
     htf: dict[str, pd.DataFrame] | None = None,
     max_zones: int = 24,
+    cfg: Any = None,  # EngineConfig-like (D-069 knobs); None = constants
 ) -> list[dict]:
     """Ranked POI zone list (highest quality first), all sides mixed.
 
@@ -192,6 +375,13 @@ def poi_zones(
     HTF zones (quality bonus, institutional timeframe). Zones are deduped
     (same-side overlaps keep the higher-quality band) and broken zones are
     dropped — a close beyond the far edge means the zone is invalidated.
+
+    D-069 (user directive: "ছোট বড় অনেক fvg তৈরি হয়, সব fvg গুরুত্ব
+    পূর্ণ না") — FVGs go through the importance model: hard noise floor
+    (>= FVG_MIN_ATR of the frame's own ATR), displacement floor, CE-aware
+    freshness, and M5/M15 HTF gaps join the ranked list (gap-in-gap
+    stacking bonus + premium/discount adjust). `cfg.fvg_importance=False`
+    restores the pre-D-069 behavior exactly (A/B escape hatch).
     """
     out: list[dict] = []
     if base is None or len(base) < 30:
@@ -229,9 +419,14 @@ def poi_zones(
         mit_t: Any = None,
         filled: bool = False,
         fill_t: Any = None,
+        quality: float | None = None,
+        extra: dict | None = None,
+        skip_broken: bool = False,
     ) -> None:
-        if _broken(closes_np, side, float(lo), float(hi), broken_tol,
-                   _origin_index(t_np, t)):
+        if not skip_broken and _broken(
+            closes_np, side, float(lo), float(hi), broken_tol,
+            _origin_index(t_np, t),
+        ):
             return
         zone = {
             "side": side,
@@ -246,13 +441,17 @@ def poi_zones(
             "fill_t": fill_t,
             "htf": htf_origin,
         }
-        zone["quality"] = zone_quality(
-            impulse_atr=impulse,
-            fresh_q=_freshness_q(zone, recent_from),
-            age_q=_age_q(t, last_t),
-            tpo_minutes=_tpo_minutes(tpo_levels, float(lo), float(hi)),
-            htf=htf_origin,
+        zone["quality"] = (
+            quality if quality is not None else zone_quality(
+                impulse_atr=impulse,
+                fresh_q=_freshness_q(zone, recent_from),
+                age_q=_age_q(t, last_t),
+                tpo_minutes=_tpo_minutes(tpo_levels, float(lo), float(hi)),
+                htf=htf_origin,
+            )
         )
+        if extra:
+            zone.update(extra)
         out.append(zone)
 
     # --- 1/2. base-TF supply/demand zones + order blocks (D-049: caps
@@ -265,22 +464,204 @@ def poi_zones(
         _add(side, "ob", ob["t"], ob["lo"], ob["hi"],
              ob.get("impulse"), False, ob["mitigated"], ob.get("mit_t"))
 
-    # --- 3. fair value gaps: unfilled or FRESHLY filled only
-    for g in smc.detect_fvg(frame, max_gaps=10):
-        if g["filled"]:
-            fill_t = g.get("fill_t")
+    # --- 3. fair value gaps — D-069 importance model (user directive:
+    # "ছোট বড় অনেক fvg তৈরি হয়, সব fvg গুরুত্ব পূর্ণ না" — not every
+    # gap matters). Legacy path (fvg_importance=False) keeps the exact
+    # pre-D-069 code (A/B escape hatch).
+    fvg_on = _cfg_flag(cfg, "fvg_importance", True)
+    fvg_htf_on = fvg_on and _cfg_flag(cfg, "fvg_htf_enabled", True)
+    fvg_min_atr = _cfg_num(cfg, "fvg_min_atr", FVG_MIN_ATR)
+    fvg_min_disp = _cfg_num(cfg, "fvg_min_disp", FVG_MIN_DISP)
+    fvg_stack = _cfg_num(cfg, "fvg_stack_bonus", FVG_STACK_BONUS)
+    fvg_pd = _cfg_num(cfg, "fvg_pd_adjust", FVG_PD_ADJ)
+    # base-TF full-fill window — flat 20 min = the exact legacy value
+    base_fill_win = FVG_FILL_WINDOW_MIN
+    range_lo = float(frame["l"].min())
+    range_hi = float(frame["h"].max())
+
+    # base-TF gap candidates FIRST (floors + full-fill window), so the
+    # stacking check can run BOTH ways: whichever same-side pair wins
+    # the dedupe below carries the gap-in-gap flag — the zone the user
+    # sees on the chart is ONE nested level, not two
+    base_cands: list[tuple[dict, str, float, float]] = []  # (g, side, atr, disp)
+    for g in smc.detect_fvg(frame, max_gaps=24 if fvg_on else 10):
+        if not fvg_on:
+            # legacy path — the exact pre-D-069 code (full_t restores
+            # the old full-fill fill_t semantics for the window check)
+            if g.get("filled"):
+                ft = g.get("full_t") or g.get("fill_t")
+                try:
+                    age = (pd.Timestamp(last_t) - pd.Timestamp(ft)
+                           ).total_seconds() / 60.0
+                except (TypeError, ValueError):
+                    age = 1e9
+                if age > base_fill_win:
+                    continue
+            side = "demand" if g["side"] == "bullish" else "supply"
+            gap_atr = (g["hi"] - g["lo"]) / atr_val
+            _add(side, "fvg", g["t"], g["lo"], g["hi"],
+                 1.0 + 2.0 * _clamp01(gap_atr), False,
+                 g.get("filled", False), g.get("full_t") or g.get("fill_t"))
+            continue
+        # D-069 — the importance gate: real size + real displacement
+        gap_atr = float(g.get("gap_atr", 0.0) or 0.0)
+        disp = float(g.get("disp", 0.0) or 0.0)
+        if gap_atr < fvg_min_atr or disp < fvg_min_disp:
+            continue  # spread noise / spike-round-trip — never a POI
+        if g.get("filled"):
+            ft = g.get("full_t") or g.get("fill_t")
             try:
-                age = (pd.Timestamp(last_t) - pd.Timestamp(fill_t)
+                age = (pd.Timestamp(last_t) - pd.Timestamp(ft)
                        ).total_seconds() / 60.0
             except (TypeError, ValueError):
                 age = 1e9
-            if age > FVG_FILL_WINDOW_MIN:
-                continue
+            if age > base_fill_win:
+                continue  # full fills older than the window stop being POIs
         side = "demand" if g["side"] == "bullish" else "supply"
-        gap_atr = (g["hi"] - g["lo"]) / atr_val
-        _add(side, "fvg", g["t"], g["lo"], g["hi"],
-             1.0 + 2.0 * _clamp01(gap_atr), False,
-             g["filled"], g.get("fill_t"))
+        base_cands.append((g, side, gap_atr, disp))
+
+    # HTF (M5/M15) institutional gaps. Self-scaled: each frame's gaps
+    # are floored/weighted on that frame's OWN ATR, so a 0.30-ATR M15
+    # gap is a real institutional inefficiency whatever the volatility.
+    htf_fvg_bands: list[dict] = []
+    if fvg_htf_on:
+        for tf in FVG_HTF_TFS:
+            hf = (htf or {}).get(tf)
+            if hf is None or len(hf) < 30:
+                continue
+            h_frame = hf.iloc[-POI_WINDOW:].reset_index(drop=True)
+            h_closes = h_frame["c"].to_numpy(dtype=float)
+            h_t_np = h_frame["time_utc"].to_numpy()
+            h_atr = atr_last(h_frame, 14) or atr_val
+            h_tol = BROKEN_TOL_ATR * h_atr
+            tf_min = _FVG_TF_MIN.get(tf, 15.0)
+            h_recent = (
+                h_frame["time_utc"].iloc[-3]
+                if len(h_frame) >= 3 else h_frame["time_utc"].iloc[-1]
+            )
+            fill_win = max(FVG_FILL_WINDOW_MIN, 2.0 * tf_min)
+            h_range_lo = float(h_frame["l"].min())
+            h_range_hi = float(h_frame["h"].max())
+            for g in _htf_fvgs(tf, h_frame, 12):
+                gap_atr = float(g.get("gap_atr", 0.0) or 0.0)
+                disp = float(g.get("disp", 0.0) or 0.0)
+                if gap_atr < fvg_min_atr or disp < fvg_min_disp:
+                    continue  # noise on the institutional frame too
+                side = "demand" if g["side"] == "bullish" else "supply"
+                g_lo, g_hi = float(g["lo"]), float(g["hi"])
+                # invalidation, dual-clock (both start AFTER the 3-candle
+                # pattern completes — a scan starting inside the forming
+                # impulse would falsely break the gap with its own M1
+                # closes): HTF closes on the HTF clock, M1 closes from
+                # the pattern's completion minute
+                if _broken(
+                    h_closes, side, g_lo, g_hi, h_tol,
+                    _origin_index(h_t_np, g["t"]),
+                ):
+                    continue
+                try:
+                    done_at = pd.Timestamp(g["t"]) + pd.Timedelta(
+                        minutes=2 * tf_min
+                    )
+                    m1_start = int(np.searchsorted(t_np, done_at))
+                except (TypeError, ValueError):
+                    m1_start = len(closes_np)
+                if _broken(
+                    closes_np, side, g_lo, g_hi, broken_tol, m1_start
+                ):
+                    continue
+                htf_fvg_bands.append({
+                    "side": side, "lo": g_lo, "hi": g_hi, "tf": tf,
+                })
+                if g.get("filled"):
+                    ft = g.get("full_t") or g.get("fill_t")
+                    try:
+                        age = (
+                            pd.Timestamp(last_t) - pd.Timestamp(ft)
+                        ).total_seconds() / 60.0
+                    except (TypeError, ValueError):
+                        age = 1e9
+                    if age > fill_win:
+                        continue
+                # gap-in-gap, HTF side: a same-side base gap nested inside
+                # this band makes THIS zone the stacked level
+                stacked = any(
+                    b_side == side
+                    and float(bg["lo"]) <= g_hi and float(bg["hi"]) >= g_lo
+                    for bg, b_side, _a, _d in base_cands
+                )
+                pos = _pd_position(
+                    side, g_lo, g_hi, h_range_lo, h_range_hi
+                )
+                pd_adjust = (
+                    fvg_pd
+                    if (side == "demand" and pos == "discount")
+                    or (side == "supply" and pos == "premium")
+                    else (-fvg_pd if pos in ("premium", "discount") else 0.0)
+                )
+                q = round(_clamp01(fvg_zone_quality(
+                    gap_atr=gap_atr,
+                    disp=disp,
+                    fresh_q=_fvg_freshness(g, h_recent),
+                    age_q=_age_q(g["t"], last_t),
+                    tpo_minutes=_tpo_minutes(tpo_levels, g_lo, g_hi),
+                    htf=True,
+                ) + pd_adjust + (fvg_stack if stacked else 0.0)), 3)
+                _add(
+                    side, "fvg", g["t"], g_lo, g_hi,
+                    None, True, g.get("filled", False),
+                    g.get("full_t") or g.get("fill_t"),
+                    quality=q, skip_broken=True,
+                    extra={
+                        "gap_atr": round(gap_atr, 2),
+                        "disp": round(disp, 2),
+                        "fill_pct": round(
+                            float(g.get("fill_pct", 0.0) or 0.0), 2),
+                        "stacked": bool(stacked),
+                        "htf_tf": tf,
+                        "pd": pos,
+                    },
+                )
+
+    # base-TF zones (the candidates survived the floors + window above)
+    for g, side, gap_atr, disp in base_cands:
+        g_lo, g_hi = float(g["lo"]), float(g["hi"])
+        # gap-in-gap, base side: nested inside a same-side HTF band
+        stack_hit = next(
+            (b for b in htf_fvg_bands
+             if b["side"] == side and g_lo <= b["hi"] and g_hi >= b["lo"]),
+            None,
+        )
+        stacked = stack_hit is not None
+        pos = _pd_position(side, g_lo, g_hi, range_lo, range_hi)
+        pd_adjust = (
+            fvg_pd
+            if (side == "demand" and pos == "discount")
+            or (side == "supply" and pos == "premium")
+            else (-fvg_pd if pos in ("premium", "discount") else 0.0)
+        )
+        q = round(_clamp01(fvg_zone_quality(
+            gap_atr=gap_atr,
+            disp=disp,
+            fresh_q=_fvg_freshness(g, recent_from),
+            age_q=_age_q(g["t"], last_t),
+            tpo_minutes=_tpo_minutes(tpo_levels, g_lo, g_hi),
+            htf=False,
+        ) + (fvg_stack if stacked else 0.0) + pd_adjust), 3)
+        _add(
+            side, "fvg", g["t"], g_lo, g_hi,
+            None, False, g.get("filled", False),
+            g.get("full_t") or g.get("fill_t"),
+            quality=q,
+            extra={
+                "gap_atr": round(gap_atr, 2),
+                "disp": round(disp, 2),
+                "fill_pct": round(float(g.get("fill_pct", 0.0) or 0.0), 2),
+                "stacked": bool(stacked),
+                "htf_tf": stack_hit["tf"] if stack_hit else None,
+                "pd": pos,
+            },
+        )
 
     # --- 4. TPO time-at-price levels (both sides, band = ±half bucket)
     if tpo_levels:

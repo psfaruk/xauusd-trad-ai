@@ -91,9 +91,10 @@ function DominanceBar({ buy, sell }: { buy: number; sell: number }) {
 }
 
 function ZoneRow({
-  side, lo, hi, quality, source, dist,
+  side, lo, hi, quality, source, dist, tf, gapAtr, fillPct,
 }: {
-  side: string; lo: number; hi: number; quality: number; source: string; dist: number;
+  side: string; lo: number; hi: number; quality: number; source: string;
+  dist: number; tf?: string | null; gapAtr?: number; fillPct?: number;
 }) {
   return (
     <li className="flex min-w-0 items-center gap-2 rounded-lg border border-zinc-800/70 bg-zinc-900/40 px-2.5 py-1.5">
@@ -102,7 +103,13 @@ function ZoneRow({
         {lo.toFixed(2)}–{hi.toFixed(2)}
       </span>
       <span className="shrink-0 text-[9px] text-zinc-500">
+        {tf ? `${tf} · ` : ""}
         q{quality.toFixed(2)} · {source}
+        {/* D-069 — FVG importance: gap width in ATRs + fill depth (CE) */}
+        {source === "fvg" && gapAtr != null ? ` · ${gapAtr.toFixed(2)} ATR` : ""}
+        {source === "fvg" && fillPct != null && fillPct > 0
+          ? ` · ${Math.round(fillPct * 100)}% filled`
+          : ""}
       </span>
       <span className="shrink-0 rounded bg-zinc-800/80 px-1.5 py-0.5 font-mono text-[10px] font-bold tabular-nums text-gold">
         {dist.toFixed(2)}$
@@ -559,6 +566,9 @@ function MarketRadar({ symbol }: { symbol: string }) {
                     quality={z.quality}
                     source={z.source}
                     dist={z.dist_usd}
+                    tf={z.tf}
+                    gapAtr={z.gap_atr}
+                    fillPct={z.fill_pct}
                   />
                 ))}
               </ul>
