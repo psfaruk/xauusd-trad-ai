@@ -243,12 +243,14 @@ class EngineConfig(BaseModel):
     entry_mode: str = Field(
         "poi_limit",
         pattern="^(market|poi_limit)$",
-        description="D-050 — 'poi_limit' turns every signal into a PENDING "
-                    "LIMIT order anchored at a POI zone level BEYOND the "
-                    "market (BUY limit below the demand/support zone, SELL "
-                    "limit above the supply/resistance zone — user "
-                    "directive); 'market' keeps the legacy enter-at-close "
-                    "behaviour",
+        description="D-050/D-056 — 'poi_limit' turns every signal into a "
+                    "PENDING LIMIT order anchored at the zone's NEAR edge "
+                    "(a BUY limit at the demand zone's lower/near edge, a "
+                    "SELL limit at the supply zone's upper/near edge — "
+                    "user directive: an order that only fills when the "
+                    "zone BREAKS is adverse selection, the near edge "
+                    "fills while the zone holds); 'market' keeps the "
+                    "legacy enter-at-close behaviour",
     )
     entry_offset_atr: float = Field(
         0.35, gt=0,
@@ -484,6 +486,17 @@ class EngineConfig(BaseModel):
         description="D-067 — confidence bonus when the signal fires WITH "
                     "a dominating aligned candle-battle (the flow pushing "
                     "the trade's direction)",
+    )
+    flow_block: bool = Field(
+        False,
+        description="D-VERIFY (external report §8) — OPT-IN hard WAIT: a "
+                    "signal firing against a DOMINATING candle-battle "
+                    "(>= flow_domination with a >= flow_streak winning "
+                    "streak against it) is REFUSED outright instead of "
+                    "confidence-discounted. Default FALSE keeps the D-049 "
+                    "directive ('সিগনাল মিস করা যাবে না' — never silently "
+                    "miss; the trap gate owns hard blocks); enable only "
+                    "if the A/B on live-shaped data favors it",
     )
     # -------------------------------------------------- D-051 trusted-vote block
     trusted_min_votes: float = Field(

@@ -55,6 +55,9 @@ class EngineRuntime:
         self.stream.on_tick = self._on_tick
         self.stream.on_bar_close = self._on_bar_close
         self.tracker.on_status = self._on_signal_status
+        # D-VERIFY — last seen live spread (feeds the tracker's bid/ask-
+        # honest bar-close fallback fill)
+        self._last_spread_price: float = 0.0
         self._account_task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
         self._stopped = asyncio.Event()
@@ -111,6 +114,10 @@ class EngineRuntime:
 
     async def _on_tick(self, tick) -> None:
         self.engine.note_spread(tick.bid, tick.ask)
+        # D-VERIFY — the live spread rides to the bar-close fallback fill
+        # (a BUY limit only truly fills when the ASK touches; the closed
+        # bar is bid-based, so the fallback needs entry - spread)
+        self._last_spread_price = max(0.0, float(tick.ask) - float(tick.bid))
         await self.tracker.on_tick(tick.bid, tick.ask)
 
     async def _on_bar_close(self, tf: str, bar: dict) -> None:
@@ -134,6 +141,7 @@ class EngineRuntime:
                 pending_expiry_bars=cfg.pending_expiry_bars,
                 bar_low=bar.get("l"), bar_high=bar.get("h"),
                 bar_open=bar.get("o"),
+                spread_price=self._last_spread_price,
             )
 
     async def _on_signal_status(self, sig: TrackedSignal) -> None:

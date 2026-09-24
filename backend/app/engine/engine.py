@@ -942,6 +942,22 @@ def evaluate(
             )
             if against and dom_pct >= cfg.flow_domination * 100.0 \
                     and streak_len >= cfg.flow_streak:
+                if cfg.flow_block:
+                    # D-VERIFY (external report §8) — the OPT-IN hard WAIT:
+                    # the exact trap shape the user reported (SELL into a
+                    # buyers' run) is refused outright, visible in the
+                    # near-miss log; default OFF per the D-049 directive
+                    trace.add(
+                        "flow_guard", False,
+                        f"{trigger_tag.direction} refused — dominating "
+                        f"{b_state} battle ({round(dom_pct)}% of the flow, "
+                        f"{streak_len} in a row) against the trade "
+                        "(flow_block=true)",
+                    )
+                    _pulse_miss(pulse, trace)
+                    return Evaluation(
+                        None, trace.to_dict(), near_miss=True, pulse=pulse
+                    )
                 flow_adjust -= cfg.flow_penalty
                 flow_note = (
                     f"{trigger_tag.direction} fires into a dominating "
@@ -958,6 +974,35 @@ def evaluate(
                     "pushing the trade's direction"
                 )
                 trace.add("flow_guard", True, flow_note)
+
+    # D-VERIFY (external report §12/§28) — FINAL ORDER-CONTRACT GATE:
+    # entry/sl/tp are all final now (geometry + targets + spread_risk
+    # + trap + structure + flow have spoken); before the payload is
+    # built, the immutable contract is asserted once, defensively:
+    #   BUY  -> sl < entry < tp    SELL -> tp < entry < sl
+    #   positive prices, positive risk, rr inside the sane band.
+    # The pipeline audit measured 0 violations — this gate exists so a
+    # FUTURE regression can never emit an inverted order: it refuses
+    # loudly (near-miss "order_contract") instead of crashing or firing.
+    _dir_final = trigger_tag.direction
+    _risk_final = abs(entry - sl)
+    _rr_final = (abs(tp - entry) / _risk_final) if _risk_final > 0 else 0.0
+    _contract_ok = (
+        entry > 0 and sl > 0 and tp > 0
+        and _risk_final > 0
+        and (
+            (sl < entry < tp) if _dir_final == "BUY" else (tp < entry < sl)
+        )
+        and 0.2 <= _rr_final <= 5.0
+    )
+    if not _contract_ok:
+        trace.add(
+            "order_contract", False,
+            f"{_dir_final} contract violated — entry {entry:.2f} sl {sl:.2f} "
+            f"tp {tp:.2f} rr {_rr_final:.2f} (refused before emit)",
+        )
+        _pulse_miss(pulse, trace)
+        return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
 
     trace.add(
         "targets", True,

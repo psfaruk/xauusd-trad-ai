@@ -166,6 +166,7 @@ class SignalTracker:
         bar_low: float | None = None,
         bar_high: float | None = None,
         bar_open: float | None = None,
+        spread_price: float = 0.0,
     ) -> None:
         """Count a closed engine-TF bar per signal; expire when full.
 
@@ -174,6 +175,13 @@ class SignalTracker:
         strand a limit that clearly traded through), and after
         `pending_expiry_bars` bars without a fill the signal expires
         UNFILLED — result_r None (a missed trade, never a loss).
+
+        D-VERIFY (external report §14) — the fallback is BID/ASK-honest
+        now: closed bars are bid-based (MT5 convention), so a BUY limit
+        (which fills on the ASK touch in reality) only fills on the
+        fallback when the bar's bid low reached entry - spread — a bar
+        whose low just kissed the entry never filled the ask side. SELL
+        limits fill on the bid touch (exact, no adjustment).
 
         D-061 — PENDING signals additionally get the PRE-FILL
         DISPLACEMENT GUARD: while the limit waits, two or more
@@ -191,7 +199,7 @@ class SignalTracker:
                     sig.bars_pending += 1
                     if (
                         bar_low is not None and sig.direction == "BUY"
-                        and bar_low <= sig.entry
+                        and bar_low <= sig.entry - spread_price
                     ) or (
                         bar_high is not None and sig.direction == "SELL"
                         and bar_high >= sig.entry

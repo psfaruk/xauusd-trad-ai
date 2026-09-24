@@ -183,8 +183,16 @@ class _SimTracker:
     signals).
     """
 
-    def __init__(self, cfg: EngineConfig) -> None:
+    def __init__(self, cfg: EngineConfig, spread_price: float = 0.0) -> None:
         self.cfg = cfg
+        # D-VERIFY (external report §13/§15) — bid/ask-exact fill model:
+        # the replayed bars are BID-based (MT5 copy_rates convention), so
+        # BUY limits fill on the ASK touch (bid low <= entry - spread)
+        # while SELL limits fill on the BID touch (exact); SELL exits
+        # trigger on the ask (high >= sl - spread, low <= tp - spread).
+        # The old low<=entry/high>=sl symmetry was one-spread optimistic
+        # on BUY fills, SELL SLs and SELL TPs.
+        self.spread_price = float(spread_price)
         self.open_sigs: list[BacktestSignal] = []
         self._held: dict[int, int] = {}  # id(sig) -> bars held (after fill)
         self._pbars: dict[int, int] = {}  # id(sig) -> bars pending (D-050)
@@ -226,9 +234,14 @@ class _SimTracker:
         high, low, close = float(bar["h"]), float(bar["l"]), float(bar["c"])
 
         # D-050 — PENDING stage: wait for the market to retrace to the limit
+        # D-VERIFY — bid/ask-exact: BUY fills on the ASK touch (bid bars
+        # need low <= entry - spread); SELL fills on the BID touch (exact)
         if sig.status == "pending":
             self._pbars[id(sig)] += 1
-            buy_touch = sig.direction == "BUY" and low <= sig.entry
+            buy_touch = (
+                sig.direction == "BUY"
+                and low <= sig.entry - self.spread_price
+            )
             sell_touch = sig.direction == "SELL" and high >= sig.entry
             if buy_touch or sell_touch:
                 sig.filled = True
@@ -237,10 +250,13 @@ class _SimTracker:
                 sig.status = "active"
                 # same-bar pessimism: the fill happened somewhere in the
                 # bar — if the bar also swept the SL, SL wins
+                # (BUY SL is a bid-side stop: exact; SELL SL is an
+                # ask-side stop: bid high >= sl - spread)
                 if sig.direction == "BUY" and low <= sig.sl:
                     sig.status, sig.result_r = "lost", -1.0
                     return self._exit(sig, bar)
-                if sig.direction == "SELL" and high >= sig.sl:
+                if sig.direction == "SELL" \
+                        and high >= sig.sl - self.spread_price:
                     sig.status, sig.result_r = "lost", -1.0
                     return self._exit(sig, bar)
                 return False
@@ -273,6 +289,10 @@ class _SimTracker:
             return False
 
         # ACTIVE stage (market-born signals start here; limit signals after fill)
+        # D-VERIFY — exits are side-exact: BUY exits on the BID (exact on
+        # bid bars); SELL exits on the ASK (sl: high >= sl - spread,
+        # tp: low <= tp - spread); a SELL expiry buys back at the ask
+        # (close + spread) — the spread rides the exit, not a post-hoc tax
         self._held[id(sig)] += 1
         if sig.direction == "BUY":
             if low <= sig.sl:
@@ -288,16 +308,19 @@ class _SimTracker:
             else:
                 return False
         else:
-            if high >= sig.sl:
+            if high >= sig.sl - self.spread_price:
                 sig.status, sig.result_r = "lost", -1.0
-            elif low <= sig.tp:
+            elif low <= sig.tp - self.spread_price:
                 sig.status = "won"
                 sig.result_r = round(
                     (sig.entry - sig.tp) / (sig.sl - sig.entry), 4
                 )
             elif self._held[id(sig)] >= self.cfg.expiry_bars:
                 sig.status = "expired"
-                sig.result_r = round((sig.entry - close) / (sig.sl - sig.entry), 4)
+                sig.result_r = round(
+                    (sig.entry - close - self.spread_price)
+                    / (sig.sl - sig.entry), 4
+                )
             else:
                 return False
         return self._exit(sig, bar)
@@ -364,7 +387,7 @@ def run_backtest(
         date_from=base["time_utc"].iloc[warmup].to_pydatetime() if len(base) > warmup else None,
         date_to=base["time_utc"].iloc[-1].to_pydatetime() if len(base) else None,
     )
-    sim = _SimTracker(cfg)
+    sim = _SimTracker(cfg, spread_price=spread_points * 0.01)
     cooldown_until = -1
 
     for i in range(warmup, len(base)):
@@ -426,15 +449,22 @@ def run_backtest(
         sim.add(sig)
         cooldown_until = i + cfg.cooldown_bars + 1
 
-    # D-041/D-050 — honest spread cost: a BUY fills at the ask and exits at
-    # the bid, so every FILLED trade pays one spread. Unfilled pendings
-    # never traded — no cost. Deducted from the realized R using the
-    # signal's own risk distance (XAUUSD point = 0.01).
+    # D-VERIFY (external report §13/§15) — the bid/ask-exact levels above
+    # now EMBED the spread for LIMIT trades (BUY fills at the ask touch,
+    # SELL exits at the ask side, SELL expiry buys back at close+spread);
+    # the post-hoc tax would double-count them. Only MARKET-born trades
+    # still owe one spread: the engine records their entry at the trigger
+    # bar's close (bid), but a BUY market fill pays the ask and exits at
+    # the bid — that cost is not in the levels. Unfilled pendings never
+    # traded — no cost (XAUUSD point = 0.01).
     if spread_points and spread_points > 0:
         cost = spread_points * 0.01
         for s in result.signals:
             risk = abs(s.entry - s.sl)
-            if risk > 0 and s.filled and s.result_r is not None:
+            if (
+                risk > 0 and s.filled and s.result_r is not None
+                and s.entry_type == "market"
+            ):
                 s.result_r = round(s.result_r - cost / risk, 4)
 
     return result
