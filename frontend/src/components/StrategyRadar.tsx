@@ -194,6 +194,109 @@ function MarketRadar({ symbol }: { symbol: string }) {
             ))}
           </div>
 
+          {/* D-068 — the MARKET REGIME verdict: WHAT KIND of market is
+           * this (trend up/down / range / chop-zigzag) on each timeframe
+           * + HOW VOLATILE it is right now (ATR vs its own median, the
+           * news-spike flag) — the app's answer to "সকল অবস্থা বুঝার মত
+           * সিস্টেম আছে?" — stated on EVERY close, not just signal bars */}
+          {pulse.regime && (
+            <div className="min-w-0 rounded-xl border border-zinc-800/70 bg-zinc-900/40 px-3 py-2.5">
+              <div className="mb-2 flex min-w-0 flex-wrap items-center gap-1.5">
+                <p className="mr-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                  Market regime
+                </p>
+                <Badge
+                  tone={
+                    pulse.regime.label?.startsWith("TREND UP")
+                      ? "green"
+                      : pulse.regime.label?.startsWith("TREND DOWN")
+                        ? "red"
+                        : pulse.regime.label?.startsWith("CHOP")
+                          ? "amber"
+                          : pulse.regime.label === "TRANSITION"
+                            ? "gold"
+                            : "zinc"
+                  }
+                >
+                  {(pulse.regime.label ?? "—").toLowerCase()}
+                </Badge>
+                {pulse.regime.vol && (
+                  <Badge
+                    tone={
+                      pulse.regime.vol.state === "extreme"
+                        ? "red"
+                        : pulse.regime.vol.state === "elevated"
+                          ? "amber"
+                          : "zinc"
+                    }
+                    pulse={pulse.regime.vol.state === "extreme" || !!pulse.regime.vol.spike}
+                  >
+                    vol {pulse.regime.vol.state ?? "—"}
+                    {pulse.regime.vol.vol_ratio != null
+                      ? ` ${pulse.regime.vol.vol_ratio}x`
+                      : ""}
+                    {pulse.regime.vol.spike ? " · SPIKE" : ""}
+                  </Badge>
+                )}
+                {pulse.regime.alignment != null && (
+                  <span className="font-mono text-[10px] tabular-nums text-zinc-500">
+                    align {pulse.regime.alignment}/4
+                  </span>
+                )}
+              </div>
+              {/* the per-TF trend-type grid — H4 bias / H1 trend / M15
+               * confirm / M5 setup, each up / down / range / zigzag */}
+              {pulse.regime.tfs && (
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  {["H4", "H1", "M15", "M5"].map((tf) => {
+                    const s = pulse.regime?.tfs?.[tf];
+                    if (!s) return null;
+                    const tag =
+                      s.state === "trend_up" ? "↑ trend"
+                      : s.state === "trend_down" ? "↓ trend"
+                      : s.state === "chop" ? (s.flavor === "zigzag" ? "zigzag" : "chop")
+                      : s.state === "range" ? "range"
+                      : "—";
+                    const tone =
+                      s.state === "trend_up" ? "green"
+                      : s.state === "trend_down" ? "red"
+                      : s.state === "chop" ? "amber"
+                      : "zinc";
+                    return (
+                      <span
+                        key={tf}
+                        className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900/60 px-1.5 py-0.5"
+                        title={s.note ?? undefined}
+                      >
+                        <span className="font-mono text-[10px] font-semibold text-zinc-300">{tf}</span>
+                        <span
+                          className={`text-[10px] ${
+                            tone === "green" ? "text-emerald-400"
+                            : tone === "red" ? "text-red-400"
+                            : tone === "amber" ? "text-amber-400"
+                            : "text-zinc-500"
+                          }`}
+                        >
+                          {tag}
+                        </span>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+              {pulse.regime.action && (
+                <p className="mt-1.5 truncate text-[11px] leading-relaxed text-zinc-400">
+                  {pulse.regime.action}
+                </p>
+              )}
+              {pulse.regime.note && (
+                <p className="mt-1 truncate text-[10px] leading-relaxed text-zinc-500">
+                  {pulse.regime.note}
+                </p>
+              )}
+            </div>
+          )}
+
           {/* live candle buyer/seller dominance (updates every tick) */}
           <div className="min-w-0 rounded-xl border border-zinc-800/70 bg-zinc-900/40 px-3 py-2.5">
             <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">

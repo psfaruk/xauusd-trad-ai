@@ -421,6 +421,34 @@ def evaluate(
     except Exception:  # noqa: BLE001 — the structure read is best-effort
         pass
 
+    # D-068 — the MARKET-REGIME read (user directive: "মার্কেট এর ভিতরে
+    # ট্রেন্ট তৈরি হয় — up, down, সাইড ওয়েস, zigzag... এই ট্রেন্ড গুলো
+    # কোন টাইম ফ্রেম এর সাথে কীভাবে এনালাইসিস করে?" + "বেশি ভোলাটেলিটি
+    # তে সিগন্যাল বেশি ভুল হচ্ছে"): EVERY bar close states WHAT KIND of
+    # market this is per timeframe (trend up/down / range / chop-zigzag,
+    # measured by efficiency ratio + ADX + EMA alignment) and HOW
+    # VOLATILE it is right now (ATR vs its own median + the news-spike
+    # bar) — the app understands ALL states, not just the signal ones.
+    # The per-trade policy (confidence shaping + the extreme-vol market
+    # refusal) runs later, once ENTRY/entry_type are final.
+    regime: dict = {}
+    try:
+        from app.analysis.regime import regime_read
+
+        regime = regime_read(base, htf, price_now)
+        pulse["regime"] = {
+            "label": regime.get("label"),
+            "label_tf": regime.get("label_tf"),
+            "dir": regime.get("dir"),
+            "alignment": regime.get("alignment"),
+            "vol": regime.get("vol"),
+            "tfs": regime.get("tfs"),
+            "note": regime.get("note"),
+            "action": regime.get("action"),
+        }
+    except Exception:  # noqa: BLE001 — the regime read is best-effort
+        pass
+
     # D-067 — the CANDLE BATTLE read (user directive: "একটি রানিং
     # ক্যান্ডেল বা কয়েক টি ক্যান্ডেল buyer Sellar position, কারা কাদের
     # কে ডোমেনেট করছে, কারা জিতেছে, লাস্ট কয়েক টি ক্যান্ডেল এর ভিতর
@@ -975,6 +1003,43 @@ def evaluate(
                 )
                 trace.add("flow_guard", True, flow_note)
 
+    # D-068 — MARKET-REGIME POLICY (user directive: "মার্কেট এ যখন বেশি
+    # ভোলাটেলিটি তখন হঠাৎ সিগন্যাল আসা... সিগন্যাল বেশি ভুল হচ্ছে"): with
+    # entry_type final, the regime verdict shapes THIS trade:
+    #   TREND  — with-trend earns, counter fades pay;
+    #   RANGE  — zone fades at the edges EARN (that IS the range play),
+    #            momentum chases inside the box pay;
+    #   CHOP   — momentum signals pay hard (the wrongest state for them),
+    #            zone trades pay a little;
+    #   EXTREME vol / news-spike — MARKET entries are REFUSED (a market
+    #            order fills wherever the spike candle is; the limit at
+    #            the drawn level only fills on the retrace — the fill
+    #            asymmetry is the guard). Limit entries keep flowing:
+    #            D-049 "সিগনাল মিস করা যাবে না" preserved — the refusal
+    #            is visibly attributed, never a silent loss.
+    regime_adjust = 0.0
+    regime_notes: list[str] = []
+    if cfg.regime_guard and regime:
+        from app.analysis.regime import regime_policy
+
+        pol = regime_policy(regime, trigger_tag.direction, trigger, entry_type)
+        regime_adjust = float(pol.get("adjust", 0.0))
+        regime_notes = list(pol.get("notes") or [])
+        if pol.get("block_market") and cfg.regime_vol_block_market:
+            trace.add(
+                "regime", False,
+                f"market {entry_type} entry refused — "
+                + (regime.get("note") or "EXTREME volatility")
+                + "; limit entries at the drawn levels still live",
+            )
+            _pulse_miss(pulse, trace)
+            return Evaluation(None, trace.to_dict(), near_miss=True, pulse=pulse)
+        if regime_notes:
+            trace.add(
+                "regime", True,
+                (regime.get("note") or "") + " — " + "; ".join(regime_notes),
+            )
+
     # D-VERIFY (external report §12/§28) — FINAL ORDER-CONTRACT GATE:
     # entry/sl/tp are all final now (geometry + targets + spread_risk
     # + trap + structure + flow have spoken); before the payload is
@@ -1065,6 +1130,11 @@ def evaluate(
         # D-067 — the candle battle's verdict: fighting a dominating
         # flow costs confidence; riding it earns a small bonus
         confidence = max(0.0, min(1.0, confidence + flow_adjust))
+    if regime_adjust:
+        # D-068 — the market regime's verdict: trading WITH the state
+        # (trend alignment, range-edge fades) earns; fighting it (chop
+        # momentum, counter-trend fades, extreme vol) pays
+        confidence = max(0.0, min(1.0, confidence + regime_adjust))
     trace_dict = trace.to_dict()
     trace_dict["trigger"] = trigger  # survives inside signals.trace JSON (D-041)
     trace_dict["confluence_factors"] = factors  # D-042 — Signal Analysis panel
@@ -1110,6 +1180,18 @@ def evaluate(
             "wins": battle.get("wins") if battle else None,
             "verdict": battle.get("verdict") if battle else None,
             "note": flow_note or None,
+        },
+        "regime": {  # D-068 — the market state this trade fired in
+            "label": (regime.get("label") if regime else None),
+            "label_tf": (regime.get("label_tf") if regime else None),
+            "dir": (regime.get("dir") if regime else None),
+            "alignment": (regime.get("alignment") if regime else None),
+            "vol": (regime.get("vol") if regime else None),
+            "tfs": (regime.get("tfs") if regime else None),
+            "note": (regime.get("note") if regime else None),
+            "action": (regime.get("action") if regime else None),
+            "adjust": regime_adjust,
+            "notes": regime_notes,
         },
         "news": news.value,
     }
@@ -1157,6 +1239,11 @@ def evaluate(
             "buy_pct": (battle.get("buy_pct") if battle else None),
             "sell_pct": (battle.get("sell_pct") if battle else None),
             "note": flow_note or None,
+        },
+        "regime": {  # D-068 — the fired trade's market regime
+            "label": (regime.get("label") if regime else None),
+            "vol": (regime.get("vol") if regime else None),
+            "adjust": regime_adjust,
         },
     }
     _pulse_miss(pulse, trace)  # fills checks (+ no near-miss on a fire)

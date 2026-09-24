@@ -305,7 +305,7 @@ def test_flow_gate_penalizes_fighting_the_domination() -> None:
     try:
         ev_base = evaluate(
             df, htf, close_time,
-            EngineConfig(entry_mode="market"),
+            EngineConfig(entry_mode="market", regime_guard=False),
             spread_points=20,
         )
     finally:
@@ -315,7 +315,7 @@ def test_flow_gate_penalizes_fighting_the_domination() -> None:
     try:
         ev_pen = evaluate(
             df, htf, close_time,
-            EngineConfig(entry_mode="market"),
+            EngineConfig(entry_mode="market", regime_guard=False),
             spread_points=20,
         )
     finally:
@@ -345,7 +345,7 @@ def test_flow_gate_rewards_the_aligned_battle() -> None:
     try:
         ev_base = evaluate(
             df, htf, close_time,
-            EngineConfig(entry_mode="market"),
+            EngineConfig(entry_mode="market", regime_guard=False),
             spread_points=20,
         )
     finally:
@@ -355,7 +355,7 @@ def test_flow_gate_rewards_the_aligned_battle() -> None:
     try:
         ev_bon = evaluate(
             df, htf, close_time,
-            EngineConfig(entry_mode="market"),
+            EngineConfig(entry_mode="market", regime_guard=False),
             spread_points=20,
         )
     finally:
@@ -378,7 +378,7 @@ def test_flow_gate_off_and_tug_cost_nothing() -> None:
     try:
         ev = evaluate(
             df, htf, close_time,
-            EngineConfig(entry_mode="market", flow_guard=False),
+            EngineConfig(entry_mode="market", flow_guard=False, regime_guard=False),
             spread_points=20,
         )
     finally:
@@ -400,7 +400,7 @@ def test_flow_streak_threshold_respected() -> None:
     try:
         ev = evaluate(
             df, htf, close_time,
-            EngineConfig(entry_mode="market"),
+            EngineConfig(entry_mode="market", regime_guard=False),
             spread_points=20,
         )
     finally:

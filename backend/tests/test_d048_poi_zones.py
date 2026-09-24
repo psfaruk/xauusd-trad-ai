@@ -290,7 +290,7 @@ def test_evaluate_zone_trigger_bypasses_confluence_count() -> None:
     htf = _uptrend_htf()
     close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
     # count gate impossible; D-050 legacy-entry fixture
-    cfg = EngineConfig(min_confluence=6, entry_mode="market")
+    cfg = EngineConfig(min_confluence=6, entry_mode="market", regime_guard=False)  # D-068 isolated
     ev = evaluate(df, htf, close_time, cfg, spread_points=20)
     assert ev.signal is not None, ev.trace["checks"]
     assert ev.signal["trigger"] == "zone"
@@ -330,7 +330,7 @@ def test_evaluate_zone_fires_without_mtf_agreement() -> None:
         ]
         htf[tf] = pd.DataFrame(rows, columns=["time_utc", "o", "h", "l", "c", "v"])
     close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-    cfg = EngineConfig(entry_mode="market")  # D-050 — zone/MTF arbitration on the legacy entry
+    cfg = EngineConfig(entry_mode="market", regime_guard=False)  # D-050 — zone/MTF arbitration on the legacy entry
     ev = evaluate(df, htf, close_time, cfg, spread_points=20)
     assert ev.signal is not None, ev.trace["checks"]
     assert ev.signal["trigger"] == "zone"
@@ -345,14 +345,14 @@ def test_evaluate_sfp_still_wins_arbitration() -> None:
     # already below -> SFP fires (wick 0.65 >= 0.35*ATR), zone also fires
     htf = _uptrend_htf()
     close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-    cfg = EngineConfig(min_confluence=6, entry_mode="market")  # D-050 fixture
+    cfg = EngineConfig(min_confluence=6, entry_mode="market", regime_guard=False)  # D-050 fixture
     ev = evaluate(df, htf, close_time, cfg, spread_points=20)
     # even if an SFP fired on this bar, the impossible count gates it out
     # and the zone path takes over — a signal still exists
     assert ev.signal is not None
     assert ev.signal["trigger"] == "zone"
     # -> now open the count gate fully: the strongest available trigger wins
-    cfg2 = EngineConfig(min_confluence=0, entry_mode="market")
+    cfg2 = EngineConfig(min_confluence=0, entry_mode="market", regime_guard=False)
     ev2 = evaluate(df, htf, close_time, cfg2, spread_points=20)
     assert ev2.signal is not None
     assert ev2.signal["trigger"] in ("sfp", "zone")

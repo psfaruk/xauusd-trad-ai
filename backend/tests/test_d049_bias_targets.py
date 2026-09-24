@@ -246,7 +246,7 @@ class TestEvaluateD049:
         close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
         ev = evaluate(
             df, htf, close_time,
-            EngineConfig(entry_mode="market"),  # D-050 — structural-TP logic on the legacy entry
+            EngineConfig(entry_mode="market", regime_guard=False),  # D-068 isolated
             spread_points=20,
         )
         assert ev.signal is not None, ev.trace["checks"]
@@ -264,7 +264,7 @@ class TestEvaluateD049:
         df = self._demand_frame()
         htf = _bias_htf("SELL")  # H4/H1/M15/M5 all falling
         close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-        cfg = EngineConfig(counter_trend_quality=0.58, entry_mode="market")  # D-050 fixture
+        cfg = EngineConfig(counter_trend_quality=0.58, entry_mode="market", regime_guard=False)  # D-068 isolated
         ev = evaluate(df, htf, close_time, cfg, spread_points=20)
         assert ev.signal is not None, ev.trace["checks"]
         assert ev.signal["direction"] == "BUY"
@@ -278,7 +278,7 @@ class TestEvaluateD049:
         htf = _bias_htf("SELL")
         htf["H1"] = _trend_frame(80, step=1.0)  # conflicts -> NEUTRAL
         close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-        cfg = EngineConfig(entry_mode="market")  # D-050 — bias arbitration on the legacy entry
+        cfg = EngineConfig(entry_mode="market", regime_guard=False)  # D-068 isolated
         ev = evaluate(df, htf, close_time, cfg, spread_points=20)
         assert ev.signal is not None
         assert ev.signal["trigger"] == "zone"  # only the zone can fire

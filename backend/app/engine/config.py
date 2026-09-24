@@ -498,6 +498,57 @@ class EngineConfig(BaseModel):
                     "miss; the trap gate owns hard blocks); enable only "
                     "if the A/B on live-shaped data favors it",
     )
+    # -------------------------------------------------- D-068 regime block
+    regime_guard: bool = Field(
+        True,
+        description="D-068 (user directive: 'মার্কেট এর ভিতরে ট্রেন্ট তৈরি হয় — "
+                    "up, down, সাইড ওয়েস, zigzag... এই ট্রেন্ড গুলো কোন "
+                    "টাইম ফ্রেম এর সাথে কীভাবে এনালাইসিস করে?' + 'বেশি "
+                    "ভোলাটেলিটি তে সিগন্যাল বেশি ভুল হচ্ছে — সকল অবস্থা "
+                    "বুঝার মত সিস্টেম আছে?') — the market-regime verdict "
+                    "(trend TYPE per TF via Kaufman efficiency + ADX + EMA "
+                    "gap; volatility STATE via ATR/median ratio + news-spike "
+                    "detection) rides every pulse, every signal context and "
+                    "shapes confidence per state; the ONE hard gate is "
+                    "regime_vol_block_market below",
+    )
+    regime_vol_block_market: bool = Field(
+        True,
+        description="D-068 — when volatility is EXTREME (ATR > 1.75x the "
+                    "frame median, or a just-closed news spike bar) MARKET "
+                    "entries are refused: a market order fills wherever the "
+                    "spike candle happens to be, while a limit at the drawn "
+                    "level only fills on the retrace — that fill asymmetry "
+                    "is the whole guard. Limit/pending entries keep flowing "
+                    "(D-049 'সিগন্যাল মিস করা যাবে না' preserved); the "
+                    "refusal is visibly attributed to 'regime'",
+    )
+    regime_trend_bonus: float = Field(
+        0.04, ge=0.0, le=0.3,
+        description="D-068 — confidence bonus when the signal fires WITH a "
+                    "clean TREND regime (efficiency + ADX + EMA alignment "
+                    "all agreeing on the trade direction)",
+    )
+    regime_range_bonus: float = Field(
+        0.05, ge=0.0, le=0.3,
+        description="D-068 — confidence bonus for ZONE retests fired inside "
+                    "a RANGE regime (fading the box edges IS the range "
+                    "play — the location carries the trade)",
+    )
+    regime_chop_penalty: float = Field(
+        0.10, ge=0.0, le=0.5,
+        description="D-068 — confidence penalty on MOMENTUM signals (sfp / "
+                    "pullback) fired inside a CHOP/zigzag regime (violent "
+                    "alternation with no net direction — the exact state "
+                    "where momentum signals are wrong the most)",
+    )
+    regime_vol_penalty: float = Field(
+        0.08, ge=0.0, le=0.5,
+        description="D-068 — confidence penalty on every signal fired "
+                    "while volatility is EXTREME (elevated pays half); the "
+                    "user's complaint — 'বেশি ভোলাটেলিটি তে সিগন্যাল বেশি "
+                    "ভুল হচ্ছে' — made visible and paid for",
+    )
     # -------------------------------------------------- D-051 trusted-vote block
     trusted_min_votes: float = Field(
         2.0, ge=1.0, le=6.0,

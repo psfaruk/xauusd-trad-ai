@@ -357,7 +357,7 @@ def test_guard_off_or_with_evidence_lets_the_fade_fire() -> None:
     try:
         ev = evaluate(
             df, htf, close_time,
-            EngineConfig(entry_mode="market", structure_guard=False),
+            EngineConfig(entry_mode="market", structure_guard=False, regime_guard=False),
             spread_points=20,
         )
     finally:
@@ -372,7 +372,7 @@ def test_guard_off_or_with_evidence_lets_the_fade_fire() -> None:
     try:
         ev_pen = evaluate(
             df, htf, close_time,
-            EngineConfig(entry_mode="market", structure_guard=True),
+            EngineConfig(entry_mode="market", structure_guard=True, regime_guard=False),
             spread_points=20,
         )
     finally:
@@ -389,7 +389,7 @@ def test_guard_off_or_with_evidence_lets_the_fade_fire() -> None:
     try:
         ev2 = evaluate(
             df, htf, close_time,
-            EngineConfig(entry_mode="market", structure_guard=True),
+            EngineConfig(entry_mode="market", structure_guard=True, regime_guard=False),
             spread_points=20,
         )
     finally:

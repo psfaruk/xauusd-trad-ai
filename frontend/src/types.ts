@@ -141,6 +141,24 @@ export interface SignalContext {
     verdict: string | null;
     note: string | null;
   } | null;
+  /** D-068 — the market REGIME at signal time: what kind of market the
+   * trade fired in (label + per-TF grid + volatility state) and what
+   * the regime policy charged/credited the confidence. */
+  regime?: {
+    label: string | null;
+    label_tf: string | null;
+    dir: "up" | "down" | null;
+    alignment: number | null;
+    vol: {
+      state: string | null;
+      vol_ratio: number | null;
+      spike: boolean | null;
+    } | null;
+    note: string | null;
+    action: string | null;
+    adjust: number;
+    notes: string[];
+  } | null;
   news: string | null;
 }
 
@@ -650,6 +668,17 @@ export interface WsStrategyPulseMsg {
       sell_pct: number | null;
       note: string | null;
     } | null;
+    /** D-068 — the fired trade's market regime + the confidence the
+     * regime policy charged/credited it. */
+    regime?: {
+      label: string | null;
+      vol: {
+        state: string | null;
+        vol_ratio: number | null;
+        spike: boolean | null;
+      } | null;
+      adjust: number;
+    } | null;
   } | null;
   trigger?: string;
   near_miss: string | null;
@@ -677,6 +706,39 @@ export interface WsStrategyPulseMsg {
     risk: number;
     phase: string | null;
     reasons: string[];
+  } | null;
+  /** D-068 — the MARKET REGIME verdict (every close): what KIND of
+   * market this is per timeframe (trend up/down / range / chop-zigzag /
+   * unknown) + the volatility state (ATR vs its own median + spike) +
+   * the one-line label and the policy sentence — the app's answer to
+   * "সকল অবস্থা বুঝার মত সিস্টেম". */
+  regime?: {
+    label: string | null;
+    label_tf: string | null;
+    dir: "up" | "down" | null;
+    alignment: number | null;
+    vol: {
+      state: "quiet" | "normal" | "elevated" | "extreme" | null;
+      vol_ratio: number | null;
+      atr: number | null;
+      spike: boolean | null;
+      pct_rank: number | null;
+      h1_state: string | null;
+      h1_vol_ratio: number | null;
+    } | null;
+    tfs: {
+      [tf: string]: {
+        state: string | null;
+        dir: "up" | "down" | null;
+        er: number | null;
+        adx: number | null;
+        body_ratio?: number | null;
+        flavor: string | null;
+        note: string | null;
+      };
+    } | null;
+    note: string | null;
+    action: string | null;
   } | null;
   /** D-064 — the market-structure ladder read (every close): leg count,
    * run direction, phase (leg / extended / resting / reversal-confirmed),

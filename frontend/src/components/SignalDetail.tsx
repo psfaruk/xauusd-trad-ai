@@ -210,11 +210,12 @@ export function SignalDetail({ signal }: { signal: Signal }) {
         const ses = ctx.session ?? null;
         const st = ctx.structure ?? null;
         const fl = ctx.flow ?? null;
-        if (!phase && !trap && !ses && !st && !ctx.news && !fl) return null;
+        const rg = ctx.regime ?? null;
+        if (!phase && !trap && !ses && !st && !ctx.news && !fl && !rg) return null;
         return (
           <div className="min-w-0 rounded-xl border border-zinc-700/60 bg-zinc-800/40 p-2.5">
             <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-              Market context · Institutional cycle
+              Market context · Regime &amp; institutional cycle
             </p>
             <div className="flex min-w-0 flex-wrap items-center gap-1.5">
               {phase && (
@@ -256,12 +257,52 @@ export function SignalDetail({ signal }: { signal: Signal }) {
                   {Math.round(fl.state === "buyers" ? (fl.buy_pct ?? 0) : (fl.sell_pct ?? 0))}%
                 </Badge>
               )}
+              {/* D-068 — the market REGIME the trade fired in + the
+               * volatility state + what the policy charged it */}
+              {rg?.label && (
+                <Badge
+                  tone={
+                    rg.label.startsWith("TREND UP") ? "green"
+                    : rg.label.startsWith("TREND DOWN") ? "red"
+                    : rg.label.startsWith("CHOP") ? "amber"
+                    : rg.label === "TRANSITION" ? "gold"
+                    : "zinc"
+                  }
+                >
+                  {rg.label}
+                </Badge>
+              )}
+              {rg?.vol?.state && (
+                <Badge
+                  tone={
+                    rg.vol.state === "extreme" ? "red"
+                    : rg.vol.state === "elevated" ? "amber"
+                    : "zinc"
+                  }
+                >
+                  VOL {rg.vol.state.toUpperCase()}
+                  {rg.vol.spike ? " · SPIKE" : ""}
+                </Badge>
+              )}
+              {rg && rg.adjust !== 0 && (
+                <Badge tone={rg.adjust > 0 ? "green" : "amber"}>
+                  REGIME {rg.adjust > 0 ? "+" : ""}
+                  {rg.adjust.toFixed(2)} CONF
+                </Badge>
+              )}
             </div>
             {ctx.amd?.note && (
               <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-400">
                 {ctx.amd.note}
               </p>
             )}
+            {/* D-068 — the regime policy notes: what the market state
+             * charged/credited THIS trade (the visible discount) */}
+            {rg?.notes?.length ? (
+              <p className="mt-1.5 text-[10px] leading-relaxed text-amber-300/80">
+                {rg.notes.join(" · ")}
+              </p>
+            ) : null}
             {st?.action && (
               <p className="mt-1.5 text-[10px] leading-relaxed text-amber-200/75">
                 {st.action}

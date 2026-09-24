@@ -262,7 +262,7 @@ def test_evaluate_blocks_the_trapped_direction() -> None:
     mani.trap_risk = _fake
     try:
         ev = evaluate(
-            df, htf, close_time, EngineConfig(entry_mode="market", trap_filter=True),
+            df, htf, close_time, EngineConfig(entry_mode="market", regime_guard=False, trap_filter=True),
             spread_points=20,
         )
     finally:
@@ -281,7 +281,7 @@ def test_evaluate_blocks_the_trapped_direction() -> None:
     mani.trap_risk = _fake
     try:
         ev2 = evaluate(
-            df, htf, close_time, EngineConfig(entry_mode="market", trap_filter=False),
+            df, htf, close_time, EngineConfig(entry_mode="market", regime_guard=False, trap_filter=False),
             spread_points=20,
         )
     finally:
@@ -312,7 +312,7 @@ def test_evaluate_payload_carries_market_context() -> None:
     df = _demand_zone_frame()
     htf = _uptrend_htf()
     close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-    cfg = EngineConfig(entry_mode="market")
+    cfg = EngineConfig(entry_mode="market", regime_guard=False)  # D-068 isolated
     ev = evaluate(df, htf, close_time, cfg, spread_points=20)
     assert ev.signal is not None
     ctx = ev.signal["context"]
@@ -338,7 +338,7 @@ def test_trap_gate_off_still_reports_the_context() -> None:
     df = _demand_zone_frame()
     htf = _uptrend_htf()
     close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-    cfg = EngineConfig(entry_mode="market", trap_filter=False)
+    cfg = EngineConfig(entry_mode="market", regime_guard=False, trap_filter=False)
     ev = evaluate(df, htf, close_time, cfg, spread_points=20)
     assert ev.signal is not None
     assert ev.signal["context"]["trap"] is not None
@@ -353,7 +353,7 @@ def test_trap_warn_band_cuts_confidence() -> None:
     df = _demand_zone_frame()
     htf = _uptrend_htf()
     close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-    base_cfg = EngineConfig(entry_mode="market", trap_filter=False)
+    base_cfg = EngineConfig(entry_mode="market", regime_guard=False, trap_filter=False)
     base = evaluate(df, htf, close_time, base_cfg, spread_points=20)
     assert base.signal is not None
 
@@ -374,7 +374,7 @@ def test_trap_warn_band_cuts_confidence() -> None:
     eng_mod.__dict__.setdefault("_trap_patch", None)
     mani.trap_risk = _fake
     try:
-        cfg = EngineConfig(entry_mode="market", trap_filter=True,
+        cfg = EngineConfig(entry_mode="market", regime_guard=False, trap_filter=True,
                            trap_conf_penalty=0.12)
         ev = evaluate(df, htf, close_time, cfg, spread_points=20)
     finally:

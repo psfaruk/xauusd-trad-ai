@@ -61,7 +61,7 @@ class TestOrderContractGate:
         df = _demand_zone_frame()
         htf = _uptrend_htf()
         close_time = df["time_utc"].iloc[-1] + timedelta(minutes=1)
-        cfg = EngineConfig(entry_mode="market")
+        cfg = EngineConfig(entry_mode="market", regime_guard=False)  # D-068 isolated
 
         original = eng.smart_targets
 
