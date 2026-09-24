@@ -72,23 +72,37 @@ def test_pending_sell_anchors_above_supply_zone() -> None:
     assert "near edge" in note
 
 
-def test_pending_nearest_zone_wins() -> None:
+def test_pending_quality_first_pick() -> None:
+    """D-070 — the pick is QUALITY-FIRST (quality - 0.25 x dist/max_off):
+    a strong zone may sit deeper and still beat a weak near one (the
+    old nearest-wins rule let a 0.31 band shadow a 0.85 band — the
+    'wrong entry point' autopsy)."""
     zones = [
-        {"side": "demand", "source": "sd", "lo": 4500.0, "hi": 4502.0,
-         "quality": 0.9, "t": None},   # 11 USD away — deeper, better q
-        {"side": "demand", "source": "ob", "lo": 4507.5, "hi": 4509.0,
-         "quality": 0.6, "t": None},   # 5.5 USD away — nearest usable
+        {"side": "demand", "source": "sd", "lo": 4511.4, "hi": 4511.8,
+         "quality": 0.31, "t": None},  # near (1.2 USD), weak
+        {"side": "demand", "source": "ob", "lo": 4509.0, "hi": 4510.4,
+         "quality": 0.85, "t": None},  # deeper (2.6 USD), strong
     ]
-    entry, _ = poi_pending_entry("BUY", 4513.0, zones, atr=2.0, cfg=CFG)
-    assert entry == 4509.0  # nearest usable zone's NEAR edge (D-056),
-    #                          not the best quality zone's
+    entry, note = poi_pending_entry("BUY", 4513.0, zones, atr=2.0, cfg=CFG)
+    assert entry == 4510.4  # the STRONG zone's near edge wins
+    assert "q 0.85" in note
 
 
-def test_pending_fallback_offset_without_zone() -> None:
-    """D-051 — no usable zone: the user's preferred 4-6 USD offset."""
-    entry, note = poi_pending_entry("BUY", 4513.0, [], atr=1.0, cfg=CFG)
+def test_pending_fallback_refuses_without_anchor() -> None:
+    """D-070 — no usable zone and no magnet: REFUSED (None). The old
+    blind 4.5 USD offset produced the locationless losers."""
+    assert poi_pending_entry("BUY", 4513.0, [], atr=1.0, cfg=CFG) is None
+    assert poi_pending_entry("SELL", 4513.0, [], atr=1.0, cfg=CFG) is None
+
+
+def test_pending_fallback_offset_without_zone_legacy() -> None:
+    """magnet_anchor=False — the exact pre-D-070 blind offset."""
+    cfg = EngineConfig.model_validate(
+        {"magnet_anchor": False, "pending_max_usd": 6.0}
+    )
+    entry, note = poi_pending_entry("BUY", 4513.0, [], atr=1.0, cfg=cfg)
     assert entry == pytest.approx(4513.0 - CFG.pending_target_usd)
-    entry_s, _ = poi_pending_entry("SELL", 4513.0, [], atr=1.0, cfg=CFG)
+    entry_s, _ = poi_pending_entry("SELL", 4513.0, [], atr=1.0, cfg=cfg)
     assert entry_s == pytest.approx(4513.0 + CFG.pending_target_usd)
     assert "no demand POI" in note
 
@@ -101,13 +115,26 @@ def test_pending_min_offset_floor_enforced() -> None:
     assert entry <= 4513.0 - CFG.entry_min_usd  # USD floor wins
 
 
-def test_pending_deep_zone_clamps() -> None:
+def test_pending_deep_zone_defers_not_clamps() -> None:
+    """D-070 — a zone beyond the window is DEFERRED (None here: no
+    magnets), never clamped into no-man's land: the deep-clamped fills
+    were the losing bucket (0-17% WR). The zone re-triggers when price
+    actually approaches the band — deferred, not missed."""
     zones = [{"side": "demand", "source": "sd", "lo": 4400.0, "hi": 4410.0,
               "quality": 0.9, "t": None}]  # 113 below — way beyond the cap
-    entry, note = poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=CFG)
-    # D-051 — the USD cap binds: never further than pending_max_usd
-    assert entry == pytest.approx(4513.0 - CFG.pending_max_usd)
-    assert 4513.0 - entry < 113.0  # clamped, not the full distance
+    out = poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=CFG)
+    assert out is None
+
+
+def test_pending_deep_zone_clamps_legacy() -> None:
+    """magnet_anchor=False — the pre-D-070 clamp survives (escape hatch)."""
+    cfg = EngineConfig.model_validate(
+        {"magnet_anchor": False, "pending_max_usd": 6.0}
+    )
+    zones = [{"side": "demand", "source": "sd", "lo": 4400.0, "hi": 4410.0,
+              "quality": 0.9, "t": None}]
+    entry, note = poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=cfg)
+    assert entry == pytest.approx(4513.0 - cfg.pending_max_usd)
     assert "clamped" in note
 
 
@@ -118,9 +145,8 @@ def test_pending_ignores_weak_and_opposing_zones() -> None:
         {"side": "demand", "source": "sd", "lo": 4500.0, "hi": 4502.0,
          "quality": 0.10, "t": None},  # too weak to anchor to
     ]
-    entry, _ = poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=CFG)
-    # D-051 fallback = the USD target offset
-    assert entry == pytest.approx(4513.0 - CFG.pending_target_usd)
+    # D-070 — nothing usable in reach: refused (no blind offset)
+    assert poi_pending_entry("BUY", 4513.0, zones, atr=1.0, cfg=CFG) is None
 
 
 # ------------------------------------------------------------- evaluate path
@@ -376,16 +402,18 @@ class TestMockPendingOrders:
 
 class TestD050Config:
     def test_m1_profile_defaults(self):
-        """D-051 — the engine is BACK on M1 (the user's signal-flow TF),
-        with the 4-6 USD pending window and multi-market defaults."""
+        """D-051/D-070 — the engine is BACK on M1 (the user's signal-flow
+        TF); the D-070 scalp window caps pendings at 3 USD (the 4-6 USD
+        swing window is the magnet_anchor=False legacy path)."""
         assert DEFAULT_CONFIG.timeframe == "M1"
         assert DEFAULT_CONFIG.confirm_tfs == ["M5", "M15"]
         assert DEFAULT_CONFIG.trend_tf == "H1"
         assert DEFAULT_CONFIG.entry_mode == "poi_limit"
         assert DEFAULT_CONFIG.entry_min_usd == 1.0
         assert DEFAULT_CONFIG.pending_target_usd == 4.5
-        assert DEFAULT_CONFIG.pending_max_usd == 6.0
-        assert DEFAULT_CONFIG.pending_expiry_bars == 60
+        assert DEFAULT_CONFIG.pending_max_usd == 3.0
+        assert DEFAULT_CONFIG.pending_expiry_bars == 30
+        assert DEFAULT_CONFIG.scalp_profile is True
         assert DEFAULT_CONFIG.signal_symbols == ["XAUUSD", "BTCUSD"]
         assert DEFAULT_CONFIG.auto_trade_symbols == ["XAUUSD"]
         assert DEFAULT_CONFIG.trusted_min_votes == 2.0

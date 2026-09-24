@@ -142,6 +142,9 @@ function MarketRadar({ symbol }: { symbol: string }) {
         right={
           pulse ? (
             <span className="flex shrink-0 items-center gap-2">
+              {pulse.profile === "scalp" && (
+                <Badge tone="gold">SCALP</Badge>
+              )}
               <Badge tone={ageSec != null && ageSec <= 90 ? "green" : "amber"} pulse>
                 live {pulse.tf}
               </Badge>

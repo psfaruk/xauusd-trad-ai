@@ -551,37 +551,59 @@ def smart_targets(
     a = ind.atr(base, 14) or 1e-9
     want_bull = direction == "BUY"
     # --- stop loss: structural, spread-floored, ATR-floored and capped
+    # D-070 — the FLOOR always outranks the cap: when max_sl_atr*ATR is
+    # below the spread floor (quiet frame + wide live spread) the old
+    # `max(sl, entry - cap)` silently pulled the stop INSIDE the spread
+    # floor — a stop the spread alone could eat. The effective cap is
+    # therefore max(max_sl_atr * a, min_risk): width is capped, survival
+    # is guaranteed.
     spread_floor = SPREAD_FLOOR_MULT * max(spread_price, 0.0)
     min_risk = max(min_sl_atr * a, spread_floor)
+    cap_risk = max(max_sl_atr * a, min_risk)
     if want_bull:
         sl = min(sl_base, entry - min_risk)
-        sl = max(sl, entry - max_sl_atr * a)      # cap: never risk more
+        sl = max(sl, entry - cap_risk)      # cap: never risk more
         risk = entry - sl
     else:
         sl = max(sl_base, entry + min_risk)
-        sl = min(sl, entry + max_sl_atr * a)
+        sl = min(sl, entry + cap_risk)
         risk = sl - entry
     if risk <= 0:  # pathological (cap below floor) — fall back to floor
         sl = entry - min_risk if want_bull else entry + min_risk
         risk = min_risk
 
     # --- D-047/D-049 TPO anchoring: extend the stop just past the
-    # NEAREST strong level that sits beyond it (BUY: supports below sl)
+    # NEAREST strong level that sits beyond it (BUY: supports below sl).
+    # D-070 scalp: only TRULY strong levels (>= 0.6, was 0.5) may anchor,
+    # and only when the level sits within +1.0 ATR of the structural
+    # stop (the old code chased levels far into the max_sl_atr cap,
+    # ballooning the risk — a measured contributor to the "wrong SL"
+    # complaint). A distant level anchors NOTHING: a stop half-way to a
+    # far level protects nothing and widens the loss.
     if tpo_levels:
-        strong = [lv for lv in tpo_levels if float(lv.get("strength", 0)) >= 0.5]
+        strong = [lv for lv in tpo_levels
+                  if float(lv.get("strength", 0)) >= 0.6]
         pad = 0.15 * a
         if want_bull:
             below = [float(lv["price"]) for lv in strong if lv["price"] < sl]
             if below:
                 cand = max(below) - pad  # NEAREST level under the stop
-                if entry - cand <= max_sl_atr * a:
+                if (
+                    cand < sl
+                    and sl - cand <= 1.0 * a  # nearby levels only
+                    and entry - cand <= max_sl_atr * a
+                ):
                     sl = cand
                     risk = entry - sl
         else:
             above = [float(lv["price"]) for lv in strong if lv["price"] > sl]
             if above:
                 cand = min(above) + pad  # NEAREST level over the stop
-                if cand - entry <= max_sl_atr * a:
+                if (
+                    cand > sl
+                    and cand - sl <= 1.0 * a  # nearby levels only
+                    and cand - entry <= max_sl_atr * a
+                ):
                     sl = cand
                     risk = sl - entry
 

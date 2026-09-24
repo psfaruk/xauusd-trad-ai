@@ -193,16 +193,17 @@ class TestConfigRoutes:
         # D-042 ICT block is served to the frontend
         assert body["config"]["smc_enabled"] is True
         assert body["config"]["min_confluence"] == 3  # D-049
-        # D-051 — USD pending window + trusted votes + multi-market lists
-        assert body["config"]["pending_max_usd"] == 6.0
+        # D-051/D-070 — USD pending window (scalp cap 3.0) + trusted votes
+        assert body["config"]["pending_max_usd"] == 3.0
         assert body["config"]["pending_target_usd"] == 4.5
+        assert body["config"]["scalp_profile"] is True
         assert body["config"]["trusted_min_votes"] == 2.0
         assert body["config"]["signal_symbols"] == ["XAUUSD", "BTCUSD"]
         assert body["config"]["auto_trade_symbols"] == ["XAUUSD"]
         assert body["config"]["bias_tfs"] == ["H4"]
-        assert body["config"]["max_positions"] == 3
+        assert body["config"]["max_positions"] == 4  # D-070 scalp budget
         # D-049 target block + user trade budget
-        assert body["config"]["tp_min_rr"] == 1.2
+        assert body["config"]["tp_min_rr"] == 1.0  # D-070 scalp floor
         assert body["config"]["tp_max_r"] == 3.0
         assert body["config"]["max_trades_per_day"] == 6
 

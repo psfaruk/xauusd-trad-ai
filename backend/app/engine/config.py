@@ -109,11 +109,17 @@ class EngineConfig(BaseModel):
         description="TP multiple used ONLY when no structural target "
                     "sits within tp_max_r — the primary TP is predicted "
                     "from the nearest opposing zone/liquidity/TPO level")
-    expiry_bars: int = Field(45, ge=1)  # D-051: 45 min on M1 (the profile
-    #                                     # that produced the user's original
-    #                                     # signal flow) — structure TPs get
-    #                                     # room to be HIT, not expire mid-flight
-    cooldown_bars: int = Field(4, ge=0)
+    expiry_bars: int = Field(30, ge=1)  # D-070 scalp: 30 min on M1 — the
+    #                                     # tighter scalp geometry resolves
+    #                                     # in minutes; a 45-min expiry let
+    #                                     # swing-scale stragglers clog the
+    #                                     # position budget (was 45)
+    # D-070 SCALP PROFILE (user directive: "প্রতি ঘণ্টা 6/7 টি সিগন্যাল
+    # আসবে। কারণ আমি শর্ট টাইম trading করি।" — short-time trading): the
+    # cooldown halved so a fresh setup can fire 2 minutes after the last
+    # one (4 -> 2); scalp_profile=False (or any explicit user value)
+    # restores the pre-D-070 flow.
+    cooldown_bars: int = Field(2, ge=0)
     # -------------------------------------------------- D-041 pullback trigger
     pullback_enabled: bool = True
     pullback_min_range_atr: float = Field(0.35, gt=0,
@@ -121,8 +127,14 @@ class EngineConfig(BaseModel):
     pullback_wick_ratio: float = Field(0.45, gt=0,
         description="min rejection wick as a fraction of the bar range")
     # -------------------------------------------------- D-041 risk geometry
-    min_sl_atr: float = Field(1.5, ge=0,
-        description="SL at least this many ATRs from entry (spread/noise floor)")
+    min_sl_atr: float = Field(0.9, ge=0,
+        description="SL at least this many ATRs from entry. D-070 scalp: "
+                    "the old 1.5-ATR blanket floor put stops far beyond "
+                    "the zone's own invalidation — the market breaks the "
+                    "zone, the trade loses MORE than the zone said it "
+                    "would. The spread floor (2.5x spread) still applies, "
+                    "so the stop always survives the spread; 0.9 ATR is "
+                    "the noise-only floor (the 'wrong SL' complaint).")
     max_spread_to_risk: float = Field(0.30, gt=0,
         description="skip when spread > this fraction of the SL distance "
                     "(D-049: 0.5 -> 0.30 — at 0.5 the spread alone could "
@@ -138,14 +150,28 @@ class EngineConfig(BaseModel):
         ]
     )
     news_blackout_min: int = Field(30, ge=0)
-    max_spread_points: int = Field(35, ge=1)
+    max_spread_points: int = Field(
+        45, ge=1,
+        description="D-070 scalp: live XAUUSD spreads run 25-45 points "
+                    "through London/NY; the old 35 ceiling refused every "
+                    "evaluation in those windows. The spread-vs-RISK ratio "
+                    "gate (max_spread_to_risk) is the honest math — it "
+                    "widens the required SL floor automatically; the flat "
+                    "ceiling only kills the feed.",
+    )
     #: D-047 — how deep the time-at-price (TPO) profile reaches (minutes of
     #: M1 history) for S/R level detection + SL anchoring
     tpo_lookback_min: int = Field(1440, ge=60, le=10080)
     risk_mode: str = Field("percent", pattern="^(percent|fixed)$")
     risk_percent: float = Field(0.5, gt=0, le=100)
     fixed_lot: float = Field(0.01, gt=0)
-    max_positions: int = Field(3, ge=1)
+    max_positions: int = Field(
+        4, ge=1,
+        description="D-070 scalp: 4 concurrent filled trades (was 3) — at "
+                    "6-7 signals/hour and 10-25 min resolution the old "
+                    "budget saturated exactly at the target flow, blocking "
+                    "new fires ('position budget full')",
+    )
     daily_max_loss_pct: float = Field(3.0, gt=0)
     # -------------------------------------------------- D-052 money window
     daily_loss_usd: float = Field(
@@ -197,20 +223,59 @@ class EngineConfig(BaseModel):
         0.9, gt=0,
         description="entry-to-zone proximity tolerance in ATRs",
     )
+    # -------------------------------------------------- D-070 scalp block
+    scalp_profile: bool = Field(
+        True,
+        description="D-070 (user directive: 'প্রতি ঘণ্টা 6/7 টি সিগন্যাল "
+                    "আসবে... আমি শর্ট টাইম trading করি') — the SHORT-TIME "
+                    "profile: faster cooldown/expiry recycling, bigger "
+                    "concurrent budgets, tighter structural SL, honest 1R "
+                    "scalp TPs. False restores the exact pre-D-070 values "
+                    "for every field the user has not explicitly set "
+                    "(model_validator below).",
+    )
+    neutral_momentum: bool = Field(
+        True,
+        description="D-070 — momentum triggers (sfp/pullback) also run when "
+                    "the D-049 bias verdict is NEUTRAL, using the M15 "
+                    "tactical structure as the tie-break direction. The old "
+                    "code silently disabled BOTH momentum triggers "
+                    "whenever |bias score| < 0.30 — hours of zone-only "
+                    "flow (a measured frequency killer). All premium gates "
+                    "(MTF + confluence/trusted) still apply.",
+    )
+    magnet_anchor: bool = Field(
+        True,
+        description="D-070 — when no same-side POI zone sits within the "
+                    "pending window, the entry anchors at the next REAL "
+                    "structural magnet (EMA21/EMA50, prior rest-zone edge, "
+                    "FVG fill watermark) instead of the old blind 4.5 USD "
+                    "offset into no-man's land (backtest: the 2-4 USD "
+                    "no-structure bucket lost 3/3). No anchor in reach -> "
+                    "the signal is REFUSED with a visible near-miss reason "
+                    "('no structural anchor') — a trade without a location "
+                    "is a guess.",
+    )
     vol_z_min: float = Field(
         0.8, ge=0,
         description="trigger-bar volume z-score that counts as institutional",
     )
     max_sl_atr: float = Field(
-        3.5, gt=0,
-        description="SL at most this many ATRs from entry (risk cap)",
+        2.2, gt=0,
+        description="SL at most this many ATRs from entry (risk cap). D-070 "
+                    "scalp: 2.2 (was 3.5) — a stop 3.5 M1-ATRs away is a "
+                    "swing trade, not the short-time profile",
     )
     # -------------------------------------------------- D-049 target block
     tp_min_rr: float = Field(
-        1.2, ge=0.5, le=5.0,
+        1.0, ge=0.5, le=5.0,
         description="minimum realized reward:risk — when the nearest "
                     "structural barrier stands closer than this, the "
-                    "trade is SKIPPED (predicted to hit the barrier first)",
+                    "trade is SKIPPED (predicted to hit the barrier first). "
+                    "D-070 scalp: 1.0 (was 1.2) — the honest scalp floor: a "
+                    "1:1 at a REAL barrier is a legitimate scalp; the "
+                    "barrier check keeps its teeth (barrier must still be "
+                    ">= 1R away or the trade is refused)",
     )
     tp_max_r: float = Field(
         3.0, ge=1.0, le=10.0,
@@ -236,8 +301,12 @@ class EngineConfig(BaseModel):
                     "downtrends: the engine could only sell)",
     )
     zone_retest_window: int = Field(
-        2, ge=1, le=5,
-        description="bars before the trigger that may have entered the zone",
+        3, ge=1, le=5,
+        description="bars before the trigger that may have entered the "
+                    "zone. D-070 scalp: 3 (was 2) — a zone dipped 2 bars "
+                    "ago that is STILL rejecting at the trigger bar is a "
+                    "live retest; the near-zone cap (close within 0.9 ATR "
+                    "of the band) keeps ran-away bounces excluded",
     )
     # -------------------------------------------------- D-050 POI pending block
     entry_mode: str = Field(
@@ -283,25 +352,34 @@ class EngineConfig(BaseModel):
                         "the USD cap below normally binds first (D-051)",
     )
     pending_max_usd: float = Field(
-        6.0, gt=0,
-        description="D-051 — HARD USD cap on the pending-entry distance "
-                    "from the market (user directive: at most 4-6 USD — "
-                    "orders further than this simply never fill; the M1 "
-                    "candle decides the exact anchor inside the cap)",
+        3.0, gt=0,
+        description="D-070 scalp — HARD USD cap on the pending-entry "
+                    "distance from the market: 3.0 (was 6.0 — the "
+                    "user's 4-6 USD window was the SWING profile; the "
+                    "backtest autopsy shows fills beyond ~2 USD are the "
+                    "losing bucket, and a 3+ USD retrace is not a "
+                    "short-time trade). Zones deeper than this are "
+                    "deferred, not clamped: they re-trigger when price "
+                    "actually approaches the band",
     )
     pending_expiry_bars: int = Field(
-        60, ge=1,
+        30, ge=1,
         description="how many engine-TF bars a PENDING signal may wait for "
-                    "its fill before expiring unfilled (1h on M1 — a 4-6 "
-                    "USD retrace takes its time; an unfilled order is a "
-                    "MISSED trade, never a loss)",
+                    "its fill before expiring unfilled. D-070 scalp: 30 min "
+                    "(was 60) — measured fill latency: the 1-USD "
+                    "min-offset pendings fill p75 by ~25-30 min; 60 kept "
+                    "dead slots clogging the budget, 20 cut profitable "
+                    "late fills (an unfilled order is a missed trade, "
+                    "never a loss)",
     )
     max_pending_signals: int = Field(
-        6, ge=1,
+        12, ge=1,
         description="concurrent PENDING (unfilled) signal budget — kept "
                     "separate from max_positions so unfilled limits never "
                     "clog the signal flow (user directive: signals must "
-                    "keep coming)",
+                    "keep coming). D-070 scalp: 12 (was 6) — at the 6-7 "
+                    "signals/hour target with 20-min expiry the old 6 "
+                    "slots saturated the flow for hours",
     )
     # -------------------------------------------------- D-057 drawing-true block
     drawing_true: bool = Field(
@@ -721,6 +799,21 @@ class EngineConfig(BaseModel):
             raise ValueError("min_tf_agree can never be satisfied")
         return self
 
+    @model_validator(mode="after")
+    def _scalp_profile_fallback(self) -> EngineConfig:
+        """D-070 — scalp_profile=False restores the exact pre-D-070 values
+        for every D-070-touched field the user did NOT explicitly set
+        (model_fields_set). Explicit user values always win in BOTH modes;
+        the switch only chooses which default an unset field falls to.
+        """
+        if self.scalp_profile:
+            return self
+        set_fields = self.model_fields_set
+        for field, legacy in _LEGACY_D070_FIELDS.items():
+            if field not in set_fields:
+                object.__setattr__(self, field, legacy)
+        return self
+
     @field_validator("sessions")
     @classmethod
     def _sessions(cls, v: list[SessionRule]) -> list[SessionRule]:
@@ -869,6 +962,64 @@ _D047_SESSIONS = [{"name": "tokyo", "utc": [0, 7]},
                   {"name": "london", "utc": [7, 16]},
                   {"name": "newyork", "utc": [13, 20]}]
 
+#: D-070 — the exact pre-D-070 shipped values for every field the SCALP
+#: profile retuned (the A/B escape hatch + the scalp_profile=False
+#: fallback). Rule identical to every prior upgrade: a stored row still
+#: carrying the OLD default was never hand-edited by the user (these are
+#: admin-config fields), so it moves to the scalp default; any other
+#: value is a user choice and stays put FOREVER.
+_LEGACY_D070_FIELDS: dict[str, float | int] = {
+    "cooldown_bars": 4,
+    "expiry_bars": 45,
+    "pending_expiry_bars": 60,
+    "max_positions": 3,
+    "max_pending_signals": 6,
+    "tp_min_rr": 1.2,
+    "min_sl_atr": 1.5,
+    "max_sl_atr": 3.5,
+    "max_spread_points": 35,
+    "zone_retest_window": 2,
+    "pending_max_usd": 6.0,
+}
+
+
+def upgrade_legacy_d070(raw: dict) -> tuple[dict, list[str]]:
+    """D-070 — move untouched pre-D-070 rows onto the scalp profile.
+
+    Returns (payload, moved_fields). Only fields still sitting on the
+    exact pre-D-070 shipped default move; user-customized values are
+    preserved forever (same rule as every legacy upgrade since D-047).
+    """
+    if not isinstance(raw, dict):
+        return raw, []
+    moved: list[str] = []
+    out = dict(raw)
+    scalp = {
+        "cooldown_bars": 2,
+        "expiry_bars": 30,
+        "pending_expiry_bars": 30,
+        "max_positions": 4,
+        "max_pending_signals": 12,
+        "tp_min_rr": 1.0,
+        "min_sl_atr": 0.9,
+        "max_sl_atr": 2.2,
+        "max_spread_points": 45,
+        "zone_retest_window": 3,
+        "pending_max_usd": 3.0,
+    }
+    for field, old in _LEGACY_D070_FIELDS.items():
+        val = out.get(field)
+        if val is not None:
+            try:
+                matches = abs(float(val) - float(old)) < 1e-9
+            except (TypeError, ValueError):
+                matches = False
+            if matches:
+                out[field] = scalp[field]
+                moved.append(field)
+    return out, moved
+
+
 #: D-048 shipped 3 -> 2; D-049 (honest 1500-bar window + structural TP)
 #: measured 3 back on top (expR +0.023 vs +0.010) — rows still sitting on
 #: the D-048-era default 2 were auto-set by the D-048 upgrade (the user
@@ -985,10 +1136,11 @@ class ConfigRepo:
             raw, moved_d049 = upgrade_legacy_d049(raw)
             raw, upgraded_d050 = upgrade_legacy_d050(raw)
             raw, upgraded_d051 = upgrade_legacy_d051(raw)
+            raw, moved_d070 = upgrade_legacy_d070(raw)
             upgraded = (
                 upgraded_strategy or upgraded_sessions
                 or upgraded_confluence or bool(moved_d049) or upgraded_d050
-                or upgraded_d051
+                or upgraded_d051 or bool(moved_d070)
             )
             cfg = EngineConfig.model_validate(raw)
             if upgraded:
@@ -1005,6 +1157,8 @@ class ConfigRepo:
                     why.append("d050:M5-profile")
                 if upgraded_d051:
                     why.append("d051:M1-back")
+                if moved_d070:
+                    why.append("d070:scalp:" + "+".join(moved_d070))
                 logger.info(
                     "engine config upgraded (%s) — persisting",
                     "+".join(why) or "strategy",

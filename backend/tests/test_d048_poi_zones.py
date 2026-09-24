@@ -386,14 +386,16 @@ def test_config_d048_defaults() -> None:
     # D-049 — 0.70 -> 0.58: the old gate was practically unreachable,
     # freezing BUY signals during H1 downtrends (sell-only bias)
     assert DEFAULT_CONFIG.counter_trend_quality == 0.58
-    assert DEFAULT_CONFIG.zone_retest_window == 2
+    # D-070 — 2 -> 3: a zone dipped 2 bars ago that is STILL rejecting
+    # at the trigger bar is a live retest (scalp frequency fix)
+    assert DEFAULT_CONFIG.zone_retest_window == 3
     # D-049 — honest 1500-bar window measured 3 back on top of 2
     assert DEFAULT_CONFIG.min_confluence == 3
-    # D-049 target block
-    assert DEFAULT_CONFIG.tp_min_rr == 1.2
+    # D-049 target block (D-070 scalp: tp_min_rr 1.2 -> 1.0, expiry 45 -> 30)
+    assert DEFAULT_CONFIG.tp_min_rr == 1.0
     assert DEFAULT_CONFIG.tp_max_r == 3.0
     assert DEFAULT_CONFIG.rr == 1.6
-    assert DEFAULT_CONFIG.expiry_bars == 45  # D-051: 45 min on M1 (back)
+    assert DEFAULT_CONFIG.expiry_bars == 30  # D-070 scalp: 30 min on M1
     assert DEFAULT_CONFIG.max_spread_to_risk == 0.30
     assert DEFAULT_CONFIG.max_trades_per_day == 6
     # D-051 — back on M1 (the user's signal-flow TF) + POI pending entries
@@ -401,15 +403,16 @@ def test_config_d048_defaults() -> None:
     assert DEFAULT_CONFIG.confirm_tfs == ["M5", "M15"]
     assert DEFAULT_CONFIG.min_atr == 0.15
     assert DEFAULT_CONFIG.entry_mode == "poi_limit"
-    # D-051 — the 4-6 USD pending window + trusted votes + multi-market
+    # D-051/D-070 — M1 + POI pending entries; the 3-USD scalp window
+    # (the 4-6 USD swing window is the magnet_anchor=False legacy path)
     assert DEFAULT_CONFIG.entry_min_usd == 1.0
     assert DEFAULT_CONFIG.pending_target_usd == 4.5
-    assert DEFAULT_CONFIG.pending_max_usd == 6.0
+    assert DEFAULT_CONFIG.pending_max_usd == 3.0
     assert DEFAULT_CONFIG.trusted_min_votes == 2.0
     assert DEFAULT_CONFIG.signal_symbols == ["XAUUSD", "BTCUSD"]
     assert DEFAULT_CONFIG.pending_max_atr == 15.0  # USD cap binds first
-    assert DEFAULT_CONFIG.pending_expiry_bars == 60  # 1h on M1
-    assert DEFAULT_CONFIG.max_pending_signals == 6
+    assert DEFAULT_CONFIG.pending_expiry_bars == 30  # D-070 scalp recycle
+    assert DEFAULT_CONFIG.max_pending_signals == 12  # D-070 scalp budget
     # bounds enforced
     try:
         EngineConfig(min_zone_quality=1.5)

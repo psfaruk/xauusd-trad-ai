@@ -778,6 +778,11 @@ export interface WsStrategyPulseMsg {
     bars: number | null;
     note: string | null;
   }[];
+  /** D-070 — the engine profile this pulse ran under: "scalp" = the
+   * short-time trading profile (2-min cooldown, 30-min expiry, 1R
+   * honest TPs, structural SL), "standard" = the legacy swing-scale
+   * values. Null = pulse predates D-070. */
+  profile?: "scalp" | "standard" | null;
   /** D-067 — the CANDLE BATTLE over the last flow_window closed M1
    * candles: who dominates (volume-weighted split), who won how many,
    * the winning streak, net displacement in ATR, the decisive events

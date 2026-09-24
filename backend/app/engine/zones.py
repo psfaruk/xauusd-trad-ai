@@ -303,8 +303,11 @@ def poi_pending_entry(
     atr: float,
     cfg: EngineConfig,
     spread_price: float = 0.0,  # current spread in price units
-) -> tuple[float, str]:
-    """D-050/D-051/D-056 — the PENDING limit-entry price + its anchor note.
+    magnets: list[tuple[float, str]] | None = None,  # D-070 same-side
+    #    structural magnets [(price, kind)] — EMA21/50, rest edges, FVG
+    #    watermarks — the fallback anchor when no POI zone is in reach
+) -> tuple[float, str] | None:
+    """D-050/D-051/D-056/D-070 — the PENDING limit-entry price + note.
 
     BUY  -> a BUY LIMIT below the market anchored at the nearest DEMAND
             (support) zone: D-056 anchors at the zone's NEAR edge (the
@@ -320,17 +323,29 @@ def poi_pending_entry(
     the unfilled "misses" were the winners. The near edge is where a valid
     zone gets its FIRST/SECOND retest — the ICT entry itself.
 
+    D-070 SCALP rework (the 'wrong entry' complaint, measured):
+      * QUALITY-FIRST zone pick — the old code picked the NEAREST zone
+        with quality >= 0.30, so a 0.31-quality band 0.4 ATR away beat a
+        0.85-quality band 1.2 ATR away. The pick now scores
+        quality - 0.25 x (dist / max_off): location still matters, but a
+        weak zone can no longer shadow a strong one.
+      * MAGNET FALLBACK — when no same-side zone sits in the window the
+        entry anchors at the nearest same-side structural magnet
+        (EMA21/EMA50, prior rest-zone edge, FVG fill watermark) instead
+        of the old blind 4.5 USD offset into no-man's land (the 2-4 USD
+        no-structure bucket lost 3/3 in the backtest autopsy).
+      * NO ANCHOR -> REFUSE — `magnet_anchor` semantics: with no zone AND
+        no magnet within the window the function returns None and the
+        engine logs a visible near-miss ("no structural anchor") — a
+        trade without a location is a guess, and guessing was exactly the
+        "wrong entry point" the user reported.
+
     Geometry guards (combined ATR + USD):
     - minimum distance: max(entry_offset_atr*ATR, 2 spreads, entry_min_usd);
     - maximum distance: min(pending_max_atr*ATR, pending_max_usd) with a
       1.5x-minimum floor so the window is never empty;
     - zone must sit on the RIGHT side (demand below the market for BUY,
-      supply above for SELL) with a quality >= 0.30;
-    - no usable zone -> the pending_target_usd offset (4.5 USD by
-      default, clamped into the window).
-
-    Ties prefer the NEAREST zone (highest fill probability); the ranked
-    zone list is quality-sorted, so quality is the implicit tie-break.
+      supply above for SELL) with a quality >= 0.30.
     """
     min_off = max(
         cfg.entry_offset_atr * atr, 2.0 * spread_price, cfg.entry_min_usd
@@ -341,7 +356,7 @@ def poi_pending_entry(
     )
     want = "demand" if direction == "BUY" else "supply"
 
-    best: tuple[float, float, dict] | None = None  # (dist, anchor, zone)
+    best: tuple[float, float, dict] | None = None  # (score, anchor, zone)
     for z in zones:
         if z.get("side") != want:
             continue
@@ -362,32 +377,71 @@ def poi_pending_entry(
         dist = (market - anchor) if direction == "BUY" else (anchor - market)
         if dist < min_off:
             continue  # zone hugs the market — no margin to be had from it
-        if best is None or dist < best[0]:
-            best = (dist, anchor, z)
+        # D-070 — quality-first: a strong zone may sit a little deeper
+        # and still win; the 0.25 weight keeps location relevant
+        score = float(z.get("quality", 0.0)) - 0.25 * (dist / max_off)
+        if best is None or score > best[0]:
+            best = (score, anchor, z)
 
     if best is not None:
-        dist, anchor, z = best
-        where = "below" if direction == "BUY" else "above"
-        if dist > max_off:
-            # D-051 — clamp to the USD cap: the order stays close enough
-            # to actually book (the user's 4-6 USD window)
-            entry = (market - max_off) if direction == "BUY" else (market + max_off)
-            note = (
-                f"{want} POI {z['lo']:.2f}-{z['hi']:.2f} too deep "
-                f"({dist:.2f} USD) — clamped to {max_off:.2f} USD"
-                f" (cap {cfg.pending_max_usd:.1f})"
-            )
-        else:
+        _score, anchor, z = best
+        dist = (market - anchor) if direction == "BUY" else (anchor - market)
+        if dist <= max_off:
+            where = "below" if direction == "BUY" else "above"
             entry = anchor
             note = (
                 f"{where} {want} POI {z['lo']:.2f}-{z['hi']:.2f} "
                 f"({z['source']}, q {float(z['quality']):.2f}) at near edge "
                 f"{anchor:.2f} — {dist:.2f} USD from market"
             )
-        return round(entry, 2), note
+            return round(entry, 2), note
+        if not cfg.magnet_anchor:
+            # legacy escape (magnet_anchor=False) — the exact pre-D-070
+            # D-051 clamp: stay inside the USD window, bookable
+            entry = (market - max_off) if direction == "BUY" else (market + max_off)
+            return round(entry, 2), (
+                f"{want} POI {z['lo']:.2f}-{z['hi']:.2f} too deep "
+                f"({dist:.2f} USD) — clamped to {max_off:.2f} USD"
+                f" (cap {cfg.pending_max_usd:.1f})"
+            )
+        # D-070 — TOO DEEP for a scalp: no clamping into no-man's land
+        # (the backtest autopsy says the deep clamped fills are exactly
+        # the losers — 2-6 USD bucket: 0-17% WR). Fall through to the
+        # magnets; the zone itself re-triggers when price actually
+        # approaches it (the engagement rule needs price IN the band),
+        # so nothing is missed, it is DEFERRED to the moment the zone
+        # is live.
 
-    # fallback — no same-side POI within the window: the user's preferred
-    # 4-6 USD offset (still on the right side, still a limit, still margin)
+    # D-070 — MAGNET FALLBACK: no same-side POI zone within the window.
+    # The next real structure the market is drawn to (EMA21/EMA50, a
+    # prior REST-zone edge, an FVG fill watermark) anchors the pending;
+    # the blind 4.5 USD offset into no-man's land is GONE (0/3 winners).
+    if cfg.magnet_anchor and magnets:
+        cands: list[tuple[float, str]] = []
+        for price, kind in magnets:
+            p = float(price)
+            if not (p > 0):
+                continue
+            if direction == "BUY" and market - min_off >= p >= market - max_off:
+                cands.append((market - p, f"{kind} magnet {p:.2f}"))
+            elif direction == "SELL" and market + min_off <= p <= market + max_off:
+                cands.append((p - market, f"{kind} magnet {p:.2f}"))
+        if cands:
+            cands.sort()  # nearest magnet first (highest fill probability)
+            dist, tag = cands[0]
+            entry = (market - dist) if direction == "BUY" else (market + dist)
+            return round(entry, 2), (
+                f"no {want} POI within {max_off:.2f} USD — anchored at the"
+                f" nearest {tag} ({dist:.2f} USD from market)"
+            )
+
+    if cfg.magnet_anchor:
+        # D-070 — refuse: neither a zone NOR a magnet is in reach; a
+        # locationless pending is the exact "wrong entry point" the user
+        # reported (the old code would fire it 4.5 USD into the void)
+        return None
+
+    # legacy escape (magnet_anchor=False): the pre-D-070 blind offset
     off = max(min(cfg.pending_target_usd, max_off), min_off)
     entry = (market - off) if direction == "BUY" else (market + off)
     note = (
@@ -395,3 +449,66 @@ def poi_pending_entry(
         f"offset {off:.2f} USD (target {cfg.pending_target_usd:.1f})"
     )
     return round(entry, 2), note
+
+
+def structural_magnets(
+    base: pd.DataFrame,
+    direction: str,
+    market: float,
+) -> list[tuple[float, str]]:
+    """D-070 — same-side structural magnets the market is drawn to.
+
+    The pending-entry fallback anchors: EMA21/EMA50 (the same pullback
+    levels the structure ladder and the chart ribbon use), the edges of
+    the most recent compressed REST zone (D-064), and FVG fill
+    watermarks (D-069 — the untraded air beyond the watermark is the
+    real inefficiency). Returns [(price, kind)] sorted by |market - p|.
+    """
+    out: list[tuple[float, str]] = []
+    if base is None or len(base) < 55 or not market:
+        return out
+    try:
+        from app.engine.indicators import ema as _ema
+
+        closes = base["c"]
+        for period, kind in ((21, "EMA21"), (50, "EMA50")):
+            v = float(_ema(closes, period).iloc[-1])
+            if v > 0:
+                out.append((v, kind))
+    except Exception:  # noqa: BLE001 — magnets are best-effort
+        pass
+    try:
+        from app.analysis.structure import rest_zones
+
+        for rz in rest_zones(base.iloc[-120:])[:2]:
+            lo, hi = float(rz.get("lo", 0.0)), float(rz.get("hi", 0.0))
+            if lo <= 0 or hi <= 0:
+                continue
+            # BUY anchors at the top of a rest box below price (the
+            # box edge price retests first); SELL at the bottom of one
+            # above — both edges are listed; the window check in
+            # poi_pending_entry picks the reachable side
+            out.append((hi, "REST edge"))
+            out.append((lo, "REST edge"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.analysis import smc as _smc
+
+        for g in _smc.detect_fvg(base.iloc[-160:], max_gaps=8):
+            if g.get("filled"):
+                continue  # mitigated gaps are not magnets
+            lo, hi = float(g["lo"]), float(g["hi"])
+            width = max(hi - lo, 1e-9)
+            pct = float(g.get("fill_pct", 0.0) or 0.0)
+            if g.get("side") == "bullish":
+                # watermark advances INTO the gap from the near edge (hi)
+                wm = hi - pct * width
+                out.append((wm, "FVG watermark"))
+            else:
+                wm = lo + pct * width
+                out.append((wm, "FVG watermark"))
+    except Exception:  # noqa: BLE001
+        pass
+    valid = [(p, k) for p, k in out if p > 0]
+    return sorted(valid, key=lambda pk: abs(market - pk[0]))

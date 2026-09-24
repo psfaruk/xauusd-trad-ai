@@ -98,8 +98,8 @@ class TestPullbackLevels:
             swing_extreme=99.9, wick_ratio=0.6, body_pos=0.8, atr=0.5,
         )
         entry, sl, tp = build_levels_pullback(sig, CFG)
-        # swing (99.9 - 0.2*0.5 = 99.8) vs floor (100 - 1.5*0.5 = 99.25)
-        assert sl == pytest.approx(99.25)
+        # swing (99.9 - 0.2*0.5 = 99.8) vs D-070 floor (100 - 0.9*0.5 = 99.55)
+        assert sl == pytest.approx(99.55)
         risk = entry - sl
         assert risk >= CFG.min_sl_atr * 0.5 - 1e-9
         assert tp == pytest.approx(entry + CFG.rr * risk)

@@ -26,6 +26,21 @@ class Trace:
         self.checks.append(res)
         return res
 
+    def demote_misses(self, names: tuple[str, ...]) -> None:
+        """D-070 — candidate-pattern negative checks become informational
+        when a DIFFERENT trigger fired the signal.
+
+        A red `pullback`/`sfp_sweep` line on a FIRED zone signal is a
+        CANDIDATE miss (that pattern was absent on this bar), not a
+        failed gate — the zone fired on its own merit via the D-049
+        fallback. Demoting keeps the fired signal's trace honest (every
+        red line on a fired signal must be a real, actionable miss).
+        """
+        for c in self.checks:
+            if not c.passed and c.name in names:
+                c.passed = True
+                c.value += " (candidate miss — zone fired on its own merit)"
+
     @property
     def failed(self) -> CheckResult | None:
         for c in self.checks:

@@ -70,6 +70,7 @@ from app.engine.zones import (
     check_rsi_zone,
     detect_zone_retest,
     poi_pending_entry,
+    structural_magnets,
     zone_retest_note,
     zone_trigger_quality,
 )
@@ -81,6 +82,12 @@ logger = logging.getLogger("xauusd.engine")
 # a 30s engine-side TTL cache cuts bridge traffic ~20x at 60 M1 closes/hour
 # while staying strictly fresher than the shortest confirm TF (M5 = 300s).
 HTF_CACHE_TTL_S = 30.0
+
+# D-070 — how many recent tick spreads feed the median the gates use. A
+# single wide quote at bar close (news print, rollover) must not kill an
+# otherwise fine evaluation; the median of the last ~60s is the honest
+# execution cost the trade would actually pay.
+SPREAD_MEDIAN_WINDOW = 20
 
 
 @dataclass(frozen=True)
@@ -316,6 +323,10 @@ def evaluate(
         pulse["tf_ladder"] = ladder_tfs
     except Exception:  # noqa: BLE001 — the ladder is informational
         pass
+    # D-070 — the profile this evaluation ran under (the radar badge:
+    # SCALP = the short-time profile the user's frequency directive
+    # built; standard = the legacy swing-scale values)
+    pulse["profile"] = "scalp" if cfg.scalp_profile else "standard"
 
     # D-049 — multi-source direction bias (replaces the single-EMA gate:
     # while gold sat under H1 EMA50 the old gate locked the engine into
@@ -529,6 +540,40 @@ def evaluate(
             except (KeyError, TypeError, ValueError):
                 continue
 
+    # D-070 — NEUTRAL-BIAS MOMENTUM (user directive: "প্রতি ঘণ্টা 6/7 টি
+    # সিগন্যাল আসবে" — the measured frequency killer): the D-049 code
+    # called detect_sfp/detect_pullback ONLY when the bias verdict was
+    # directional — in NEUTRAL (|score| < 0.30, hours per day) BOTH
+    # momentum triggers were silently dead and only zone retests could
+    # fire. The M15 TACTICAL structure vote now breaks the tie: a
+    # bullish M15 structure lets sweeps/pullbacks look for BUYs, a
+    # bearish one for SELLs. All premium gates (MTF + confluence /
+    # trusted core) still apply — this widens the CANDIDATE pool, not
+    # the pass bar.
+    momentum_dir: str | None = trace.direction
+    if (
+        momentum_dir is None
+        and cfg.neutral_momentum
+        and (htf.get("M15") is not None and len(htf["M15"]) >= 25)
+    ):
+        from app.analysis import smc as _smc
+
+        try:
+            st = _smc.detect_structure(htf["M15"].iloc[-160:])
+            if st.get("trend") == "bullish":
+                momentum_dir = "BUY"
+            elif st.get("trend") == "bearish":
+                momentum_dir = "SELL"
+        except Exception:  # noqa: BLE001 — tactical read is best-effort
+            pass
+        if momentum_dir is not None:
+            trace.direction = momentum_dir
+            trace.add(
+                "neutral_momentum", True,
+                f"bias NEUTRAL — M15 tactical structure drives momentum "
+                f"triggers ({momentum_dir}); premium gates unchanged",
+            )
+
     sig_sfp = detect_sfp(base, cfg, trace) if trace.direction else None
     sig_zone: ZoneRetestSignal | None = None
     if cfg.zone_trigger_enabled:
@@ -559,6 +604,11 @@ def evaluate(
     if trigger is None:
         _pulse_miss(pulse, trace)  # near_miss -> "no trigger on this bar"
         return Evaluation(None, trace.to_dict(), near_miss=False, pulse=pulse)
+    # D-070 — a trigger FIRED: the losing candidates' pattern checks are
+    # informational, never gates (a red `pullback` line on a fired SFP
+    # signal — or on a zone fallback — is a candidate miss, not a failed
+    # check; the fired signal's trace must show only real failures).
+    trace.demote_misses(("sfp_sweep", "pullback"))
     pulse["trigger"] = trigger
     if trigger in pulse["triggers"]:
         pulse["triggers"][trigger] = True
@@ -774,13 +824,35 @@ def evaluate(
         # is the margin the old mode lacked; SL/TP are then re-derived
         # from the (deeper) pending entry by the same smart_targets pass
         # below.
+        # D-070 — MAGNET FALLBACK + no-anchor refusal: with no same-side
+        # zone in the window, the entry anchors at the nearest structural
+        # magnet (EMA21/50, REST edge, FVG watermark); with neither in
+        # reach the signal is REFUSED with a visible near-miss — the old
+        # blind 4.5 USD offset produced the locationless "wrong entry
+        # point" trades (backtest autopsy: 2-4 USD bucket 0/3).
         if cfg.entry_mode == "poi_limit":
             atr_val = atr_calc(base, cfg.atr_period) or 1e-9
-            pending, entry_note = poi_pending_entry(
-                trigger_tag.direction, market_ref, zones, atr_val, cfg,
-                spread_price=spread_price,
+            mags = (
+                structural_magnets(base, trigger_tag.direction, market_ref)
+                if cfg.magnet_anchor else None
             )
-            entry, entry_type = pending, "limit"
+            pending = poi_pending_entry(
+                trigger_tag.direction, market_ref, zones, atr_val, cfg,
+                spread_price=spread_price, magnets=mags,
+            )
+            if pending is None:
+                trace.add(
+                    "entry_anchor", False,
+                    "no structural anchor — no same-side POI zone or "
+                    "magnet (EMA/REST/FVG watermark) within the pending "
+                    "window; a locationless entry is a guess (refused)",
+                )
+                _pulse_miss(pulse, trace)
+                return Evaluation(
+                    None, trace.to_dict(), near_miss=True, pulse=pulse
+                )
+            entry, entry_note = pending
+            entry, entry_type = entry, "limit"
             trace.add(
                 "entry_mode", True,
                 f"pending {entry_type} @ {entry:.2f} "
@@ -1279,6 +1351,10 @@ class SignalEngine:
         self._lock = asyncio.Lock()
         self._last_signal_bar: datetime | None = None  # cooldown anchor
         self._last_spread_points: float = 0.0
+        # D-070 — rolling spread window: the gates read the MEDIAN of the
+        # last SPREAD_MEDIAN_WINDOW quotes (one rollover/news print must
+        # not kill an evaluation; the median is what the trade would pay)
+        self._spread_history: list[float] = []
         # D-041 — confirm/trend frame cache: {(symbol, tf): (mono_ts, df)}
         self._htf_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
         # Phase 4: async callback fired with (payload, signal_id) right after a
@@ -1301,9 +1377,33 @@ class SignalEngine:
         self._htf_cache.clear()
 
     def note_spread(self, bid: float, ask: float) -> None:
-        """Track the latest spread so bar-close evaluation uses a fresh value."""
+        """Track the latest spread so bar-close evaluation uses a fresh value.
+
+        D-070 — the GATE value is the median of the recent window: a
+        single wide quote (news print / rollover second) no longer kills
+        the evaluation; the last-seen value is still tracked for the
+        pulse display.
+        """
         point = self._point_size if self._point_size > 0 else 0.01
-        self._last_spread_points = (ask - bid) / point
+        pts = (ask - bid) / point
+        self._last_spread_points = pts
+        hist = self._spread_history
+        hist.append(pts)
+        if len(hist) > SPREAD_MEDIAN_WINDOW:
+            del hist[: len(hist) - SPREAD_MEDIAN_WINDOW]
+
+    @property
+    def _gate_spread_points(self) -> float:
+        """D-070 — median of recent spreads (0.0 until the first tick)."""
+        hist = self._spread_history
+        if not hist:
+            return self._last_spread_points
+        ordered = sorted(hist)
+        n = len(ordered)
+        mid = n // 2
+        if n % 2:
+            return ordered[mid]
+        return 0.5 * (ordered[mid - 1] + ordered[mid])
 
     async def _htf_frame(
         self, source: Any, symbol: str, tf: str, bars: int
@@ -1420,7 +1520,8 @@ class SignalEngine:
             news = NewsState(blocked=not news_ok, skipped=False, value=t.checks[0].value)
 
         ev = evaluate(
-            base, htf, bar_close_time, cfg, self._last_spread_points, news=news,
+            base, htf, bar_close_time, cfg, self._gate_spread_points,
+            news=news,
             point_size=self._point_size,
         )
         # D-051 — the strategy radar frame: every M1 close, signal or not,
