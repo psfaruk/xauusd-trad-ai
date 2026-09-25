@@ -208,10 +208,14 @@ def _quiet_m1() -> pd.DataFrame:
 def test_engine_books_the_drawn_trade() -> None:
     """_drawing_geometry: the order IS the chart's contract — a BUY LIMIT
     at the drawn demand zone's near edge, SL beyond the zone, TP at the
-    drawn supply zone edge."""
+    drawn supply zone edge. D-073: the market sits INSIDE the chart-box
+    reach (0.75 M5-ATRs) and entry_min_usd is loosened so the drawn
+    level clears the noise margin — the default 1.0 USD floor would push
+    this near-zone case onto the market-entry branch instead."""
     htf = {"M5": _m5_with_drawn_zones(), "M15": _quiet_m1()}
+    cfg = EngineConfig(entry_min_usd=0.3)
     geo = _drawing_geometry(
-        _quiet_m1(), htf, "BUY", market=4302.8, cfg=CFG, spread_price=0.20,
+        _quiet_m1(), htf, "BUY", market=4302.2, cfg=cfg, spread_price=0.20,
     )
     assert geo is not None
     snap = setup_snapshot(htf["M5"], "M5")

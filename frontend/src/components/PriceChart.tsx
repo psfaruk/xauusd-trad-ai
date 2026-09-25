@@ -40,6 +40,7 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { feed } from "../state/feed";
+import { preservedRange } from "../lib/chartZoom";
 import { TIMEFRAMES } from "../types";
 import type {
   AnalysisResponse, Candle, ChartDrawing, DrawingTone, Signal, Timeframe,
@@ -402,12 +403,36 @@ const TF_SECONDS: Record<string, number> = {
  * the dashed ENTRY/SL/TP lines of active signals vanish once older than
  * this TTL (120 minutes ≈ the engine's whole short-time trade horizon).
  * The signals still live in the SIGNAL ANALYSIS panel + history — only
- * the chart ink expires. */
+ * the chart ink expires.
+ *
+ * D-073 — STATUS-AWARE TTL (user report: "মার্কেট কোথায় আর এন্ট্রি
+ * সিগন্যাল কোথায় গিয়ে পড়ে"): an EXPIRED/CANCELLED/WON/LOST signal kept
+ * painting its arrow + ENTRY lines at a stale level for up to 2 hours —
+ * dead ink the user read as "the entry landed somewhere the market never
+ * went". Dead signals now vanish within minutes (long enough to see the
+ * outcome), PENDING arrows expire with the order itself, and only LIVE
+ * trades keep the full 2-hour horizon. */
 const SIGNAL_CHART_TTL_MS = 120 * 60 * 1000;
+/** dead (won/lost/expired/cancelled) ink lingers just long enough to
+ * read the outcome on the chart, then goes */
+const DEAD_SIGNAL_TTL_MS = 6 * 60 * 1000;
+/** pending arrows: the engine expires the order after 30 M1 bars — keep
+ * a small grace so the arrow never outlives the order by much */
+const PENDING_TTL_MS = 40 * 60 * 1000;
 
 const isFreshSignal = (s: Signal, now = Date.now()): boolean => {
   const t = new Date(s.ts).getTime();
-  return Number.isFinite(t) && now - t <= SIGNAL_CHART_TTL_MS;
+  if (!Number.isFinite(t)) return false;
+  const age = now - t;
+  switch (s.status) {
+    case "pending":
+      return age <= PENDING_TTL_MS;
+    case "active":
+      return age <= SIGNAL_CHART_TTL_MS;
+    default:
+      // won / lost / expired / cancelled — outcome ink fades fast
+      return age <= DEAD_SIGNAL_TTL_MS;
+  }
 };
 
 interface PriceChartProps {
@@ -479,6 +504,7 @@ export default function PriceChart({
   const animRef = useRef<AnimState>({ cur: null, tgt: null });
   const rafRef = useRef<number | null>(null);
   const dataKeyRef = useRef(""); // last (symbol|tf|candleCount) applied
+  const appliedRef = useRef<Candle[]>([]); // D-073 — the array last fed to setData
   const [ready, setReady] = useState(false);
   const isSignals = variant === "signals";
   // D-052 — simplified overlay layer toggles (full words, six chips);
@@ -702,6 +728,7 @@ export default function PriceChart({
     if (dataKeyRef.current.split("|").slice(0, 2).join("|") !== key) {
       // pair or timeframe changed: wipe everything until fresh data lands
       dataKeyRef.current = `${key}|0`;
+      appliedRef.current = [];
       animRef.current = { cur: null, tgt: null };
       try {
         seriesRef.current?.setData([]);
@@ -713,6 +740,16 @@ export default function PriceChart({
   }, [symbol, tf]);
 
   /* ----------------------------------------- backfill when data changes */
+  // D-073 — ZOOM PRESERVATION (user report: "যখন কোন চার্ট জুম করে রাখি,
+  // হঠাৎ করে চার্ট ভেঙে যায়, আগের অবস্থায় ফিরে আসে"): the old effect
+  // re-ran setData + a FIXED visible range on every candle refetch —
+  // the 3-min poll, the 10-s warm-up poll, every WS reconnect
+  // invalidation, every desync resync — stomping the user's zoom back
+  // to the default 95-bar window. Now only the FIRST dataset for a
+  // symbol+TF gets the default window; every refresh of the SAME
+  // pair re-anchors the range (lib/chartZoom): following views stay
+  // glued to the live edge, zoomed views stay on the same historical
+  // candles at the same zoom scale.
   useEffect(() => {
     const series = seriesRef.current;
     const volume = volumeRef.current;
@@ -721,9 +758,23 @@ export default function PriceChart({
     const key = `${symbol}|${tf}|${clean.length}|${clean.length ? clean[clean.length - 1].t : 0}`;
     if (key === dataKeyRef.current) return;
     if (clean.length === 0) return; // keep the loading overlay on
+    const isFirst =
+      !dataKeyRef.current.startsWith(`${symbol}|${tf}|`) ||
+      appliedRef.current.length === 0;
     dataKeyRef.current = key;
+    const prev = appliedRef.current;
     animRef.current = { cur: null, tgt: null };
     try {
+      let restore: ReturnType<typeof preservedRange> = null;
+      if (!isFirst) {
+        try {
+          restore = preservedRange(
+            prev, clean, chartRef.current?.timeScale().getVisibleLogicalRange(),
+          );
+        } catch {
+          restore = null;
+        }
+      }
       series.setData(
         clean.map((c) => ({
           time: c.t as UTCTimestamp,
@@ -740,9 +791,25 @@ export default function PriceChart({
           color: c.c >= c.o ? "rgba(38,166,154,0.16)" : "rgba(239,83,80,0.16)",
         })),
       );
-      chartRef.current?.timeScale().setVisibleLogicalRange(
-        { from: Math.max(0, clean.length - 95), to: clean.length + 5 },
-      );
+      const ts = chartRef.current?.timeScale();
+      if (ts) {
+        if (isFirst || !restore) {
+          // first sight of this pair/TF: the D-052 default window
+          ts.setVisibleLogicalRange(
+            { from: Math.max(0, clean.length - 95), to: clean.length + 5 },
+          );
+        } else {
+          // same pair refresh — the user's zoom, re-anchored
+          try {
+            ts.setVisibleLogicalRange(restore);
+          } catch {
+            ts.setVisibleLogicalRange(
+              { from: Math.max(0, clean.length - 95), to: clean.length + 5 },
+            );
+          }
+        }
+      }
+      appliedRef.current = clean;
     } catch (err) {
       console.warn("chart setData failed — dropping this batch", err);
     }
@@ -2011,17 +2078,24 @@ export default function PriceChart({
     // D-063 — the dashed order lines expire with the same TTL as the
     // arrows: an active trade from hours ago no longer drags its
     // ENTRY/SL/TP across the whole chart
-    const activeSignals = signals.filter(
-      (s) => s.status === "active" && s.id !== selectedSignal?.id
-        && isFreshSignal(s),
-    );
-    for (const sig of activeSignals.slice(0, 2)) {
+    // D-073 — PENDING orders draw their WAITING level too (labeled), so
+    // the user SEES where the limit sits relative to the market instead
+    // of an arrow floating on an old candle; live trades first, at most 2
+    const orderSignals = signals
+      .filter(
+        (s) => (s.status === "active" || s.status === "pending")
+          && s.id !== selectedSignal?.id
+          && isFreshSignal(s),
+      )
+      .sort((a, b) => (a.status === "active" ? -1 : 1) - (b.status === "active" ? -1 : 1));
+    for (const sig of orderSignals.slice(0, 2)) {
+      const waiting = sig.status === "pending";
       const line = (p: number, color: string, label: string) => {
         const y = yOf(p);
         if (y == null || y < 0 || y > h) return;
         ctx.strokeStyle = color;
         ctx.lineWidth = 0.6;
-        ctx.setLineDash([2, 4]);
+        ctx.setLineDash(waiting ? [1, 5] : [2, 4]);
         ctx.beginPath();
         ctx.moveTo(0, Math.round(y) + 0.5);
         ctx.lineTo(rightEdge, Math.round(y) + 0.5);
@@ -2032,11 +2106,12 @@ export default function PriceChart({
         ctx.font = `400 8px ${FONT_FAMILY}`;
         ctx.shadowColor = TEXT_SHADOW;
         ctx.shadowBlur = 2;
-        ctx.fillStyle = "rgba(154,160,170,0.8)";
+        ctx.fillStyle = waiting ? "rgba(231,205,111,0.75)" : "rgba(154,160,170,0.8)";
         ctx.fillText(label, 6, y - 3);
         ctx.restore();
       };
-      line(sig.entry, "rgba(212,175,55,0.6)", `${sig.direction} ENTRY`);
+      const verb = waiting ? "WAIT" : "ENTRY";
+      line(sig.entry, "rgba(212,175,55,0.6)", `${sig.direction} ${verb} ${sig.entry.toFixed(2)}`);
       line(sig.sl, "rgba(248,113,113,0.45)", `${sig.direction} SL`);
       line(sig.tp, "rgba(52,211,153,0.45)", `${sig.direction} TP`);
     }

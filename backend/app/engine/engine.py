@@ -197,7 +197,22 @@ def _drawing_geometry(
     min_off = max(
         cfg.entry_offset_atr * a_m1, 2.0 * spread_price, cfg.entry_min_usd
     )
+    # D-073 — the drawn entry obeys the SAME pending window the legacy
+    # chain does (min(pending_max_atr*ATR, pending_max_usd), floored at
+    # 1.5x min_off). Before this, drawing-true limits were booked at
+    # ANY zone the reach window accepted — in ATR blowups that meant
+    # orders several USD into no-man's land, the exact "entry lands
+    # where the market never went" the user reported. Deeper drawn
+    # zones DEFER (return None): the legacy chain anchors nearer
+    # (magnet/POI window) or refuses visibly, and the zone re-triggers
+    # the moment price actually approaches its band.
+    max_off = max(
+        min(cfg.pending_max_atr * a_m1, cfg.pending_max_usd),
+        1.5 * min_off,
+    )
     dist = (market - entry) if direction == "BUY" else (entry - market)
+    if dist > max_off:
+        return None  # drawn entry too deep — defer to the legacy window
     if dist >= min_off:
         entry_type = "limit"
         rr = abs(tp - entry) / risk

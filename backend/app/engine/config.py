@@ -394,14 +394,18 @@ class EngineConfig(BaseModel):
                     "poi_pending_entry + smart_targets chain",
     )
     setup_near_atr: float = Field(
-        1.5, gt=0,
-        description="D-057 — how close (in M5-ATR units) a DRAWN zone "
-                    "(the zone boxes the chart renders) must be to the "
-                    "market for the drawing-true geometry to anchor the "
-                    "order there; the setup BOX itself still uses the "
-                    "tighter 0.75 (setup_geometry.SETUP_NEAR_ATR) — the "
-                    "box is the 'trade is live here' card, this window is "
-                    "the 'orders sit at drawn zone boxes' reach",
+        0.75, gt=0,
+        description="D-057/D-073 — how close (in M5-ATR units) a DRAWN zone "
+                    "must be to the market for the drawing-true geometry "
+                    "to anchor the order there. D-073 aligned this with "
+                    "the chart's setup BOX (setup_geometry.SETUP_NEAR_ATR "
+                    "= 0.75): the old 1.5 booked orders at zones up to "
+                    "2x farther than anything the chart draws — the user "
+                    "read them as 'entry lands where the market never "
+                    "went' (report: মার্কেট কোথায় আর এন্ট্রি সিগন্যাল কোথায় "
+                    "গিয়ে পড়ে), and the D-070 autopsy measured fills "
+                    "beyond ~2 USD as the losing bucket. Deeper zones "
+                    "re-trigger when price actually approaches the band",
     )
     setup_entry_anchor: str = Field(
         "near", pattern="^(near|mid)$",
@@ -982,6 +986,40 @@ _LEGACY_D070_FIELDS: dict[str, float | int] = {
     "pending_max_usd": 6.0,
 }
 
+#: D-073 — the drawing-true zone reach (engine) aligned with the chart's
+#: setup box. Rule identical to every prior upgrade: a stored row still
+#: carrying the D-057/D-070 shipped default 1.5 was never hand-edited by
+#: the user (admin-config field), so it moves to the chart-parity 0.75;
+#: any other value is a user choice and stays put FOREVER.
+_LEGACY_D073_FIELDS: dict[str, tuple[float, float]] = {
+    "setup_near_atr": (1.5, 0.75),
+}
+
+
+def upgrade_legacy_d073(raw: dict) -> tuple[dict, list[str]]:
+    """D-073 — move untouched 1.5-reach rows onto the chart-parity 0.75.
+
+    Returns (payload, moved_fields). Only fields still sitting on the
+    exact shipped default move; user-customized values are preserved
+    forever (same rule as every legacy upgrade since D-047).
+    """
+    if not isinstance(raw, dict):
+        return raw, []
+    moved: list[str] = []
+    out = dict(raw)
+    for field, (old, new) in _LEGACY_D073_FIELDS.items():
+        val = out.get(field)
+        if val is None:
+            continue
+        try:
+            matches = abs(float(val) - float(old)) < 1e-9
+        except (TypeError, ValueError):
+            matches = False
+        if matches:
+            out[field] = new
+            moved.append(field)
+    return out, moved
+
 
 def upgrade_legacy_d070(raw: dict) -> tuple[dict, list[str]]:
     """D-070 — move untouched pre-D-070 rows onto the scalp profile.
@@ -1137,10 +1175,11 @@ class ConfigRepo:
             raw, upgraded_d050 = upgrade_legacy_d050(raw)
             raw, upgraded_d051 = upgrade_legacy_d051(raw)
             raw, moved_d070 = upgrade_legacy_d070(raw)
+            raw, moved_d073 = upgrade_legacy_d073(raw)
             upgraded = (
                 upgraded_strategy or upgraded_sessions
                 or upgraded_confluence or bool(moved_d049) or upgraded_d050
-                or upgraded_d051 or bool(moved_d070)
+                or upgraded_d051 or bool(moved_d070) or bool(moved_d073)
             )
             cfg = EngineConfig.model_validate(raw)
             if upgraded:
@@ -1159,6 +1198,8 @@ class ConfigRepo:
                     why.append("d051:M1-back")
                 if moved_d070:
                     why.append("d070:scalp:" + "+".join(moved_d070))
+                if moved_d073:
+                    why.append("d073:chart-parity:" + "+".join(moved_d073))
                 logger.info(
                     "engine config upgraded (%s) — persisting",
                     "+".join(why) or "strategy",
