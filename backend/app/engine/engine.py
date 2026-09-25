@@ -1553,18 +1553,31 @@ class SignalEngine:
             return
 
         payload = ev.signal
-        signal_id = await self._repo.insert(payload, symbol, tf)
+        # D-074 — the signal IDENTITY speaks the platform market name
+        # (market_key: "XAUUSDm" -> "XAUUSD"), never the broker's
+        # suffixed spelling. The chart, the analysis snapshot, the
+        # candles and the signals panel are all keyed by the platform
+        # symbol — a suffixed signal row matched NOTHING there, so the
+        # newest entry signal never drew on the chart while the stale
+        # analysis "forming" box kept showing (user report: "নতুন এন্ট্রি
+        # যে সিগন্যাল টি আসে, সেটি চার্ট এর উপরে ড্রয়িং করে না"). The
+        # data fetch + the executor relay below keep the CONCRETE broker
+        # symbol (get_rates needs it; abroker_symbol resolves orders).
+        from app.mt5.base import market_key as _mkt
+
+        mkt = _mkt(symbol)
+        signal_id = await self._repo.insert(payload, mkt, tf)
         self._last_signal_bar = bar_open
         await self._hub.broadcast_all(
             "signal",
             {**payload, "id": signal_id, "ts": bar_open.isoformat(),
-             "symbol": symbol, "tf": tf},
+             "symbol": mkt, "tf": tf},
         )
         if self.on_signal is not None:
             try:
                 await self.on_signal(
                     {**payload, "id": signal_id, "ts": bar_open.isoformat(),
-                     "symbol": symbol, "tf": tf},
+                     "symbol": mkt, "tf": tf},
                     symbol,
                     self._point_size,
                 )
@@ -1572,7 +1585,7 @@ class SignalEngine:
                 logger.exception("on_signal relay callback failed")
         await self._log(
             "info",
-            f"SIGNAL {payload['direction']} {symbol} @ {payload['entry']} "
+            f"SIGNAL {payload['direction']} {mkt} @ {payload['entry']} "
             f"SL {payload['sl']} TP {payload['tp']} conf {payload['confidence']} "
             f"({payload['trigger']})",
         )

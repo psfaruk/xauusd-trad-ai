@@ -33,6 +33,7 @@ import {
   createChart,
   ColorType,
   CrosshairMode,
+  type AutoscaleInfoProvider,
   type IChartApi,
   type ISeriesApi,
   type SeriesMarker,
@@ -41,6 +42,7 @@ import {
 } from "lightweight-charts";
 import { feed } from "../state/feed";
 import { preservedRange } from "../lib/chartZoom";
+import { pickLiveSetup } from "../lib/liveSetup";
 import { TIMEFRAMES } from "../types";
 import type {
   AnalysisResponse, Candle, ChartDrawing, DrawingTone, Signal, Timeframe,
@@ -398,42 +400,15 @@ const TF_SECONDS: Record<string, number> = {
   M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400,
 };
 
-/** D-063 — old order drawings auto-delete (user directive: "নির্দিষ্ট
- * কিছু সময়ে পুরাতন ড্রয়িং মুছে যাবে"): signal arrows on the candles and
- * the dashed ENTRY/SL/TP lines of active signals vanish once older than
- * this TTL (120 minutes ≈ the engine's whole short-time trade horizon).
- * The signals still live in the SIGNAL ANALYSIS panel + history — only
- * the chart ink expires.
- *
- * D-073 — STATUS-AWARE TTL (user report: "মার্কেট কোথায় আর এন্ট্রি
- * সিগন্যাল কোথায় গিয়ে পড়ে"): an EXPIRED/CANCELLED/WON/LOST signal kept
- * painting its arrow + ENTRY lines at a stale level for up to 2 hours —
- * dead ink the user read as "the entry landed somewhere the market never
- * went". Dead signals now vanish within minutes (long enough to see the
- * outcome), PENDING arrows expire with the order itself, and only LIVE
- * trades keep the full 2-hour horizon. */
-const SIGNAL_CHART_TTL_MS = 120 * 60 * 1000;
-/** dead (won/lost/expired/cancelled) ink lingers just long enough to
- * read the outcome on the chart, then goes */
-const DEAD_SIGNAL_TTL_MS = 6 * 60 * 1000;
-/** pending arrows: the engine expires the order after 30 M1 bars — keep
- * a small grace so the arrow never outlives the order by much */
-const PENDING_TTL_MS = 40 * 60 * 1000;
-
-const isFreshSignal = (s: Signal, now = Date.now()): boolean => {
-  const t = new Date(s.ts).getTime();
-  if (!Number.isFinite(t)) return false;
-  const age = now - t;
-  switch (s.status) {
-    case "pending":
-      return age <= PENDING_TTL_MS;
-    case "active":
-      return age <= SIGNAL_CHART_TTL_MS;
-    default:
-      // won / lost / expired / cancelled — outcome ink fades fast
-      return age <= DEAD_SIGNAL_TTL_MS;
-  }
-};
+/** D-074 — THE SIGNAL IS THE DRAWING (user directive, Bengali):
+ * "নতুন এন্ট্রি যে সিগন্যাল টি আসে, সেটি চার্ট এর উপরে ড্রয়িং করে না।
+ * পুরাতন একটি এন্ট্রি সেটাপ দেখায়" — the chart's entry setup is the
+ * NEWEST live signal (pending limit / active trade), drawn at ITS exact
+ * levels from ITS candle to the right edge; a new signal deletes the
+ * previous drawing; SL/TP hit (status won/lost) deletes it immediately;
+ * the stale analysis "forming" box never renders while a live signal
+ * exists. The pick lives in ../lib/liveSetup (pure, unit-tested). */
+const LIVE_CLOCK_MS = 30_000;
 
 interface PriceChartProps {
   symbol: string;
@@ -886,21 +861,40 @@ export default function PriceChart({
   useEffect(() => {
     const series = seriesRef.current;
     if (!series || !ready) return;
-    // D-063 — only RECENT signals paint markers on the candles: the
-    // arrows of trades from hours ago were permanent chart clutter
-    const fresh = signals.filter((s) => isFreshSignal(s));
-    const markers: SeriesMarker<Time>[] = fresh
-      .slice(0, 40)
-      .map((s) => {
-        const t = Math.floor(new Date(s.ts).getTime() / 1000) as UTCTimestamp;
-        return {
-          time: t,
-          position: s.direction === "BUY" ? "belowBar" : "aboveBar",
-          color: s.direction === "BUY" ? UP : DOWN,
-          shape: s.direction === "BUY" ? "arrowUp" : "arrowDown",
-          text: `${s.direction} ${Math.round(s.confidence * 100)}%`,
-        } as SeriesMarker<Time>;
-      });
+    // D-074 — ONE arrow at a time: the live setup's own arrow, SNAPPED
+    // onto an actual candle of this timeframe (the old code fed raw
+    // signal timestamps to setMarkers — off-grid times landed on the
+    // "nearest" bar at best and the newest signal's arrow was easy to
+    // miss). A new signal replaces the previous arrow; a signal that hit
+    // SL/TP (status won/lost — or expired/cancelled) is deleted from the
+    // chart immediately (user directive, verbatim): history stays in the
+    // SIGNAL ANALYSIS panel, the canvas carries the CURRENT trade only.
+    const markers: SeriesMarker<Time>[] = [];
+    const live = pickLiveSetup(signals, symbol);
+    if (live) {
+      const t = Math.floor(new Date(live.ts).getTime() / 1000);
+      let mt = t as UTCTimestamp;
+      if (candles.length) {
+        const tfSec = TF_SECONDS[tf] ?? 60;
+        const bar = candles.find((c) => c.t <= t && t < c.t + tfSec);
+        if (bar) {
+          mt = bar.t as UTCTimestamp;
+        } else {
+          // the signal is newer than the loaded candles (poll lag) or
+          // older than the window — clamp to the nearest loaded candle
+          const first = candles[0].t;
+          const last = candles[candles.length - 1].t;
+          mt = (t >= last ? last : t <= first ? first : t) as UTCTimestamp;
+        }
+      }
+      markers.push({
+        time: mt,
+        position: live.direction === "BUY" ? "belowBar" : "aboveBar",
+        color: live.direction === "BUY" ? UP : DOWN,
+        shape: live.direction === "BUY" ? "arrowUp" : "arrowDown",
+        text: `${live.direction} ${Math.round(live.confidence * 100)}%`,
+      } as SeriesMarker<Time>);
+    }
     // D-042 — whale/institutional events (momentum entries, stop hunts,
     // absorption) — snapped onto actual candle times of this TF.
     // D-053 — FULL variant only: the Chart tab shows signals + the entry
@@ -936,18 +930,65 @@ export default function PriceChart({
       /* markers need ascending times — sanitized above */
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signals, ready, analysis, tf, candles.length, isSignals]);
+  }, [signals, ready, analysis, tf, candles.length, isSignals, symbol]);
 
   /* ------------------------------------- D-052 professional drawing overlay */
   // D-052 — each timeframe picks ITS OWN drawing set (recent 80-150
   // candles of that TF); fallback to the legacy M1 set.
   // D-053 — the signals variant strips every analysis layer except the
   // entry-setup drawing (Chart tab = setup + signals only).
+  // D-074 — the fib retracement joins the signals variant (user:
+  // "Fibonacci set-up লজিক এ … লেভেল নাম্বার গুল টি চার্ট এ দেখা যাচ্ছে
+  // না" — the fib grid + its numbers are part of the entry logic, not
+  // analysis noise).
   const allDrawings: ChartDrawing[] =
     analysis?.drawings_by_tf?.[tf] ?? analysis?.drawings ?? [];
   const drawings: ChartDrawing[] = isSignals
-    ? allDrawings.filter((d) => d.kind === "setup")
+    ? allDrawings.filter((d) => d.kind === "setup" || d.kind === "fib")
     : allDrawings;
+
+  /* ------------------------------------------- D-074 the LIVE trade setup */
+  // The ONE signal the chart draws (see ../lib/liveSetup). Re-derived on
+  // every signals change + a 30s clock so an expired pending (order
+  // dead) drops its ink even without a refetch; the 500ms redraw loop
+  // below re-checks per paint.
+  const [liveClock, setLiveClock] = useState(0);
+  useEffect(() => {
+    const iv = window.setInterval(() => setLiveClock((c) => c + 1), LIVE_CLOCK_MS);
+    return () => window.clearInterval(iv);
+  }, []);
+  const liveSignal = useMemo(
+    () => pickLiveSetup(signals, symbol, Date.now()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [signals, symbol, liveClock],
+  );
+  // D-074 — the price scale must SHOW the trade: autoscale fits the
+  // candles only (custom price lines are NOT part of the default range
+  // in lightweight-charts), so a pending entry 2 USD below the market
+  // drew its lines OUTSIDE the canvas — "নতুন এন্ট্রি … ড্রয়িং করে না".
+  // The provider widens the autoscaled range to include the live
+  // signal's entry/SL/TP — the setup and the candles share one screen
+  // ("ক্যান্ডেল এর সাথে … মিলিয়ে"). A price scale the user zoomed
+  // manually is untouched (autoscale only drives the auto mode).
+  const liveSignalRef = useRef<Signal | null>(liveSignal);
+  liveSignalRef.current = liveSignal;
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series || !ready) return;
+    const provider: AutoscaleInfoProvider = (base) => {
+      const raw = base();
+      const s = liveSignalRef.current;
+      if (!s || raw === null || !raw.priceRange) return raw;
+      return {
+        priceRange: {
+          minValue: Math.min(raw.priceRange.minValue, s.entry, s.sl, s.tp),
+          maxValue: Math.max(raw.priceRange.maxValue, s.entry, s.sl, s.tp),
+        },
+        margins: raw.margins,
+      };
+    };
+    series.applyOptions({ autoscaleInfoProvider: provider });
+  }, [liveSignal?.id, ready]);
 
   const drawOverlay = useCallback(() => {
     const canvas = overlayRef.current;
@@ -1931,6 +1972,9 @@ export default function PriceChart({
     }
 
     /* -------------------------------------------------- fibonacci fan */
+    // D-074 — the LIVE signal the chart is drawing (ref: fresh on every
+    // 500ms repaint / signals change; see pickLiveSetup)
+    const live = liveSignalRef.current;
     if (L.fib) {
       for (const d of drawings) {
         if (d.kind !== "fib") continue;
@@ -1938,7 +1982,9 @@ export default function PriceChart({
         const y0 = yOf(d.p0);
         const y1 = yOf(d.p1);
         const fx = x0 == null ? 0 : Math.max(-2, x0);
-        // OTE band first (under the level lines)
+        // OTE band first (under the level lines) — D-074: with its edge
+        // numbers written on the chart ("লেভেল নাম্বার গুল টি চার্ট এ দেখা
+        // যাচ্ছে না")
         if (d.ote) {
           const yo1 = yOf(d.ote[1]);
           const yo0 = yOf(d.ote[0]);
@@ -1950,7 +1996,17 @@ export default function PriceChart({
             ctx.setLineDash([2, 3]);
             ctx.strokeRect(fx + 0.5, Math.min(yo1, yo0) + 0.5, rightEdge - fx - 1, Math.abs(yo0 - yo1) - 1);
             ctx.setLineDash([]);
-            // D-053 — no OTE text on the canvas (legend carries it)
+            ctx.save();
+            ctx.font = `700 8px ${FONT_FAMILY}`;
+            ctx.shadowColor = TEXT_SHADOW;
+            ctx.shadowBlur = 2;
+            ctx.fillStyle = "rgba(231,205,111,0.95)";
+            ctx.fillText(
+              `OTE ${d.ote[0].toFixed(2)}–${d.ote[1].toFixed(2)}`,
+              Math.max(4, Math.min(fx + 4, rightEdge - 96)),
+              Math.max(10, Math.min(yo0, yo1) - 3),
+            );
+            ctx.restore();
           }
         }
         for (const lv of d.levels) {
@@ -1971,7 +2027,21 @@ export default function PriceChart({
             ctx.stroke();
             ctx.setLineDash([]);
           }
-          // D-053 — no FIB % tags on the canvas (legend carries it)
+          // D-074 — the level NUMBERS on the chart (user directive:
+          // "লেভেল নাম্বার গুল টি চার্ট এ দেখা যাচ্ছে না"): ratio +
+          // price written directly on each fib line, tiny + shadowed
+          // (no box, D-058), golden pocket slightly louder
+          ctx.save();
+          ctx.font = `600 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 2;
+          ctx.fillStyle = key ? "rgba(231,205,111,0.9)" : "rgba(212,175,55,0.55)";
+          ctx.fillText(
+            `${lv.ratio.toFixed(3)} ${lv.price.toFixed(2)}`,
+            Math.max(4, Math.min(fx + 4, rightEdge - 88)),
+            y - 3,
+          );
+          ctx.restore();
         }
         // the impulse leg itself (thin neutral diagonal)
         if (y0 != null && y1 != null && x0 != null) {
@@ -1986,9 +2056,15 @@ export default function PriceChart({
     }
 
     /* -------------------------------------------- D-043 entry-setup box */
-    const setup = drawings.find(
-      (d): d is Extract<ChartDrawing, { kind: "setup" }> => d.kind === "setup",
-    );
+    // D-074 — the analysis "forming" box ONLY draws when NO live signal
+    // exists: while a real signal is pending/active THE SIGNAL IS THE
+    // DRAWING (its own exact levels, drawn below) — the forming box was
+    // the "পুরাতন এন্ট্রি সেটাপ" at a level the market never reached.
+    const setup = !live
+      ? drawings.find(
+          (d): d is Extract<ChartDrawing, { kind: "setup" }> => d.kind === "setup",
+        )
+      : undefined;
     if (L.setup && setup) {
       const x0raw = xOf(setup.t0);
       const x0 = x0raw == null ? 0 : Math.max(-2, x0raw);
@@ -2074,53 +2150,114 @@ export default function PriceChart({
       ctx.restore();
     }
 
-    /* --------------------------------- D-043 active signal entry/SL/TP lines */
-    // D-063 — the dashed order lines expire with the same TTL as the
-    // arrows: an active trade from hours ago no longer drags its
-    // ENTRY/SL/TP across the whole chart
-    // D-073 — PENDING orders draw their WAITING level too (labeled), so
-    // the user SEES where the limit sits relative to the market instead
-    // of an arrow floating on an old candle; live trades first, at most 2
-    const orderSignals = signals
-      .filter(
-        (s) => (s.status === "active" || s.status === "pending")
-          && s.id !== selectedSignal?.id
-          && isFreshSignal(s),
-      )
-      .sort((a, b) => (a.status === "active" ? -1 : 1) - (b.status === "active" ? -1 : 1));
-    for (const sig of orderSignals.slice(0, 2)) {
-      const waiting = sig.status === "pending";
-      const line = (p: number, color: string, label: string) => {
-        const y = yOf(p);
-        if (y == null || y < 0 || y > h) return;
-        ctx.strokeStyle = color;
+    /* --------------------------- D-074 THE LIVE TRADE — the signal IS the drawing */
+    // ONE setup at a time: the newest live signal's own contract at its
+    // EXACT entry/SL/TP, drawn from the signal's candle to the right
+    // edge ("ক্যান্ডেল এর সাথে … মিলিয়ে"). A new signal replaces the
+    // previous ink; SL/TP hit (won/lost) deletes it — pickLiveSetup
+    // already excluded the dead ones. Pending limits read WAIT + the
+    // level they rest at; live trades read ENTRY.
+    if (L.setup && live) {
+      const tSec = Math.floor(new Date(live.ts).getTime() / 1000);
+      const tfSec = TF_SECONDS[tf] ?? 60;
+      // x0 — the candle the signal was born on, SNAPPED to this TF's
+      // grid (so the drawing starts exactly ON a candle, tick-aligned)
+      let x0: number | null = xOf(live.ts);
+      if (candles.length) {
+        const bar = candles.find((c) => c.t <= tSec && tSec < c.t + tfSec);
+        const anchor = bar ? bar.t : candles[candles.length - 1].t;
+        const ax = xOf(new Date(anchor * 1000).toISOString());
+        if (ax != null) x0 = ax;
+      }
+      if (x0 == null || x0 < -2) x0 = -2;
+      const xS = Math.min(x0, rightEdge - 24); // keep the head on-canvas
+      const isBuy = live.direction === "BUY";
+      const waiting = live.status === "pending";
+      const yE = yOf(live.entry);
+      const yS = yOf(live.sl);
+      const yT = yOf(live.tp);
+      // risk / reward shading: entry↔sl red, entry↔tp green — D-074
+      // raised to 0.08 (0.05 was invisible on dark bg — the trade's
+      // zones must READ at a glance)
+      if (yE != null && yS != null) {
+        ctx.fillStyle = "rgba(248,113,113,0.08)";
+        ctx.fillRect(xS, Math.min(yE, yS), rightEdge - xS, Math.abs(yS - yE));
+      }
+      if (yE != null && yT != null) {
+        ctx.fillStyle = "rgba(52,211,153,0.08)";
+        ctx.fillRect(xS, Math.min(yE, yT), rightEdge - xS, Math.abs(yT - yE));
+      }
+      // the dotted birth line — where the trade started
+      if (xS > 2) {
+        ctx.strokeStyle = "rgba(154,160,170,0.35)";
         ctx.lineWidth = 0.6;
-        ctx.setLineDash(waiting ? [1, 5] : [2, 4]);
+        ctx.setLineDash([2, 4]);
         ctx.beginPath();
-        ctx.moveTo(0, Math.round(y) + 0.5);
-        ctx.lineTo(rightEdge, Math.round(y) + 0.5);
+        ctx.moveTo(Math.round(xS) + 0.5, 0);
+        ctx.lineTo(Math.round(xS) + 0.5, h);
         ctx.stroke();
         ctx.setLineDash([]);
-        // D-058 — subtle THIN direct label (no box, shadowed)
-        ctx.save();
-        ctx.font = `400 8px ${FONT_FAMILY}`;
-        ctx.shadowColor = TEXT_SHADOW;
-        ctx.shadowBlur = 2;
-        ctx.fillStyle = waiting ? "rgba(231,205,111,0.75)" : "rgba(154,160,170,0.8)";
-        ctx.fillText(label, 6, y - 3);
-        ctx.restore();
+      }
+      const orderLine = (
+        y: number | null, color: string, halo: string, dash: number[],
+        label: string,
+      ) => {
+        if (y == null || y < -5 || y > h + 5) return;
+        hardSeg(xS, Math.round(y) + 0.5, rightEdge, Math.round(y) + 0.5,
+          color, halo, 0.85, dash);
+        rightTag(label, y, "neutral");
       };
       const verb = waiting ? "WAIT" : "ENTRY";
-      line(sig.entry, "rgba(212,175,55,0.6)", `${sig.direction} ${verb} ${sig.entry.toFixed(2)}`);
-      line(sig.sl, "rgba(248,113,113,0.45)", `${sig.direction} SL`);
-      line(sig.tp, "rgba(52,211,153,0.45)", `${sig.direction} TP`);
+      orderLine(
+        yE, "rgba(212,175,55,0.95)", TONE.gold.halo, waiting ? [2, 3] : [],
+        `${live.direction} ${verb} ${live.entry.toFixed(2)}`,
+      );
+      orderLine(yS, "rgba(248,113,113,0.9)", TONE.bear.halo, [5, 4],
+        `SL ${live.sl.toFixed(2)}`);
+      const rrTxt = live.rr != null ? ` · RR ${live.rr}` : "";
+      orderLine(yT, "rgba(52,211,153,0.9)", TONE.bull.halo, [5, 4],
+        `TP ${live.tp.toFixed(2)}${rrTxt}`);
+      // the trade words — 3 compact shadowed lines at the setup's head
+      ctx.save();
+      ctx.font = `700 9px ${FONT_FAMILY}`;
+      ctx.shadowColor = TEXT_SHADOW;
+      ctx.shadowBlur = 3;
+      ctx.fillStyle = waiting
+        ? "#e7cd6f"
+        : isBuy ? TONE.bull.text : TONE.bear.text;
+      const headY = Math.max(24, Math.min((yE ?? h / 2) - 34, h - 58));
+      ctx.fillText(
+        `${isBuy ? "▲" : "▼"} ${live.direction} ${waiting ? "WAIT" : "LIVE"} · ${verb} ${live.entry.toFixed(2)} · RR ${live.rr ?? "—"}`,
+        Math.max(8, xS + 6),
+        headY,
+      );
+      ctx.font = `500 8px ${FONT_FAMILY}`;
+      ctx.fillStyle = "#b7bcc6";
+      const note1 = live.entry_note || live.target_note || "";
+      if (note1) {
+        ctx.fillText(
+          note1.length > 72 ? note1.slice(0, 70) + "…" : note1,
+          Math.max(8, xS + 6),
+          headY + 12,
+        );
+      }
+      const ageMin = Math.max(
+        0, Math.round((Date.now() - new Date(live.ts).getTime()) / 60000),
+      );
+      ctx.fillStyle = "#9aa0aa";
+      ctx.fillText(
+        `${live.entry_type === "limit" ? "limit order" : "market entry"} · ${ageMin}m ago · ${live.symbol} ${live.tf}`,
+        Math.max(8, xS + 6),
+        headY + 23,
+      );
+      ctx.restore();
     }
     } catch (err) {
       // D-052 — a drawing failure must NEVER blank the whole chart: log
       // and keep the candles + markers alive.
       console.warn("[PriceChart] overlay draw skipped:", err);
     }
-  }, [drawings, signals, selectedSignal, tf, isSignals]);
+  }, [drawings, signals, tf, isSignals, symbol, candles.length]);
   // D-067 — keep the live-bar redraw hook pointed at the latest
   // drawOverlay (deps change -> the RUNNING badge keeps fresh closures)
   drawRef.current = drawOverlay;
@@ -2160,12 +2297,17 @@ export default function PriceChart({
   }, [drawOverlay]);
 
   /* --------------------------------------------- selected signal lines */
+  // D-074 — the panel-selection inspection lines (axis labels). Skipped
+  // for the LIVE setup itself: that signal's entry/SL/TP are already the
+  // prominent overlay ink — drawing them twice doubles the lines.
   useEffect(() => {
     const series = seriesRef.current;
     if (!series) return;
     priceLinesRef.current.forEach((line) => series.removePriceLine(line));
     priceLinesRef.current = [];
-    if (!selectedSignal) return;
+    if (!selectedSignal || selectedSignal.id === liveSignalRef.current?.id) {
+      return;
+    }
     const mk = (price: number, color: string, title: string) =>
       series.createPriceLine({
         price,
@@ -2180,7 +2322,7 @@ export default function PriceChart({
       mk(selectedSignal.sl, DOWN, "SL"),
       mk(selectedSignal.tp, UP, "TP"),
     ];
-  }, [selectedSignal]);
+  }, [selectedSignal, liveSignal?.id]);
 
   /* ------------------------------------------------------------ overlay */
   const dataApplied = dataKeyRef.current.endsWith("|0") ? false : candles.length > 0;

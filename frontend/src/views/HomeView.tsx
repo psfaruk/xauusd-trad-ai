@@ -10,6 +10,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTick } from "../state/feed";
 import { getAnalysis } from "../lib/api";
+import { sameMarket } from "../lib/liveSetup";
 import ErrorBoundary from "../components/ErrorBoundary";
 import PriceChart from "../components/PriceChart";
 import {
@@ -172,13 +173,16 @@ function HomeChartSection({
     };
   }, [token, symbol]);
 
+  // D-074 — sameMarket: broker-suffixed spellings (XAUUSDm) and the
+  // platform name (XAUUSD) are ONE market — the exact mismatch that
+  // made "নতুন এন্ট্রি সিগন্যাল চার্টে ড্রয়িং করে না" before
   const symbolSignals = useMemo(
-    () => signals.filter((s) => s.symbol === symbol).slice(0, 40),
+    () => signals.filter((s) => sameMarket(s.symbol, symbol)).slice(0, 40),
     [signals, symbol],
   );
   const activeSignal = useMemo(
     () =>
-      signals.find((s) => s.symbol === symbol && s.status === "active") ?? null,
+      signals.find((s) => sameMarket(s.symbol, symbol) && s.status === "active") ?? null,
     [signals, symbol],
   );
 

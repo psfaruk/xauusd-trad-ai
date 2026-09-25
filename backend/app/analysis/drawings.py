@@ -1158,19 +1158,61 @@ def _fib(df: pd.DataFrame | None, pd_state: dict | None) -> dict | None:
     pts = ind.swings(df, 2, 2)
     if len(pts) < 2:
         return None
-    hi_i = int(df["h"].iloc[-90:].idxmax()) if len(df) >= 90 else int(df["h"].idxmax())
-    lo_i = int(df["l"].iloc[-90:].idxmin()) if len(df) >= 90 else int(df["l"].idxmin())
-    leg_up = hi_i > lo_i
-    # anchor on confirmed swings nearest those extremes
-    highs = [p for p in pts if p["kind"] == "high"]
-    lows = [p for p in pts if p["kind"] == "low"]
+    tail = df.iloc[-90:]
+    off = len(df) - len(tail)
+    hi_pos = off + int(tail["h"].values.argmax())
+    lo_pos = off + int(tail["l"].values.argmin())
+    leg_up = hi_pos > lo_pos
+    tail_start = df["time_utc"].iloc[off]
+    # D-074 — anchor the IMPULSE leg (user: "Fibonacci set-up লজিক এ আমার
+    # মনে হচ্ছে এটি সমস্যা আছে"): the leg must run FORWARD in time. The
+    # old code took the most recent confirmed low + high regardless of
+    # order — when the last low printed AFTER the last high (a pullback
+    # in progress) the "leg" ran backwards and the retracement grid
+    # measured the pullback as if it were the impulse. Classic rule now:
+    #   leg up   -> b = the impulse's highest high (the confirmed swing
+    #               when it IS the extreme, else the raw extreme bar —
+    #               a still-unconfirmed impulse top stays the anchor),
+    #               a = the last swing low BEFORE it (else the raw
+    #               lowest bar before)
+    #   leg down -> the mirror
+    # A forward-in-time leg ALWAYS exists because leg_up itself means
+    # the max-high bar prints after the min-low bar.
+    highs = [p for p in pts if p["kind"] == "high" and p["t"] >= tail_start]
+    lows = [p for p in pts if p["kind"] == "low" and p["t"] >= tail_start]
+    b_raw_hi = {"t": df["time_utc"].iloc[hi_pos],
+                "price": float(df["h"].iloc[hi_pos])}
+    b_raw_lo = {"t": df["time_utc"].iloc[lo_pos],
+                "price": float(df["l"].iloc[lo_pos])}
     if leg_up:
-        a = lows[-1] if lows else None
-        b = highs[-1] if highs else None
+        b_swing = max(highs, key=lambda p: float(p["price"])) if highs else None
+        b = b_swing if (b_swing and b_swing["price"] >= b_raw_hi["price"]) \
+            else b_raw_hi
+        prior_lows = [p for p in lows if p["t"] < b["t"]]
+        if prior_lows:
+            a = prior_lows[-1]
+        else:
+            pre = df[df["time_utc"] < b["t"]]
+            if not len(pre):
+                return None
+            a_pos = int(pre["l"].values.argmin())
+            a = {"t": pre["time_utc"].iloc[a_pos],
+                 "price": float(pre["l"].iloc[a_pos])}
     else:
-        a = highs[-1] if highs else None
-        b = lows[-1] if lows else None
-    if a is None or b is None or a["t"] == b["t"]:
+        b_swing = min(lows, key=lambda p: float(p["price"])) if lows else None
+        b = b_swing if (b_swing and b_swing["price"] <= b_raw_lo["price"]) \
+            else b_raw_lo
+        prior_highs = [p for p in highs if p["t"] < b["t"]]
+        if prior_highs:
+            a = prior_highs[-1]
+        else:
+            pre = df[df["time_utc"] < b["t"]]
+            if not len(pre):
+                return None
+            a_pos = int(pre["h"].values.argmax())
+            a = {"t": pre["time_utc"].iloc[a_pos],
+                 "price": float(pre["h"].iloc[a_pos])}
+    if a is None or b is None or a["t"] >= b["t"]:
         return None
     p0, p1 = float(a["price"]), float(b["price"])
     if abs(p1 - p0) <= 1e-9:
@@ -1287,10 +1329,17 @@ def _setup(
     except Exception:  # noqa: BLE001 — the tag is best-effort
         pass
 
-    # triggered? an engine signal for this direction fired recently:
-    # the box then mirrors the FIRED signal's actual levels — the box IS
-    # the trade contract, so after the trigger it shows exactly what the
-    # broker holds (entry/SL/TP of the live order)
+    # D-074 — the box mirrors the NEWEST LIVE signal (status pending or
+    # active), regardless of its direction. The old rule only mirrored a
+    # signal when its direction MATCHED the box's bias direction, and
+    # matched DEAD signals too — so a fresh counter-direction signal
+    # (or one that had already hit SL/TP) left the chart wearing the
+    # previous, stale "entry setup" at a level the market never reached
+    # ("পুরাতন একটি এন্ট্রি সেটাপ দেখায়, মার্কেট প্রাইস ওই পর্যন্ত যায়
+    # নি"). recent_signals arrives newest-first (repo.list order by ts
+    # desc), so the first live hit IS the newest live order — the box
+    # then IS the trade the engine holds. No live signal -> the forming
+    # analysis box as before.
     status = "forming"
     sig_note = None
     for sig in recent_signals or []:
@@ -1301,17 +1350,27 @@ def _setup(
             age = (now - st.to_pydatetime()).total_seconds() / 60.0
         except (TypeError, ValueError):
             continue
-        if 0 <= age <= TRIGGER_WINDOW_MIN and sig.get("direction") == direction:
-            status = "triggered"
-            try:
-                entry = round(float(sig["entry"]), 2)
-                sl = round(float(sig["sl"]), 2)
-                tp = round(float(sig["tp"]), 2)
-                rr = round(float(sig.get("rr") or rr), 2)
-                sig_note = f"order live @ {entry}"
-            except (KeyError, TypeError, ValueError):
-                sig_note = f"entry taken @ {sig.get('entry')}"
-            break
+        if not (0 <= age <= TRIGGER_WINDOW_MIN):
+            continue
+        if sig.get("status") not in ("pending", "active"):
+            continue
+        direction = "BUY" if sig.get("direction") == "BUY" else "SELL"
+        status = "triggered" if sig.get("status") == "active" else "pending"
+        # mirror field-by-field: a partial row (no sl/tp) still mirrors
+        # the levels it carries, everything else keeps the box geometry
+        try:
+            entry = round(float(sig.get("entry", entry)), 2)
+            sl = round(float(sig.get("sl", sl)), 2)
+            tp = round(float(sig.get("tp", tp)), 2)
+            rr = round(float(sig.get("rr") or rr), 2)
+        except (TypeError, ValueError):
+            pass
+        sig_note = (
+            f"order live @ {entry}"
+            if status == "triggered"
+            else f"limit waiting @ {entry}"
+        )
+        break
 
     pd_state_txt = "range"
     if s15 and s15.get("ok"):

@@ -133,13 +133,14 @@ def test_setup_marks_triggered_with_recent_signal():
     price = float(frames["M1"]["c"].iloc[-1])
     recent = [{
         "direction": "BUY",
+        "status": "active",  # D-074 — only LIVE orders mirror
         "entry": price,
         "ts": (datetime.now(UTC) - timedelta(minutes=3)).isoformat(),
     }]
     out = build_drawings(frames, _snaps(frames), price, recent)
     setups = [d for d in out if d["kind"] == "setup"]
     assert setups and setups[0]["status"] == "triggered"
-    assert "entry taken" in setups[0]["note"].lower()
+    assert "order live" in setups[0]["note"].lower()
 
 
 def test_old_signal_does_not_mark_triggered():

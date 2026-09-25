@@ -331,6 +331,7 @@ def test_setup_box_mirrors_fired_signal_levels() -> None:
     now = datetime(2026, 9, 22, 14, 30, tzinfo=UTC)
     recent = [{
         "direction": "BUY",
+        "status": "active",  # D-074 — only LIVE orders mirror
         "entry": 4301.9,
         "sl": 4300.5,
         "tp": 4303.5,

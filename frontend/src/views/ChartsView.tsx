@@ -13,6 +13,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTick } from "../state/feed";
 import { getAnalysis } from "../lib/api";
+import { sameMarket } from "../lib/liveSetup";
 import {
   type AnalysisResponse,
   type Candle,
@@ -81,8 +82,10 @@ export default function ChartsView({
     };
   }, [token, symbol]);
 
+  // D-074 — sameMarket: a suffixed symbol spelling (XAUUSDm vs XAUUSD)
+  // must never hide this pair's signals from the panel again
   const symbolSignals = useMemo(
-    () => signals.filter((s) => s.symbol === symbol),
+    () => signals.filter((s) => sameMarket(s.symbol, symbol)),
     [signals, symbol],
   );
   const chartSignals = useMemo(
@@ -179,7 +182,11 @@ export default function ChartsView({
                 candles={candles}
                 candlesLoading={candlesLoading}
                 signals={chartSignals}
-                selectedSignal={selected?.status === "active" ? selected : null}
+                /* D-074 — inspection lines for an EXPLICIT row pick (any
+                 * status — pending/active/won/lost); the default (no
+                 * pick) draws nothing extra: the live setup ink already
+                 * IS the current trade on the canvas */
+                selectedSignal={selectedId ? selected : null}
                 market={market}
                 wsConnected={wsState === "open"}
                 onDesync={onDesync}

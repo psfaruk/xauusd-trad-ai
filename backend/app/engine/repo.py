@@ -115,6 +115,16 @@ class SignalRepo:
                 logger.warning("signal status persist failed: %s", exc)
 
     async def list(self, limit: int = 100, status: str | None = None) -> list[dict]:
+        # D-074 — read-side heal: rows persisted before the identity
+        # normalization carry broker spellings ("XAUUSDm"); every consumer
+        # (chart, signals panel, analysis mirror) is platform-keyed.
+        from app.mt5.base import market_key
+
+        def _heal(d: dict) -> dict:
+            if d.get("symbol"):
+                d["symbol"] = market_key(str(d["symbol"]))
+            return d
+
         if self._db is not None:
             try:
                 from sqlalchemy import text
@@ -140,13 +150,14 @@ class SignalRepo:
                     for k in ("ts", "created_at", "closed_at"):
                         if d.get(k) is not None:
                             d[k] = d[k].isoformat()
-                    out.append(d)
+                    out.append(_heal(d))
                 return out
             except Exception as exc:  # noqa: BLE001
                 logger.warning("signal list fell back to memory: %s", exc)
         async with self._lock:
             rows = [r for r in self._mem if status is None or r["status"] == status]
-            return list(reversed(rows[-limit:]))
+            # copies: a read must never mutate the store
+            return [_heal(dict(r)) for r in reversed(rows[-limit:])]
 
     async def get(self, signal_id: str) -> dict | None:
         rows = await self.list(limit=1000)
