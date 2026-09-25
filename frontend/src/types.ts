@@ -1469,6 +1469,30 @@ export interface PathDrawing {
   tone: DrawingTone;
 }
 
+/** D-072 — the classic chart-pattern drawing in the studied YouTube
+ *  channel's style (@easytradingeasy): numbered swing points, thin
+ *  geometry lines, light pattern shading, ENTRY circle + red dashed
+ *  SL line + TARGET band + breakout arrow (measured-move plan). */
+export interface PatternDrawing {
+  kind: "pattern";
+  name: string;
+  family: string;
+  dir: "up" | "down";
+  state: "forming" | "confirmed";
+  points: { t: string | null; price: number; n: number; kind: "high" | "low" }[];
+  lines: { t1: string | null; p1: number; t2: string | null; p2: number; dash: boolean }[];
+  zone: { t: string | null; lo: number; hi: number } | null;
+  entry: { price: number; t: string | null };
+  sl: number;
+  target: number;
+  target_zone: { lo: number; hi: number };
+  height_atr: number | null;
+  rr: number | null;
+  label: string;
+  note?: string | null;
+  tone: DrawingTone;
+}
+
 export type ChartDrawing =
   | HLineDrawing
   | ZoneDrawing
@@ -1491,4 +1515,5 @@ export type ChartDrawing =
   | RejectDrawing
   | LiqDrawing
   | OutlookDrawing
-  | PathDrawing;
+  | PathDrawing
+  | PatternDrawing;

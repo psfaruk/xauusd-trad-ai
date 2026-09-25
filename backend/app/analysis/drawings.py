@@ -1464,4 +1464,18 @@ def _build(
         if path is not None:
             out.append(path)
 
+    # 17. D-072 — the CLASSIC CHART-PATTERN layer in the studied
+    #     YouTube channel's style (youtube.com/@easytradingeasy — 48
+    #     shorts: numbered swing points 1..N, thin geometry lines,
+    #     light pattern shading, ENTRY circle + red SL line + TARGET
+    #     band + breakout arrow; measured-move trade plan). Detects
+    #     double/triple tops-bottoms, H&S + inverse, flags, pennants,
+    #     triangles, wedges, rectangles on the ACTIVE TF window.
+    try:
+        from app.analysis.patterns import detect_patterns
+
+        out.extend(detect_patterns(base, atr, price, DRAW_WINDOW_BARS))
+    except Exception:  # noqa: BLE001 — patterns must never break drawings
+        logger.exception("pattern marks failed")
+
     return [d for d in out if d is not None][:MAX_DRAWINGS]

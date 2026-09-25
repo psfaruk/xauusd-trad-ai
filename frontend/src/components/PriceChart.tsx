@@ -115,7 +115,7 @@ function isFaded(d: { state?: "active" | "faded"; broken?: boolean; label?: stri
   return Boolean(d.broken) || Boolean(d.label?.includes("· tested"));
 }
 
-type LayerKey = "setup" | "zones" | "levels" | "structure" | "fib" | "whales" | "momentum" | "flow" | "liquidity";
+type LayerKey = "setup" | "zones" | "levels" | "structure" | "fib" | "whales" | "momentum" | "flow" | "liquidity" | "patterns";
 
 /** One row of the external MARKS legend (outside the chart canvas). */
 export interface LegendMark {
@@ -369,6 +369,20 @@ function buildLegend(drawings: ChartDrawing[], tf: string): LegendMark[] {
           layer: "liquidity",
         });
         break;
+      // D-072 — the classic chart-pattern entry joins the legend
+      case "pattern":
+        marks.push({
+          key,
+          swatch: TONE[d.tone].text,
+          short: d.name,
+          detail: d.state === "confirmed"
+            ? `CONFIRMED ${d.dir === "up" ? "↑" : "↓"}${d.rr != null ? ` · RR ${d.rr}` : ""}`
+            : `forming · ${d.height_atr ?? "?"}A`,
+          text: `${d.label} — ${d.note ?? ""}`,
+          faded: false,
+          layer: "patterns",
+        });
+        break;
     }
   });
   return marks;
@@ -480,6 +494,7 @@ export default function PriceChart({
     momentum: true, // D-058 — EMA 9/21/50 momentum ribbon
     flow: true, // D-067 — the candle battle badge + running candle
     liquidity: true, // D-071 — pool life-cycle + DIRECTION outlook + path
+    patterns: true, // D-072 — classic chart patterns (channel-style)
   });
   const layersRef = useRef(layers);
   layersRef.current = layers;
@@ -1567,6 +1582,158 @@ export default function PriceChart({
       }
     }
 
+    /* --------------------------------- D-072 — classic chart patterns */
+    /* The studied channel's recipe (youtube.com/@easytradingeasy):
+     * numbered swing circles 1..N, thin solid geometry lines, a whisper
+     * pattern shading, ENTRY ring + red dashed SL + TARGET band, and a
+     * breakout arrow when the trigger level closed through. */
+    if (L.patterns && !isSignals) {
+      for (const d of drawings) {
+        if (d.kind !== "pattern") continue;
+        const t = TONE[d.tone];
+        const gold = TONE.gold;
+        // pattern body shading (whisper — candles stay loud)
+        if (d.zone) {
+          const yA = yOf(d.zone.hi);
+          const yB = yOf(d.zone.lo);
+          if (yA != null && yB != null && Math.abs(yB - yA) > 1) {
+            const xRaw = d.zone.t ? xOf(d.zone.t) : null;
+            const x1 = xRaw == null ? -2 : Math.max(-2, xRaw);
+            if (x1 <= rightEdge) {
+              ctx.fillStyle = t.fill;
+              ctx.fillRect(x1, Math.min(yA, yB), rightEdge - x1, Math.abs(yB - yA));
+            }
+          }
+        }
+        // geometry lines — thin hard cores, dashed for necklines
+        for (const ln of d.lines) {
+          const s = segment(ln.t1, ln.p1, ln.t2, ln.p2);
+          if (!s) continue;
+          hardSeg(s.x1, s.y1, s.x2, s.y2, t.line, t.halo, 0.7,
+            ln.dash ? [4, 3] : []);
+        }
+        // numbered swing circles (the channel's 1..N structure walk)
+        ctx.save();
+        for (const p of d.points) {
+          if (!p.t) continue;
+          const x = xOf(p.t);
+          const y = yOf(p.price);
+          if (x == null || y == null || x < -6 || x > rightEdge + 6) continue;
+          const cy = p.kind === "high" ? y - 10 : y + 10;
+          ctx.beginPath();
+          ctx.arc(x, cy, 5.5, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(13,17,23,0.82)";
+          ctx.fill();
+          ctx.strokeStyle = t.line;
+          ctx.lineWidth = 0.8;
+          ctx.stroke();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.fillStyle = t.text;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 2;
+          ctx.fillText(String(p.n), x, cy + 0.5);
+          ctx.shadowBlur = 0;
+        }
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+        ctx.restore();
+        // tag placement (channel style): ENTRY/SL words sit NEXT TO THE
+        // PATTERN (at the breakout candle), not at the right edge — the
+        // right-edge strip belongs to the liquidity/level rightTags, so
+        // the pattern words never stack on them. TARGET keeps the far
+        // edge but BELOW its line (level tags sit above theirs).
+        const headP = d.points[d.points.length - 1];
+        const xH = headP?.t ? xOf(headP.t) : null;
+        const xAnchor = Math.min(
+          (d.entry.t ? xOf(d.entry.t) : xH) ?? rightEdge - 84,
+          rightEdge - 84,
+        ) + 8;
+        // ENTRY — gold ring at the trigger candle + dashed level line
+        const yE = yOf(d.entry.price);
+        if (yE != null && yE > -5 && yE < h + 5) {
+          ctx.strokeStyle = gold.line;
+          ctx.lineWidth = 0.65;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          const xE0 = d.entry.t ? xOf(d.entry.t) : null;
+          ctx.moveTo(Math.max(0, xE0 ?? 0), Math.round(yE) + 0.5);
+          ctx.lineTo(rightEdge, Math.round(yE) + 0.5);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          if (xE0 != null && xE0 >= -4 && xE0 <= rightEdge) {
+            ctx.beginPath();
+            ctx.arc(xE0 + 2, yE, 5, 0, Math.PI * 2);
+            ctx.strokeStyle = gold.line;
+            ctx.lineWidth = 1.1;
+            ctx.stroke();
+          }
+          tag("ENTRY " + d.entry.price.toFixed(2), xAnchor,
+            d.dir === "up" ? yE + 11 : yE - 4, "gold", 9);
+        }
+        // STOP-LOSS — thin red dashed line + SL tag
+        const yS = yOf(d.sl);
+        if (yS != null && yS > -5 && yS < h + 5) {
+          ctx.strokeStyle = "rgba(248,113,113,0.75)";
+          ctx.lineWidth = 0.55;
+          ctx.setLineDash([2.5, 3.5]);
+          ctx.beginPath();
+          ctx.moveTo(0, Math.round(yS) + 0.5);
+          ctx.lineTo(rightEdge, Math.round(yS) + 0.5);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          tag("SL " + d.sl.toFixed(2), xAnchor, yS + 12, "bear", 9);
+        }
+        // TARGET — whisper gold band + dashed far edge + TARGET tag
+        const yT1 = yOf(d.target_zone.hi);
+        const yT2 = yOf(d.target_zone.lo);
+        if (yT1 != null && yT2 != null && Math.abs(yT2 - yT1) > 0.5) {
+          ctx.fillStyle = "rgba(212,175,55,0.05)";
+          ctx.fillRect(rightEdge - 64, Math.min(yT1, yT2), 64, Math.abs(yT2 - yT1));
+          ctx.strokeStyle = gold.line;
+          ctx.lineWidth = 0.55;
+          ctx.setLineDash([2, 3]);
+          ctx.beginPath();
+          const yT = yOf(d.target);
+          if (yT != null) {
+            ctx.moveTo(0, Math.round(yT) + 0.5);
+            ctx.lineTo(rightEdge, Math.round(yT) + 0.5);
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+          if (yT != null) {
+            tag("TARGET " + d.target.toFixed(2), rightEdge - 78,
+              d.dir === "up" ? yT + 11 : yT - 3, "gold", 9);
+          }
+        }
+        // the breakout arrow + state word at the pattern head
+        if (d.state === "confirmed") {
+          const xB = d.entry.t ? xOf(d.entry.t) : xH;
+          if (xB != null && xB >= -4 && xB <= rightEdge) {
+            arrow(xB + 10, yE != null ? yE + (d.dir === "up" ? -18 : 18) : h / 2,
+              d.dir, t.line, t.halo);
+          }
+        }
+        // pattern name + state — small direct words, no box
+        if (xH != null && xH >= 0 && xH <= rightEdge) {
+          ctx.save();
+          ctx.font = `700 9px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = t.text;
+          ctx.fillText(d.name, xH + 6, (yOf(d.zone ? d.zone.hi : headP.price) ?? h / 2) - 6);
+          ctx.font = `600 8px ${FONT_FAMILY}`;
+          ctx.fillStyle = d.state === "confirmed" ? t.text : "#9aa0aa";
+          ctx.fillText(
+            d.state === "confirmed" ? (d.dir === "up" ? "▲ CONFIRMED" : "▼ CONFIRMED") : "FORMING",
+            xH + 6, (yOf(d.zone ? d.zone.hi : headP.price) ?? h / 2) + 4,
+          );
+          ctx.restore();
+        }
+      }
+    }
+
     /* ---------------------------------------------- horizontal levels */
     if (L.levels) {
       for (const d of drawings) {
@@ -1946,6 +2113,7 @@ export default function PriceChart({
   const layerChips: { key: LayerKey; label: string }[] = [
     { key: "setup", label: "Setup" },
     { key: "liquidity", label: "Liquidity" },
+    { key: "patterns", label: "Patterns" },
     { key: "zones", label: "Zones" },
     { key: "levels", label: "Levels" },
     { key: "structure", label: "Structure" },
