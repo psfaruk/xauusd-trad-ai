@@ -357,6 +357,7 @@ export default function Dashboard() {
                 wsConnected={wsState === "open"}
                 onDesync={onDesync}
                 token={token ?? ""}
+                isAdmin={isAdmin}
               />
             )}
             {activeTab === "charts" && (

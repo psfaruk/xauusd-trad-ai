@@ -65,8 +65,10 @@ DRAW_WINDOW_BARS = 150
 SETUP_NEAR_ATR = 0.75
 #: a setup drawing expires once its zone origin is older than this
 SETUP_MAX_AGE_MIN = 240
-#: recent-signal window marking a forming setup as triggered
-TRIGGER_WINDOW_MIN = 25
+# D-075 — TRIGGER_WINDOW_MIN (the forming->triggered wall-clock window) is
+# RETIRED: the setup drawing is a pure live-signal mirror now — the order's
+# STATUS (pending/active/won/lost/expired/cancelled) decides everything,
+# never the age of the signal.
 
 FIB_RATIOS = (0.236, 0.382, 0.5, 0.618, 0.786)
 
@@ -1245,18 +1247,28 @@ def _setup(
     now: datetime,
     recent_signals: list[dict],
 ) -> dict | None:
-    """The entry-setup drawing — the professional 'I'd take this trade' box.
+    """The entry-setup drawing — a MIRROR of the newest LIVE signal only.
 
-    Fires only when a real confluence exists: MTF bias + price sitting in /
-    near a supporting zone (demand/OB/FVG/OTE). That is exactly the user's
-    directive — draw WHEN a good setup appears, not always.
+    D-075 (user directive, Bengali): "আমি দেখতে পাচ্ছি এই পুরোনো সেটাপ টি
+    হোম পেজ এর চার্ট, প্লিজ এটা মুছে দেন … নতুন কোনো এন্ট্রি সিগন্যাল আসলে
+    তখন মুছে যাবে। আর যদি সে সেটাপ এর sl TP হিট হয়, তখন মুছে যাবে" — the
+    chart's entry-setup drawing is THE SIGNAL and nothing else, so this
+    builder returns a drawing ONLY while a pending/active order exists:
 
-    D-057: the ENTRY/SL/TP geometry comes from the SHARED module
-    (app.analysis.setup_geometry) — the exact same numbers the signal
-    engine places its order at, so the box the user watches IS the trade
-    the broker receives. Once a signal fires, the box mirrors the
-    signal's actual levels verbatim ("সিগন্যাল গুলো এই ড্রয়িং ফলো করে
-    আসবে ... SL TP ENTRY সব কিছু এই চার্ট ফলো করে হবে").
+    - no live signal -> None (no drawing — the old "forming" prediction
+      box at a level the market never reached is DELETED, canvas and
+      legend alike);
+    - a pending/active signal -> the box mirrors that order's exact
+      levels, regardless of its direction, for as long as the ORDER
+      lives (status-driven, no wall-clock age cap — the engine's tracker
+      flips status on fill/expiry/TP/SL and the drawing follows);
+    - dead signals (won/lost/expired/cancelled) never mirror.
+
+    D-057: the geometry seed still comes from the SHARED module
+    (app.analysis.setup_geometry) — the same numbers the signal engine
+    places its order at — and the live signal overwrites every level
+    verbatim, so the box the user watches IS the trade the broker
+    holds.
     """
     m1, m5 = frames.get("M1"), frames.get("M5")
     s1, s5, s15 = snaps.get("M1"), snaps.get("M5"), snaps.get("M15")
@@ -1268,31 +1280,68 @@ def _setup(
     if atr5 <= 0:
         return None
 
-    b = bias.get("bias")
-    s15_trend = (s15 or {}).get("structure", {}).get("trend") if s15 else None
-    if b == "bullish":
-        direction = "BUY"
-    elif b == "bearish":
-        direction = "SELL"
-    elif s15_trend in ("bullish", "bearish"):
-        direction = "BUY" if s15_trend == "bullish" else "SELL"
-    else:
+    # D-075 — the mirror pick FIRST: no live order -> NO setup drawing at
+    # all (the forming box is retired). recent_signals arrives newest-first
+    # (repo.list order by ts desc), so the first live hit IS the newest
+    # live order. Age is NOT a filter — the order's STATUS decides.
+    sig = None
+    for cand in recent_signals or []:
+        if cand.get("status") not in ("pending", "active"):
+            continue
+        try:
+            st = pd.Timestamp(cand.get("ts"))
+            if st.tzinfo is None:
+                st = st.tz_localize("UTC")
+            if st.to_pydatetime() > now:
+                continue  # clock-skew guard — future rows never mirror
+        except (TypeError, ValueError):
+            continue
+        sig = cand
+        break
+    if sig is None:
         return None
+    direction = "BUY" if sig.get("direction") == "BUY" else "SELL"
 
     # D-058 — EXACT window parity with the engine's _drawing_geometry():
     # both sides build their M5/M15 snapshots through setup_snapshot()
     # (GEOMETRY_BARS windows == services/analysis.py BARS_PER_TF), so the
     # box the user watches is numerically identical to the order the
     # broker receives — no 240-vs-GEOMETRY window drift ever again.
+    # The geometry SEED tries the signal's own direction first; when a
+    # counter-bias signal has no zone of its own, the bias side seeds
+    # the zone box (D-074 semantics — the mirrored levels are the trade,
+    # the zone is just the analysis context around it).
     s5_geo = setup_snapshot(m5, "M5")
     s15_geo = setup_snapshot(frames.get("M15"), "M15")
     geo = setup_geometry(s5_geo, s15_geo, direction, price, atr_fallback=atr5)
+    if geo is None:
+        b = bias.get("bias")
+        s15_trend = (s15 or {}).get("structure", {}).get("trend") if s15 else None
+        if b == "bullish":
+            seed_dir: str | None = "BUY"
+        elif b == "bearish":
+            seed_dir = "SELL"
+        elif s15_trend in ("bullish", "bearish"):
+            seed_dir = "BUY" if s15_trend == "bullish" else "SELL"
+        else:
+            seed_dir = None
+        if seed_dir is not None:
+            geo = setup_geometry(s5_geo, s15_geo, seed_dir, price, atr_fallback=atr5)
     if geo is None:
         return None
     tag, lo, hi, t0 = geo["tag"], geo["lo"], geo["hi"], geo["t0"]
     entry, sl, tp, rr = geo["entry"], geo["sl"], geo["tp"], geo["rr"]
     if t0 is not None and _age_min(t0, now) > SETUP_MAX_AGE_MIN:
         t0 = m1["time_utc"].iloc[-1]
+    # D-075 — the box anchors on the LIVE SIGNAL's own birth time (the
+    # drawing starts where the order was born, exactly like the canvas)
+    try:
+        sig_t = pd.Timestamp(sig.get("ts"))
+        if sig_t.tzinfo is None:
+            sig_t = sig_t.tz_localize("UTC")
+        t0 = sig_t.to_pydatetime()
+    except (TypeError, ValueError):
+        pass
 
     # confluence factor tags (the "why" the trader writes on the chart)
     factors: list[str] = [tag]
@@ -1329,48 +1378,22 @@ def _setup(
     except Exception:  # noqa: BLE001 — the tag is best-effort
         pass
 
-    # D-074 — the box mirrors the NEWEST LIVE signal (status pending or
-    # active), regardless of its direction. The old rule only mirrored a
-    # signal when its direction MATCHED the box's bias direction, and
-    # matched DEAD signals too — so a fresh counter-direction signal
-    # (or one that had already hit SL/TP) left the chart wearing the
-    # previous, stale "entry setup" at a level the market never reached
-    # ("পুরাতন একটি এন্ট্রি সেটাপ দেখায়, মার্কেট প্রাইস ওই পর্যন্ত যায়
-    # নি"). recent_signals arrives newest-first (repo.list order by ts
-    # desc), so the first live hit IS the newest live order — the box
-    # then IS the trade the engine holds. No live signal -> the forming
-    # analysis box as before.
-    status = "forming"
-    sig_note = None
-    for sig in recent_signals or []:
-        try:
-            st = pd.Timestamp(sig.get("ts"))
-            if st.tzinfo is None:
-                st = st.tz_localize("UTC")
-            age = (now - st.to_pydatetime()).total_seconds() / 60.0
-        except (TypeError, ValueError):
-            continue
-        if not (0 <= age <= TRIGGER_WINDOW_MIN):
-            continue
-        if sig.get("status") not in ("pending", "active"):
-            continue
-        direction = "BUY" if sig.get("direction") == "BUY" else "SELL"
-        status = "triggered" if sig.get("status") == "active" else "pending"
-        # mirror field-by-field: a partial row (no sl/tp) still mirrors
-        # the levels it carries, everything else keeps the box geometry
-        try:
-            entry = round(float(sig.get("entry", entry)), 2)
-            sl = round(float(sig.get("sl", sl)), 2)
-            tp = round(float(sig.get("tp", tp)), 2)
-            rr = round(float(sig.get("rr") or rr), 2)
-        except (TypeError, ValueError):
-            pass
-        sig_note = (
-            f"order live @ {entry}"
-            if status == "triggered"
-            else f"limit waiting @ {entry}"
-        )
-        break
+    # D-075 — the mirror: this signal's levels, verbatim. A partial row
+    # (no sl/tp) still mirrors the levels it carries; everything else
+    # keeps the geometry seed.
+    status = "triggered" if sig.get("status") == "active" else "pending"
+    try:
+        entry = round(float(sig.get("entry", entry)), 2)
+        sl = round(float(sig.get("sl", sl)), 2)
+        tp = round(float(sig.get("tp", tp)), 2)
+        rr = round(float(sig.get("rr") or rr), 2)
+    except (TypeError, ValueError):
+        pass
+    sig_note = (
+        f"order live @ {entry}"
+        if status == "triggered"
+        else f"limit waiting @ {entry}"
+    )
 
     pd_state_txt = "range"
     if s15 and s15.get("ok"):

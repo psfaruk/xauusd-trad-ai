@@ -98,30 +98,44 @@ def _m5_demand_supply_around(price: float) -> pd.DataFrame:
     return _mk(rows)
 
 
-def test_setup_drawing_on_bullish_ict_tape():
+def test_setup_drawing_only_with_live_signal():
+    """D-075 — the setup drawing is a LIVE-SIGNAL mirror: no live order
+    -> NO setup drawing at all (the forming prediction box is deleted
+    from the contract); a live order -> the box mirrors its levels."""
     frames = _frames()
-    # D-057 — the M5 must draw BOTH the entry zone and a TP target
     frames["M5"] = _m5_demand_supply_around(float(frames["M1"]["c"].iloc[-1]))
     price = float(frames["M1"]["c"].iloc[-1])
+    # no live signal: the forming box must NOT draw
     out = build_drawings(frames, _snaps(frames), price, [])
-    # D-058 — the momentum ribbon / swing labels / session bands joined
-    # the sheet; the cap is 42, this fixture lands ~30
-    # D-071 — the liquidity set (up to 5 pool marks + outlook + path)
-    # joined: the fixture lands ~38
-    assert len(out) <= 42
     setups = [d for d in out if d["kind"] == "setup"]
-    assert len(setups) == 1
-    s = setups[0]
+    assert setups == []
+    # a live pending order: the box mirrors it
+    recent = [{
+        "direction": "BUY",
+        "status": "pending",
+        "entry": price,
+        "sl": price - 1.2,
+        "tp": price + 2.4,
+        "rr": 2.0,
+        "ts": (datetime.now(UTC) - timedelta(minutes=2)).isoformat(),
+    }]
+    out2 = build_drawings(frames, _snaps(frames), price, recent)
+    # D-058/D-071 caps still hold
+    assert len(out2) <= 42
+    setups2 = [d for d in out2 if d["kind"] == "setup"]
+    assert len(setups2) == 1
+    s = setups2[0]
     assert s["dir"] == "BUY"
     assert s["zone"][0] < s["zone"][1]
-    assert s["sl"] < s["zone"][0]          # SL below the zone (app-controlled)
-    assert s["tp"] > s["entry"]            # TP above entry for a BUY
-    assert s["rr"] > 0
-    assert s["status"] == "forming"
+    assert s["entry"] == price
+    assert s["sl"] == round(price - 1.2, 2)   # the order's exact levels
+    assert s["tp"] == round(price + 2.4, 2)
+    assert s["rr"] == 2.0
+    assert s["status"] == "pending"
     assert s["factors"], "setup must carry its confluence notes"
     assert isinstance(s["t0"], str) and "T" in s["t0"]  # ISO time
     # every drawing with a time field carries an ISO string
-    for d in out:
+    for d in out2:
         for k in ("t0", "t1", "t", "t2"):
             if d.get(k) is not None:
                 assert isinstance(d[k], str)
@@ -153,7 +167,8 @@ def test_old_signal_does_not_mark_triggered():
     }]
     out = build_drawings(frames, _snaps(frames), price, stale)
     setups = [d for d in out if d["kind"] == "setup"]
-    assert not setups or setups[0]["status"] == "forming"
+    # D-075 — no status (or dead) -> no live order -> NO setup drawing
+    assert not setups
 
 
 def test_drawings_never_crash_on_thin_data():
@@ -247,16 +262,24 @@ def test_d058_setup_geometry_parity_with_engine_windows():
     frames = _frames()
     frames["M5"] = _m5_demand_supply_around(float(frames["M1"]["c"].iloc[-1]))
     price = float(frames["M1"]["c"].iloc[-1])
-    out = build_drawings(frames, _snaps(frames), price, [])
-    setups = [d for d in out if d["kind"] == "setup"]
-    assert setups, "fixture must yield a setup box"
-    s = setups[0]
-    # the engine's own snapshot build must produce the identical numbers
+    # the engine books orders at the geometry's own entry (D-057: the
+    # box the user watches IS the trade the broker receives), so the
+    # mirrored entry equals the geometry entry and parity is assertable
     s5 = setup_snapshot(frames.get("M5"), "M5")
     s15 = setup_snapshot(frames.get("M15"), "M15")
     from app.analysis.setup_geometry import setup_geometry
-    geo = setup_geometry(s5, s15, s["dir"], price)
+    geo = setup_geometry(s5, s15, "BUY", price)
     assert geo is not None
+    recent = [{
+        "direction": "BUY",
+        "status": "active",
+        "entry": geo["entry"],
+        "ts": (datetime.now(UTC) - timedelta(minutes=2)).isoformat(),
+    }]
+    out = build_drawings(frames, _snaps(frames), price, recent)
+    setups = [d for d in out if d["kind"] == "setup"]
+    assert setups, "fixture must yield a setup box"
+    s = setups[0]
     assert (geo["entry"], geo["sl"], geo["tp"]) == (s["entry"], s["sl"], s["tp"])
 
 

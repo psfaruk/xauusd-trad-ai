@@ -49,6 +49,10 @@ interface Props {
   wsConnected: boolean;
   onDesync: () => void;
   token: string;
+  /** D-075 — separate user interfaces: the ADMIN's account card shows
+   * the INSTITUTION Exness terminal account (their real trading
+   * account); regular users keep their own practice plane. */
+  isAdmin: boolean;
 }
 
 function PriceHero({
@@ -195,7 +199,7 @@ function HomeChartSection({
        * whales, momentum ribbon, sessions, setup, signals); its header
        * row holds the TF dropdown + marks dropdown + fullscreen (D-058) */}
       <div
-        className="h-[52vh] min-h-[320px] lg:h-[calc(100vh-8.5rem)]"
+        className="h-[52vh] min-h-[300px] sm:min-h-[320px] md:h-[60vh] lg:h-[calc(100vh-8.5rem)]"
       >
         <ErrorBoundary label="Home chart">
           <PriceChart
@@ -239,6 +243,7 @@ export default function HomeView({
   wsConnected,
   onDesync,
   token,
+  isAdmin,
 }: Props) {
   const tick = useTick(symbol);
   const market = mt5?.feed?.symbols?.[symbol]?.market ?? "unknown";
@@ -248,6 +253,34 @@ export default function HomeView({
   const brokerLinked = broker?.status === "connected" || broker?.status === "linked";
   const winRate = stats?.win_rate;
   const expectancy = stats?.expectancy;
+
+  /* D-075 — separate user interfaces, honest status everywhere:
+   * the ADMIN's account card is the INSTITUTION Exness terminal
+   * account (the account the auto-trader actually books orders on —
+   * "Fronted এ exness not connected দেখাচ্ছে, কিন্তু অটো সিগন্যাল এন্ট্রি
+   * হচ্ছে" ended exactly here: the admin watched a practice-plane card
+   * while real entries flowed on the terminal). Regular users keep
+   * their own isolated practice plane — total separation. */
+  const adminTerminalUp =
+    mt5?.status === "connected" || broker?.status === "connected";
+  const adminAcct = isAdmin ? mt5?.account ?? null : null;
+  const shownBalance = isAdmin
+    ? adminAcct?.balance ?? broker?.account?.balance ?? null
+    : account?.balance ?? null;
+  const shownEquity = isAdmin
+    ? adminAcct?.equity ?? broker?.account?.equity ?? null
+    : account?.equity ?? null;
+  const shownCurrency = isAdmin
+    ? adminAcct?.currency ?? broker?.account?.currency ?? "USD"
+    : account?.currency ?? "USD";
+  const acctConnected = isAdmin ? adminTerminalUp : tradingAccount?.connected;
+  const acctFootnote = isAdmin
+    ? brokerLinked
+      ? `Exness terminal · ${broker?.login_masked ?? broker?.login ?? adminAcct?.login ?? "—"} @ ${broker?.server ?? adminAcct?.server ?? "—"}`
+      : "Institution terminal · link your Exness account in Settings"
+    : brokerLinked
+      ? `Broker linked · ${broker?.login_masked ?? broker?.server ?? "—"}`
+      : "Practice account · link your broker in Settings";
 
   return (
     <div className="flex min-w-0 flex-col gap-3">
@@ -345,14 +378,16 @@ export default function HomeView({
 
           <LatestSignalCard signal={latest} onOpen={() => latest && onOpenSignal(latest.id)} />
 
-          {/* the user's own trading account (D-044 — isolated practice plane) */}
+          {/* the user's trading account — D-044 isolated practice plane
+              (regular users); D-075: the ADMIN sees the institution
+              Exness terminal account (their real trading account) */}
           <Card>
             <SectionTitle
-              title="Your Trading Account"
+              title={isAdmin ? "Exness Trading Account" : "Your Trading Account"}
               right={
-                tradingAccount?.connected ? (
+                acctConnected ? (
                   <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400">
-                    <Dot tone="green" /> active
+                    <Dot tone="green" /> {isAdmin ? "exness connected" : "active"}
                   </span>
                 ) : (
                   <span className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-400">
@@ -364,25 +399,23 @@ export default function HomeView({
             <div className="grid grid-cols-2 gap-2">
               <Stat
                 label="Balance"
-                value={account?.balance != null ? account.balance.toFixed(2) : "—"}
-                loading={tradingAccount === null}
-                hint={account?.currency ?? "USD"}
+                value={shownBalance != null ? shownBalance.toFixed(2) : "—"}
+                loading={tradingAccount === null && !isAdmin}
+                hint={shownCurrency}
               />
               <Stat
                 label="Equity"
-                value={account?.equity != null ? account.equity.toFixed(2) : "—"}
-                loading={tradingAccount === null}
+                value={shownEquity != null ? shownEquity.toFixed(2) : "—"}
+                loading={tradingAccount === null && !isAdmin}
                 tone={
-                  account?.balance != null && account?.equity != null
-                    ? account.equity >= account.balance ? "up" : "down"
+                  shownBalance != null && shownEquity != null
+                    ? shownEquity >= shownBalance ? "up" : "down"
                     : "default"
                 }
               />
             </div>
             <p className="mt-2.5 truncate text-[10px] text-zinc-500">
-              {brokerLinked
-                ? `Broker linked · ${broker?.login_masked ?? broker?.server ?? "—"}`
-                : "Practice account · link your broker in Settings"}
+              {acctFootnote}
             </p>
             <div className="mt-3">
               <Btn variant="gold" onClick={onOpenAi} className="w-full">

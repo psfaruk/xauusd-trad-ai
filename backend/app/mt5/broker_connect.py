@@ -30,6 +30,7 @@ import asyncio
 import logging
 import time as time_mod
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger("xauusd.broker")
@@ -37,7 +38,14 @@ logger = logging.getLogger("xauusd.broker")
 
 @dataclass
 class BrokerConnection:
-    """One user's active broker connection (in-memory state)."""
+    """One user's active broker connection (in-memory state).
+
+    `admin_verified` — D-075: the link was verified against the LIVE
+    institution terminal (the admin bind). True means status() may probe
+    the terminal for the account snapshot; False is a public user's
+    broker-link profile which must NEVER touch institution data.
+    Restored-from-DB connections carry the persisted flag.
+    """
 
     user_id: str
     login: str
@@ -46,6 +54,8 @@ class BrokerConnection:
     last_seen: float = field(default_factory=time_mod.time)
     # last verified account snapshot (from the terminal MCP)
     account: dict[str, Any] = field(default_factory=dict)
+    # D-075 — restored/persisted admin-verified bind flag
+    admin_verified: bool = False
 
 
 class NotConnectedError(RuntimeError):
@@ -81,6 +91,70 @@ class BrokerConnectionService:
         self._demo = bool(demo_mode)
         self._connections: dict[str, BrokerConnection] = {}
         self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------ restore
+    async def restore(self) -> int:
+        """D-075 — rebuild the in-memory broker links from the DB at boot.
+
+        The bug this kills (user report, Bengali): "Fronted এ exness not
+        connected দেখাচ্ছে, কিন্তু অটো সিগন্যাল এন্ট্রি হচ্ছে" — the MT5
+        terminal bridge survives server restarts (it is the terminal app
+        on the host) and the auto-trader restores its armed state, so
+        orders kept flowing while every per-user broker link read
+        "disconnected" until the user re-linked by hand: the links lived
+        ONLY in memory, the persisted rows were never read back.
+
+        Restored admin-verified links (broker_admin=true) probe the
+        terminal on the next status() call — reachable => "connected"
+        with the live account snapshot, unreachable => "reconnecting"
+        (honest). Public broker-links come back as "linked" and never
+        touch institution data (D-044 isolation preserved). Rows whose
+        status was set 'disconnected' by an explicit unlink are skipped.
+        """
+        if self._db is None:
+            return 0
+
+        def _run() -> list[dict]:
+            import sqlalchemy as sa  # local: tests run without it
+
+            with self._db.begin() as cx:
+                rows = cx.execute(sa.text(
+                    "select owner, server, login, broker_admin "
+                    "from mt5_connections "
+                    "where status in ('connected', 'linked')"
+                )).mappings().all()
+                return [dict(r) for r in rows]
+
+        try:
+            rows = await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001 — restore is best-effort
+            logger.warning("broker link restore read failed: %s", exc)
+            return 0
+
+        restored = 0
+        async with self._lock:
+            for row in rows:
+                try:
+                    uid = str(row["owner"])
+                except (KeyError, TypeError):
+                    continue
+                if not uid or uid in self._connections:
+                    continue
+                self._connections[uid] = BrokerConnection(
+                    user_id=uid,
+                    login=str(row.get("login") or ""),
+                    server=str(row.get("server") or ""),
+                    # demo stacks never probe the terminal (D-044 guard)
+                    admin_verified=bool(row.get("broker_admin")) and not self._demo,
+                )
+                restored += 1
+        if restored:
+            logger.info(
+                "restored %d broker link(s) from persistence — the status is "
+                "honest after restarts (D-075)",
+                restored,
+            )
+        return restored
 
     # ------------------------------------------------------------- fernet
     def _cipher(self) -> Any | None:
@@ -181,6 +255,7 @@ class BrokerConnectionService:
                 login=term_login or login,
                 server=term_server or server,
                 account=self._snapshot(acct, term),
+                admin_verified=True,  # D-075 — terminal-verified bind
             )
             self._connections[user_id] = conn
             await self._persist(conn, password)
@@ -235,6 +310,7 @@ class BrokerConnectionService:
         def _run() -> None:
             import sqlalchemy as sa  # local: tests run without it
 
+            hb = datetime.now(UTC)  # bound in Python — portable across PG/sqlite
             with self._db.begin() as cx:
                 cx.execute(
                     sa.text(
@@ -246,15 +322,19 @@ class BrokerConnectionService:
                     sa.text(
                         "insert into mt5_connections "
                         "(owner, server, login, enc_password, mode, status, "
-                        " last_heartbeat) values "
+                        " last_heartbeat, broker_admin) values "
                         "(:owner, :server, :login, :enc, 'live', 'connected', "
-                        " now())"
+                        " :hb, :admin)"
                     ),
                     {
                         "owner": conn.user_id,
                         "server": conn.server,
                         "login": conn.login,
                         "enc": enc,
+                        "hb": hb,
+                        # D-075 — restore() reads this back: admin-verified
+                        # binds probe the terminal, public links never do
+                        "admin": conn.admin_verified,
                     },
                 )
 
@@ -291,7 +371,13 @@ class BrokerConnectionService:
         conn = self._connections.get(user_id)
         if conn is None:
             return {"status": "disconnected"}
-        if conn.account.get("balance") is None and not conn.account.get("name"):
+        # D-075 — a terminal-verified bind (fresh connect OR restored from
+        # persistence) may probe the terminal for its account snapshot; a
+        # public broker-link profile must never see institution data.
+        terminal_verified = conn.admin_verified or bool(
+            conn.account.get("balance") is not None or conn.account.get("name")
+        )
+        if not terminal_verified:
             # D-044 broker-LINK (public user): per-user profile only — no
             # institution-terminal data to expose or refresh.
             return {

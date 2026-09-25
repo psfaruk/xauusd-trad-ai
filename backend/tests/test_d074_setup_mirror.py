@@ -155,7 +155,8 @@ def test_box_mirrors_newest_live_signal_any_direction():
 
 def test_dead_signal_never_mirrors():
     """A signal that already hit SL/TP (won/lost) must NOT pin the box —
-    that was the stale 'ENTRY TAKEN' ink."""
+    D-075: and with the forming fallback DELETED there is NO setup
+    drawing at all while no live order exists."""
     snaps, frames = _snaps_fixture()
     price = 4302.4
     recent = [{
@@ -167,8 +168,7 @@ def test_dead_signal_never_mirrors():
         "ts": (NOW - timedelta(minutes=3)).isoformat(),
     }]
     box = _setup(frames, snaps, {"bias": "bullish"}, price, NOW, recent)
-    assert box is not None
-    assert box["status"] == "forming"
+    assert box is None
 
 
 def test_newest_live_wins_over_older_live_and_dead():
@@ -209,14 +209,37 @@ def test_newest_live_wins_over_older_live_and_dead():
     assert box["entry"] == 4301.9  # the newest LIVE, not the dead 4306.0
 
 
-def test_no_live_signal_leaves_forming_box():
-    """No live signals -> the honest forming analysis box, unchanged."""
+def test_no_live_signal_no_setup_drawing():
+    """D-075 (verbatim): "আমি দেখতে পাচ্ছি এই পুরোনো সেটাপ টি হোম পেজ এর
+    চার্ট, প্লিজ এটা মুছে দেন" — no live order -> NO setup drawing at
+    all. The forming prediction box at a level the market never
+    reached is deleted from the contract."""
     snaps, frames = _snaps_fixture()
     price = 4302.4
     box = _setup(frames, snaps, {"bias": "bullish"}, price, NOW, [])
+    assert box is None
+
+
+def test_live_signal_aged_beyond_any_window_still_mirrors():
+    """D-075 — NO time-based deletion ("আর আপনি বলেছেন এটি মুছে যাবে 6 মিনিটে
+    আমি এটা বলি নি"): a pending order 3 HOURS old is still LIVE (the
+    engine's tracker — not a wall clock — decides when it dies), so it
+    still mirrors. Age alone never deletes ink."""
+    snaps, frames = _snaps_fixture()
+    price = 4302.4
+    recent = [{
+        "direction": "BUY",
+        "status": "pending",
+        "entry": 4301.9,
+        "sl": 4300.5,
+        "tp": 4303.5,
+        "rr": 1.6,
+        "ts": (NOW - timedelta(hours=3)).isoformat(),
+    }]
+    box = _setup(frames, snaps, {"bias": "bearish"}, price, NOW, recent)
     assert box is not None
-    assert box["status"] == "forming"
-    assert box["dir"] in ("BUY", "SELL")
+    assert box["status"] == "pending"
+    assert box["entry"] == 4301.9
 
 
 # ------------------------------------------------------------- fib anchor

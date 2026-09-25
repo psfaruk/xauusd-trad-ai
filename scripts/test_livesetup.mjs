@@ -1,7 +1,8 @@
 /**
- * D-074 — headless unit tests for frontend/src/lib/liveSetup.ts
- * (THE SIGNAL IS THE DRAWING pick). Transpiled with esbuild, run with
- * node. Usage: node scripts/test_livesetup.mjs   (from the repo root)
+ * D-074/D-075 — headless unit tests for frontend/src/lib/liveSetup.ts
+ * (THE SIGNAL IS THE DRAWING pick, event-only lifecycle). Transpiled
+ * with esbuild, run with node.
+ * Usage: node scripts/test_livesetup.mjs   (from the repo root)
  */
 import { execSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
@@ -17,8 +18,7 @@ execSync(
   { cwd: FRONTEND, stdio: "pipe" },
 );
 
-const { PENDING_TTL_MS, ACTIVE_TTL_MS, pickLiveSetup, marketKey, sameMarket } =
-  await import(`file://${out}`);
+const { pickLiveSetup, marketKey, sameMarket } = await import(`file://${out}`);
 
 let pass = 0;
 let fail = 0;
@@ -50,21 +50,21 @@ const sig = (id, over = {}) => ({
 });
 
 // ------------------------------------------------------- the basic pick
-eq("null when no signals", pickLiveSetup([], "XAUUSD", NOW), null);
-eq("null when undefined", pickLiveSetup(undefined, "XAUUSD", NOW), null);
+eq("null when no signals", pickLiveSetup([], "XAUUSD"), null);
+eq("null when undefined", pickLiveSetup(undefined, "XAUUSD"), null);
 eq(
   "picks a fresh pending signal",
-  pickLiveSetup([sig("a")], "XAUUSD", NOW)?.id,
+  pickLiveSetup([sig("a")], "XAUUSD")?.id,
   "a",
 );
 eq(
   "picks a fresh active signal",
-  pickLiveSetup([sig("a", { status: "active" })], "XAUUSD", NOW)?.id,
+  pickLiveSetup([sig("a", { status: "active" })], "XAUUSD")?.id,
   "a",
 );
 eq(
   "filters by symbol",
-  pickLiveSetup([sig("a", { symbol: "BTCUSD" })], "XAUUSD", NOW),
+  pickLiveSetup([sig("a", { symbol: "BTCUSD" })], "XAUUSD"),
   null,
 );
 
@@ -79,7 +79,6 @@ eq(
       sig("can", { status: "cancelled" }),
     ],
     "XAUUSD",
-    NOW,
   ),
   null,
 );
@@ -91,7 +90,6 @@ eq(
       sig("new", { ts: iso(30_000), direction: "SELL", status: "pending" }),
     ],
     "XAUUSD",
-    NOW,
   )?.id,
   "new",
 );
@@ -103,7 +101,6 @@ eq(
       sig("dead", { ts: iso(30_000), status: "won" }),
     ],
     "XAUUSD",
-    NOW,
   )?.id,
   "live",
 );
@@ -115,58 +112,55 @@ eq(
       sig("older", { ts: iso(9 * 60_000), status: "pending" }),
     ],
     "XAUUSD",
-    NOW,
   )?.id,
   "newer",
 );
 
-// --------------------------------------------------------- TTL windows
+// ----------------------------------- D-075: NO time-based deletion EVER
+// user directive (verbatim): "আর আপনি বলেছেন এটি মুছে যাবে 6 মিনিটে আমি
+// এটা বলি নি, আমি বলেছি, নতুন কোনো এন্ট্রি সিগন্যাল আসলে তখন মুছে যাবে।
+// আর যদি সে সেটাপ এর sl TP হিট হয়, তখন মুছে যাবে।"
+// A live order stays drawn for as long as it LIVES — age alone never
+// deletes ink (the engine's tracker flips the status, the WS
+// signal_update event refetches, the drawing follows the ORDER).
 eq(
-  "pending ink dies with the order window",
-  pickLiveSetup(
-    [sig("stale", { ts: iso(PENDING_TTL_MS + 1) })],
-    "XAUUSD",
-    NOW,
-  ),
-  null,
+  "pending ink 3 hours old STILL draws (no TTL)",
+  pickLiveSetup([sig("old", { ts: iso(3 * 3_600_000) })], "XAUUSD")?.id,
+  "old",
 );
 eq(
-  "pending ink alive at the order window edge",
-  pickLiveSetup(
-    [sig("edge", { ts: iso(PENDING_TTL_MS - 1) })],
-    "XAUUSD",
-    NOW,
-  )?.id,
-  "edge",
+  "pending ink 24 hours old STILL draws (no TTL)",
+  pickLiveSetup([sig("day", { ts: iso(24 * 3_600_000) })], "XAUUSD")?.id,
+  "day",
 );
 eq(
-  "active ink carries the trade horizon",
+  "active ink 6 hours old STILL draws (no TTL)",
   pickLiveSetup(
-    [sig("long", { ts: iso(ACTIVE_TTL_MS - 1), status: "active" })],
+    [sig("long", { ts: iso(6 * 3_600_000), status: "active" })],
     "XAUUSD",
-    NOW,
   )?.id,
   "long",
 );
 eq(
-  "active ink expires past the horizon",
-  pickLiveSetup(
-    [sig("gone", { ts: iso(ACTIVE_TTL_MS + 1), status: "active" })],
-    "XAUUSD",
-    NOW,
-  ),
+  "the CLOCK never deletes: same list, same pick an hour later",
+  pickLiveSetup([sig("a")], "XAUUSD")?.id,
+  "a",
+);
+eq(
+  "the age cut is STATUS, not minutes: dead after 1 minute is gone",
+  pickLiveSetup([sig("dead", { ts: iso(60_000), status: "lost" })], "XAUUSD"),
   null,
 );
 
 // ------------------------------------------------------------- garbage
 eq(
   "unparseable ts never picks",
-  pickLiveSetup([sig("bad", { ts: "not-a-date" })], "XAUUSD", NOW),
+  pickLiveSetup([sig("bad", { ts: "not-a-date" })], "XAUUSD"),
   null,
 );
 eq(
   "null/undefined entries skipped",
-  pickLiveSetup([null, undefined, sig("ok")], "XAUUSD", NOW)?.id,
+  pickLiveSetup([null, undefined, sig("ok")], "XAUUSD")?.id,
   "ok",
 );
 
@@ -186,7 +180,6 @@ eq(
   pickLiveSetup(
     [sig("a", { symbol: "XAUUSDm", status: "active" })],
     "XAUUSD",
-    NOW,
   )?.id,
   "a",
 );

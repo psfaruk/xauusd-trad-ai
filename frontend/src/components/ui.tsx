@@ -220,7 +220,7 @@ export function Field({
 }
 
 export const inputCls =
-  "w-full min-w-0 rounded-xl border border-zinc-700/80 bg-zinc-900 px-3 py-2 font-mono text-sm text-zinc-100 tabular-nums placeholder:text-zinc-600 focus:border-gold/60 focus:outline-none focus:ring-1 focus:ring-gold/30";
+  "w-full min-w-0 rounded-xl border border-zinc-700/80 bg-zinc-900 px-3 py-2 font-mono text-base tabular-nums text-zinc-100 placeholder:text-zinc-600 focus:border-gold/60 focus:outline-none focus:ring-1 focus:ring-gold/30 sm:text-sm";
 
 /* --------------------------------------------------- D-054 numeric input */
 

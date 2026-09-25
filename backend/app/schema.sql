@@ -25,6 +25,9 @@ create table if not exists mt5_connections (
 -- Multi-user trading planes (Phase 4): one row per user, plus per-user arm.
 alter table mt5_connections add column if not exists mode text not null default 'demo';
 alter table mt5_connections add column if not exists auto_trade boolean not null default false;
+-- D-075 — the link was ADMIN-verified against the live institution terminal
+-- (restores at boot probe the terminal; public broker-links never do).
+alter table mt5_connections add column if not exists broker_admin boolean not null default false;
 
 create table if not exists engine_config (
   id int primary key default 1 check (id = 1),   -- single row

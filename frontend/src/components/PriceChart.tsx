@@ -400,15 +400,17 @@ const TF_SECONDS: Record<string, number> = {
   M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400,
 };
 
-/** D-074 — THE SIGNAL IS THE DRAWING (user directive, Bengali):
+/** D-074/D-075 — THE SIGNAL IS THE DRAWING (user directive, Bengali):
  * "নতুন এন্ট্রি যে সিগন্যাল টি আসে, সেটি চার্ট এর উপরে ড্রয়িং করে না।
  * পুরাতন একটি এন্ট্রি সেটাপ দেখায়" — the chart's entry setup is the
  * NEWEST live signal (pending limit / active trade), drawn at ITS exact
  * levels from ITS candle to the right edge; a new signal deletes the
- * previous drawing; SL/TP hit (status won/lost) deletes it immediately;
- * the stale analysis "forming" box never renders while a live signal
- * exists. The pick lives in ../lib/liveSetup (pure, unit-tested). */
-const LIVE_CLOCK_MS = 30_000;
+ * previous drawing; SL/TP hit (status won/lost) deletes it immediately.
+ * D-075 (verbatim): "নতুন কোনো এন্ট্রি সিগন্যাল আসলে তখন মুছে যাবে। আর যদি
+ * সে সেটাপ এর sl TP হিট হয়, তখন মুছে যাবে" — NO time-based deletion
+ * (no TTL, no fade); and the analysis "forming" box NEVER renders (it
+ * was the "পুরোনো সেটাপ" at a level the market never reached). The
+ * pick lives in ../lib/liveSetup (pure, unit-tested). */
 
 interface PriceChartProps {
   symbol: string;
@@ -948,19 +950,16 @@ export default function PriceChart({
     : allDrawings;
 
   /* ------------------------------------------- D-074 the LIVE trade setup */
-  // The ONE signal the chart draws (see ../lib/liveSetup). Re-derived on
-  // every signals change + a 30s clock so an expired pending (order
-  // dead) drops its ink even without a refetch; the 500ms redraw loop
-  // below re-checks per paint.
-  const [liveClock, setLiveClock] = useState(0);
-  useEffect(() => {
-    const iv = window.setInterval(() => setLiveClock((c) => c + 1), LIVE_CLOCK_MS);
-    return () => window.clearInterval(iv);
-  }, []);
+  // The ONE signal the chart draws (see ../lib/liveSetup). D-075: pure
+  // event-driven lifecycle — NO clock, NO TTL (user directive: "নতুন কোনো
+  // এন্ট্রি সিগন্যাল আসলে তখন মুছে যাবে। আর যদি সে সেটাপ এর sl TP হিট হয়,
+  // তখন মুছে যাবে") — the drawing changes ONLY when the signals array
+  // changes (WS signal / signal_update events), and the 500ms redraw
+  // loop below re-reads the ref per paint.
   const liveSignal = useMemo(
-    () => pickLiveSetup(signals, symbol, Date.now()),
+    () => pickLiveSetup(signals, symbol),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [signals, symbol, liveClock],
+    [signals, symbol],
   );
   // D-074 — the price scale must SHOW the trade: autoscale fits the
   // candles only (custom price lines are NOT part of the default range
@@ -1022,6 +1021,17 @@ export default function PriceChart({
     const yOf = (p: number): number | null => {
       const c = series.priceToCoordinate(p);
       return c == null ? null : c;
+    };
+    // D-075 — width-fit a canvas text line to `maxWidth` with an honest
+    // ellipsis (the DIRECTION verdict + the live-trade head must read
+    // COMPLETE on a 360px phone, never run under the price axis)
+    const fitText = (line: string, maxWidth: number): string => {
+      if (ctx.measureText(line).width <= maxWidth) return line;
+      let t = line;
+      while (t.length > 4 && ctx.measureText(t + "…").width > maxWidth) {
+        t = t.slice(0, -1);
+      }
+      return t + "…";
     };
 
     /* -------------------------------------- D-058 no-box text helpers */
@@ -1591,7 +1601,11 @@ export default function PriceChart({
           }
         }
       }
-      // the DIRECTION outlook — three compact lines, top-left, no box
+      // the DIRECTION outlook — three compact lines, top-left, no box.
+      // D-075 — each line is width-FITTED to the live canvas: on a
+      // 360px phone the "drawn to untouched SSL ..." verdict used to
+      // run off the right edge under the price; it now trims honestly
+      // with an ellipsis at the axis (content intact on wider screens).
       for (const d of drawings) {
         if (d.kind !== "outlook") continue;
         ctx.save();
@@ -1600,7 +1614,7 @@ export default function PriceChart({
         d.lines.forEach((line, i) => {
           ctx.font = i === 0 ? `700 9px ${FONT_FAMILY}` : `600 8px ${FONT_FAMILY}`;
           ctx.fillStyle = i === 0 ? TONE[d.tone].text : i === 1 ? "#9aa0aa" : "#b7bcc6";
-          ctx.fillText(line, 6, 18 + i * 11);
+          ctx.fillText(fitText(line, rightEdge - 12), 6, 18 + i * 11);
         });
         ctx.restore();
       }
@@ -2055,108 +2069,24 @@ export default function PriceChart({
       }
     }
 
-    /* -------------------------------------------- D-043 entry-setup box */
-    // D-074 — the analysis "forming" box ONLY draws when NO live signal
-    // exists: while a real signal is pending/active THE SIGNAL IS THE
-    // DRAWING (its own exact levels, drawn below) — the forming box was
-    // the "পুরাতন এন্ট্রি সেটাপ" at a level the market never reached.
-    const setup = !live
-      ? drawings.find(
-          (d): d is Extract<ChartDrawing, { kind: "setup" }> => d.kind === "setup",
-        )
-      : undefined;
-    if (L.setup && setup) {
-      const x0raw = xOf(setup.t0);
-      const x0 = x0raw == null ? 0 : Math.max(-2, x0raw);
-      const isBuy = setup.dir === "BUY";
-      const tone: DrawingTone = isBuy ? "bull" : "bear";
-      const yZhi = yOf(setup.zone[1]);
-      const yZlo = yOf(setup.zone[0]);
-      const yE = yOf(setup.entry);
-      const yS = yOf(setup.sl);
-      const yT = yOf(setup.tp);
-      if (yZhi != null && yZlo != null) {
-        // entry zone box — D-058 whisper fill + thin hard border
-        ctx.fillStyle = TONE[tone].fill;
-        ctx.fillRect(x0, Math.min(yZhi, yZlo), rightEdge - x0, Math.abs(yZlo - yZhi));
-        ctx.strokeStyle = TONE[tone].halo;
-        ctx.lineWidth = 0.9;
-        ctx.setLineDash([]);
-        ctx.strokeRect(x0 - 0.5, Math.min(yZhi, yZlo) - 0.5, rightEdge - x0 + 1, Math.abs(yZlo - yZhi) + 1);
-        ctx.strokeStyle = TONE[tone].line;
-        ctx.lineWidth = 0.7;
-        ctx.strokeRect(x0 + 0.5, Math.min(yZhi, yZlo) + 0.5, rightEdge - x0 - 1, Math.abs(yZlo - yZhi) - 1);
-        tag(
-          `${setup.dir} SETUP${setup.status === "triggered" ? " · ENTRY TAKEN" : " · FORMING"}`,
-          x0 + 6,
-          Math.min(yZhi, yZlo) + 10,
-          tone,
-        );
-      }
-      const line = (
-        y: number | null, color: string, halo: string, dash: number[],
-        label: string, x: number,
-      ) => {
-        if (y == null || y < -5 || y > h + 5) return;
-        // D-053 — the entry-setup lines are the one place the hard halo
-        // really matters: these ARE the trade (user directive).
-        hardSeg(x, Math.round(y) + 0.5, rightEdge, Math.round(y) + 0.5,
-          color, halo, 0.85, dash);
-        rightTag(label, y, "neutral");
-      };
-      // risk / reward shading between entry and sl / tp
-      if (yE != null && yS != null) {
-        ctx.fillStyle = "rgba(248,113,113,0.045)";
-        ctx.fillRect(x0, Math.min(yE, yS), rightEdge - x0, Math.abs(yS - yE));
-      }
-      if (yE != null && yT != null) {
-        ctx.fillStyle = "rgba(52,211,153,0.045)";
-        ctx.fillRect(x0, Math.min(yE, yT), rightEdge - x0, Math.abs(yT - yE));
-      }
-      line(yE, "rgba(212,175,55,0.95)", TONE.gold.halo, [], `ENTRY ${setup.entry}`, x0);
-      line(yS, "rgba(248,113,113,0.9)", TONE.bear.halo, [5, 4], `STOP LOSS ${setup.sl}`, x0);
-      line(yT, "rgba(52,211,153,0.9)", TONE.bull.halo, [5, 4], `TAKE PROFIT ${setup.tp} · RR ${setup.rr}`, x0);
-      // D-058 — the setup words: written DIRECTLY on the chart, tiny,
-      // fixed-size, no card behind them (user directive: "লেখার পিছনে
-      // কোনও প্রকার বক্স বা কালার থাকবে না")
-      const title = `${isBuy ? "▲" : "▼"} ${setup.dir} SETUP · ${
-        setup.status === "triggered" ? "ENTRY TAKEN" : "FORMING"
-      } · RR ${setup.rr}`;
-      const factors = setup.factors.slice(0, 4).join(" · ");
-      const textX = Math.max(8, x0 + 6);
-      const textY = Math.max(
-        24,
-        Math.min((yZhi ?? h / 2) - 10, h - 46),
-      );
-      ctx.save();
-      ctx.font = `700 9px ${FONT_FAMILY}`;
-      ctx.shadowColor = TEXT_SHADOW;
-      ctx.shadowBlur = 3;
-      ctx.fillStyle = setup.status === "triggered" ? TONE[tone].text : "#e7cd6f";
-      ctx.fillText(title, textX, textY);
-      ctx.font = `500 8px ${FONT_FAMILY}`;
-      ctx.fillStyle = "#b7bcc6";
-      ctx.fillText(
-        factors.length > 64 ? factors.slice(0, 62) + "…" : factors,
-        textX,
-        textY + 12,
-      );
-      ctx.fillStyle = "#9aa0aa";
-      ctx.fillText(
-        setup.note.length > 70 ? setup.note.slice(0, 68) + "…" : setup.note,
-        textX,
-        textY + 23,
-      );
-      ctx.restore();
-    }
+    /* -------------------------------------------- D-043/D-075 entry setup */
+    // D-075 — the analysis "forming" box is DELETED from the canvas
+    // (user directive: "আমি দেখতে পাচ্ছি এই পুরোনো সেটআপ টি হোম পেজ এর
+    // চার্ট, প্লিজ এটা মুছে দেন"): the entry-setup drawing on this chart
+    // is ONLY the newest live signal (the D-074 ink below) — a prediction
+    // box at a level the market never reached must never haunt the chart
+    // again. The backend no longer emits forming setups either; the
+    // drawings list keeps only live-signal mirror rows for the Marks
+    // legend.
 
     /* --------------------------- D-074 THE LIVE TRADE — the signal IS the drawing */
     // ONE setup at a time: the newest live signal's own contract at its
     // EXACT entry/SL/TP, drawn from the signal's candle to the right
-    // edge ("ক্যান্ডেল এর সাথে … মিলিয়ে"). A new signal replaces the
-    // previous ink; SL/TP hit (won/lost) deletes it — pickLiveSetup
-    // already excluded the dead ones. Pending limits read WAIT + the
-    // level they rest at; live trades read ENTRY.
+    // edge ("ক্যান্ডেল এর সাথে … মিলিয়ে"). D-075 lifecycle — event-only,
+    // NO timers: a NEW signal replaces the previous ink; SL/TP hit
+    // (won/lost) or order death (expired/cancelled) deletes it
+    // immediately (pickLiveSetup excluded the dead ones); a live order
+    // stays drawn for as long as it lives, however long that is.
     if (L.setup && live) {
       const tSec = Math.floor(new Date(live.ts).getTime() / 1000);
       const tfSec = TF_SECONDS[tf] ?? 60;
@@ -2218,6 +2148,8 @@ export default function PriceChart({
       orderLine(yT, "rgba(52,211,153,0.9)", TONE.bull.halo, [5, 4],
         `TP ${live.tp.toFixed(2)}${rrTxt}`);
       // the trade words — 3 compact shadowed lines at the setup's head
+      // (D-075: each fitted to the canvas width — phones read the WHOLE
+      // contract, never a clipped half of it)
       ctx.save();
       ctx.font = `700 9px ${FONT_FAMILY}`;
       ctx.shadowColor = TEXT_SHADOW;
@@ -2226,28 +2158,25 @@ export default function PriceChart({
         ? "#e7cd6f"
         : isBuy ? TONE.bull.text : TONE.bear.text;
       const headY = Math.max(24, Math.min((yE ?? h / 2) - 34, h - 58));
+      const headX = Math.max(8, xS + 6);
       ctx.fillText(
-        `${isBuy ? "▲" : "▼"} ${live.direction} ${waiting ? "WAIT" : "LIVE"} · ${verb} ${live.entry.toFixed(2)} · RR ${live.rr ?? "—"}`,
-        Math.max(8, xS + 6),
+        fitText(`${isBuy ? "▲" : "▼"} ${live.direction} ${waiting ? "WAIT" : "LIVE"} · ${verb} ${live.entry.toFixed(2)} · RR ${live.rr ?? "—"}`, rightEdge - headX - 10),
+        headX,
         headY,
       );
       ctx.font = `500 8px ${FONT_FAMILY}`;
       ctx.fillStyle = "#b7bcc6";
       const note1 = live.entry_note || live.target_note || "";
       if (note1) {
-        ctx.fillText(
-          note1.length > 72 ? note1.slice(0, 70) + "…" : note1,
-          Math.max(8, xS + 6),
-          headY + 12,
-        );
+        ctx.fillText(fitText(note1, rightEdge - headX - 10), headX, headY + 12);
       }
       const ageMin = Math.max(
         0, Math.round((Date.now() - new Date(live.ts).getTime()) / 60000),
       );
       ctx.fillStyle = "#9aa0aa";
       ctx.fillText(
-        `${live.entry_type === "limit" ? "limit order" : "market entry"} · ${ageMin}m ago · ${live.symbol} ${live.tf}`,
-        Math.max(8, xS + 6),
+        fitText(`${live.entry_type === "limit" ? "limit order" : "market entry"} · ${ageMin}m ago · ${live.symbol} ${live.tf}`, rightEdge - headX - 10),
+        headX,
         headY + 23,
       );
       ctx.restore();

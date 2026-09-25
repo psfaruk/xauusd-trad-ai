@@ -5,8 +5,38 @@
 @layer base {
   html {
     @apply antialiased;
+    /* D-075 — devices: stop mobile browsers from inflating text on
+     * orientation change and give the dark app thin, calm scrollbars */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    scrollbar-width: thin;
+    scrollbar-color: #3f3f46 transparent;
   }
   body {
     @apply bg-zinc-950 text-zinc-100 font-sans;
+    /* notch-friendly + no tap flash + no rubber-band on the app shell */
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior-y: none;
+  }
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #3f3f46;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  /* inputs: iOS zooms the viewport when a <16px input is focused —
+   * pin 16px so Settings/Login never zoom-jump on tap */
+  input, select, textarea, button {
+    font-size: 16px;
+  }
+  @media (min-width: 640px) {
+    input, select, textarea, button {
+      font-size: inherit;
+    }
   }
 }

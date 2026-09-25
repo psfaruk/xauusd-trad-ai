@@ -31,7 +31,8 @@ def test_split_sql_handles_the_real_schema() -> None:
     # + 2 D-036 alter statements (engine_config live-arm columns)
     # = 19 statements (D-044: + user_accounts, + user_positions, + index)
     # + 3 D-054 alter statements (signals pending-contract columns).
-    assert len(stmts) == 22, stmts
+    # + 1 D-075 alter statement (mt5_connections.broker_admin).
+    assert len(stmts) == 23, stmts
     assert all(s for s in stmts)
     # The trigger statement survives as one piece.
     trigger = [s for s in stmts if s.startswith("create trigger")]

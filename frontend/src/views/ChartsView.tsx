@@ -173,7 +173,7 @@ export default function ChartsView({
       <div className="flex min-w-0 flex-col gap-3 xl:flex-row xl:items-start">
         {/* chart — D-053: signals variant (setup + signal marks ONLY) */}
         <div className="min-w-0 flex-1 xl:sticky xl:top-16">
-          <div className="h-[52vh] min-h-[320px] w-full min-w-0 lg:h-[calc(100vh-10rem)]">
+          <div className="h-[52vh] min-h-[300px] w-full min-w-0 sm:min-h-[320px] md:h-[60vh] lg:h-[calc(100vh-10rem)]">
             <ErrorBoundary label="Chart">
               <PriceChart
                 symbol={symbol}

@@ -148,6 +148,16 @@ async def lifespan(app: FastAPI):
         settings=settings,
         demo_mode=(effective_data_source == "mock"),
     )
+    # D-075 — the broker links live in MEMORY; a restart wiped them while
+    # the terminal bridge (and the armed auto-trader) kept placing orders:
+    # "Fronted এ exness not connected দেখাচ্ছে, কিন্তু অটো সিগন্যাল এন্ট্রি
+    # হচ্ছে" — the exact mixed-signal this restore kills. The persisted
+    # rows come back at boot; admin-verified binds re-probe the terminal
+    # on the next status read (connected / reconnecting — honest).
+    try:
+        await app.state.broker_connect.restore()
+    except Exception:  # noqa: BLE001 — restore is best-effort, never blocks boot
+        logger.exception("broker link boot restore failed")
 
     # --- Phase 4: per-user trading planes (agent architecture) + the admin's
     # own platform executor (armed by engine_config.auto_trade).

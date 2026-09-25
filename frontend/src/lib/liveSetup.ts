@@ -1,33 +1,29 @@
 /**
- * D-074 — "THE SIGNAL IS THE DRAWING".
+ * D-074/D-075 — "THE SIGNAL IS THE DRAWING", event-only lifecycle.
  *
- * User directive (Bengali, verbatim): "আমি চাই চার্ট এর ওপরে ক্যান্ডেল এর
- * সাথে যেই এন্ট্রি সিগন্যাল টি আসে, আমি চাই সেই ভাবে টিক এই ভাবে মিলিয়ে
- * এন্ট্রি সেটাপ করবেন … এই অঙ্কন এর মেয়াদ থাকবে নতুন যদি অন্য একটি
- * সিগন্যাল আসে, তখন আগের টি মুছে যাবে, যদি sl TP হিট হয়, তখনও সিগন্যাল
- * টি মুছে যাবে।"
+ * User directive (Bengali, verbatim, restated in D-075): "আর আপনি বলেছেন
+ * এটি মুছে যাবে 6 মিনিটে আমি এটা বলি নি, আমি বলেছি, নতুন কোনো এন্ট্রি
+ * সিগন্যাল আসলে তখন মুছে যাবে। আর যদি সে সেটাপ এর sl TP হিট হয়, তখন
+ * মুছে যাবে।"
  *
- * The chart's entry-setup drawing is the NEWEST *live* signal — nothing
- * else. One drawing at a time:
+ * NO TIME-BASED DELETION. The chart's entry-setup drawing is the NEWEST
+ * *live* signal — nothing else — and it lives exactly as long as the
+ * ORDER lives:
  *   - a NEW different signal replaces (deletes) the previous drawing;
  *   - SL/TP hit (status won/lost) deletes it — immediately, no fade;
- *   - expired / cancelled limit orders delete it too;
- *   - the stale analysis "forming" box never shows while a live signal
- *     exists (that box was the "পুরাতন এন্ট্রি সেটাপ" the market never
- *     reached).
+ *   - expired / cancelled limit orders delete it too (order death,
+ *     reported by the engine's tracker, not by a frontend timer);
+ *   - there is NO TTL: a pending limit drawn for 3 hours stays drawn
+ *     until the engine fills it, expires it, or a newer signal replaces
+ *     it. Age alone NEVER removes ink.
  *
- * `pending` = limit order waiting at its level (max 30 M1 bars by the
- * engine's pending_expiry, +grace) → the chart draws "WAIT <level>".
- * `active`  = order filled, trade live (the engine's whole short-time
- *             horizon) → "ENTRY <level>".
+ * `pending` = limit order waiting at its level → the chart draws
+ * "WAIT <level>". `active` = order filled, trade live → "ENTRY <level>".
+ * The engine's tracker flips statuses and the WS `signal_update` event
+ * refetches the list — the drawing follows the ORDER, not the clock.
  */
 
 import type { Signal } from "../types";
-
-/** pending limit ink lives as long as the order itself (+ small grace) */
-export const PENDING_TTL_MS = 40 * 60 * 1000;
-/** active (filled) trade ink horizon */
-export const ACTIVE_TTL_MS = 120 * 60 * 1000;
 
 /** finite epoch-ms of a signal's `ts`, or 0 when unparseable */
 export function signalTsMs(s: Signal): number {
@@ -69,13 +65,13 @@ export function isLiveStatus(s: Signal): boolean {
 
 /**
  * The ONE signal the chart draws as the live trade setup: the NEWEST
- * live signal for `symbol` whose ink has not expired.
- * `signals` may be any order (API is newest-first; this is defensive).
+ * live signal for `symbol`. Pure status logic — no clock, no TTL (the
+ * D-075 directive). `signals` may be any order (API is newest-first;
+ * this is defensive).
  */
 export function pickLiveSetup(
   signals: Signal[] | null | undefined,
   symbol: string,
-  now: number = Date.now(),
 ): Signal | null {
   if (!signals || !signals.length) return null;
   let best: Signal | null = null;
@@ -85,8 +81,6 @@ export function pickLiveSetup(
     if (!isLiveStatus(s)) continue;
     const t = signalTsMs(s);
     if (t <= 0) continue;
-    const ttl = s.status === "pending" ? PENDING_TTL_MS : ACTIVE_TTL_MS;
-    if (now - t > ttl) continue;
     if (t > bestTs) {
       best = s;
       bestTs = t;
