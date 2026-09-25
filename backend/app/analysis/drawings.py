@@ -56,7 +56,9 @@ logger = logging.getLogger("xauusd.drawings")
 #: the leg-count ladder badge)
 #: D-067 — 52: +4 for the candle-battle set (the war badge + the last
 #: decisive wick rejections)
-MAX_DRAWINGS = 52
+#: D-071 — 60: +8 for the liquidity set (up to 5 pool life-cycle marks +
+#: the DIRECTION outlook + the draw path)
+MAX_DRAWINGS = 60
 #: drawings live on the recent 80–150 candles of the ACTIVE timeframe
 DRAW_WINDOW_BARS = 150
 #: how close (in ATR units) price must be to a zone for the SETUP box
@@ -536,6 +538,238 @@ def _battle_marks(base: pd.DataFrame, tf: str) -> list[dict]:
             "tone": "bull" if e.get("side") == "buyers" else "bear",
         })
     return out[:4]
+
+
+# ------------------------------------------------------ D-071 liquidity set
+
+
+def _liquidity_marks(
+    base: pd.DataFrame, tf: str, price: float, flow: dict,
+) -> list[dict]:
+    """kind: "liq" — every pool's LIFE-CYCLE state (D-071).
+
+    User directive (Bengali): "কোনো লেভেল বা zone এর বা কোনো একটি
+    ক্যান্ডেল এর লিকুডিটি নিলো, কি নিল না। নেওয়ার পরে লিকুডিটি রান
+    করে নাকি সুয়েপ করবে" — each pool renders with its live verdict:
+
+    - UNTOUCHED — the draw: resting liquidity price is pulled toward
+      ("$$ · 1.2 ATR away");
+    - SWEPT — the stops were harvested and REJECTED: expect REVERSAL
+      away from the pool (the ICT stop-hunt);
+    - RUN — the pool was consumed and price closed through: expect
+      CONTINUATION toward the next pool.
+
+    The tone carries the EXPECTED DIRECTION (green = up, red = down) —
+    swept BSL is bear (reversal down), run BSL is bull (continuation
+    up), untouched pools keep the side's own color.
+    """
+
+    if base is None or len(base) < 40 or not (price and price > 0):
+        return []
+    pools = (flow or {}).get("pools") or []
+    draw = (flow or {}).get("draw") or {}
+    if not pools:
+        return []
+
+    draw_prices = {
+        p.get("price") for p in (draw.get("above"), draw.get("below")) if p
+    }
+
+    def rank(p: dict) -> tuple:
+        # draws first, then fresh events (nearest first), then the rest
+        if p.get("price") in draw_prices:
+            return (0, 0)
+        if p.get("state") != "untouched":
+            bars_ago = 99
+            if p.get("i_event") is not None:
+                bars_ago = max(0, len(base) - 1 - int(p["i_event"]))
+            return (1, min(bars_ago, 40))
+        return (2, p.get("dist_atr") or 99)
+
+    ranked = sorted(pools, key=rank)[:5]
+    out: list[dict] = []
+    for p in ranked:
+        side = p.get("kind")
+        state = p.get("state")
+        side_word = "Buy Side" if side == "BSL" else "Sell Side"
+        if state == "untouched":
+            d = p.get("dist_atr")
+            label = (
+                f"{side_word} Liquidity — untouched draw"
+                + (f" · {d} ATR away" if d is not None else "")
+            )
+            note = (
+                "resting liquidity the market is drawn toward — "
+                "price moves from pool to pool"
+            )
+            tone = "bull" if side == "BSL" else "bear"
+        elif state == "swept":
+            rev = "down" if side == "BSL" else "up"
+            disp = p.get("disp_atr")
+            label = (
+                f"{side_word} Liquidity — SWEPT · reversal {rev}"
+                + (f" ({disp} ATR so far)" if disp is not None else "")
+            )
+            note = (
+                "stops harvested then rejected (stop-hunt) — "
+                "expect the move AWAY from the pool"
+            )
+            tone = "bear" if side == "BSL" else "bull"
+        else:
+            cont = "up" if side == "BSL" else "down"
+            disp = p.get("disp_atr")
+            label = (
+                f"{side_word} Liquidity — RUN · continuation {cont}"
+                + (f" ({disp} ATR so far)" if disp is not None else "")
+            )
+            note = (
+                "pool consumed, price closed through — expect the move "
+                "to continue toward the next pool"
+            )
+            tone = "bull" if side == "BSL" else "bear"
+        out.append({
+            "kind": "liq",
+            "side": side,
+            "price": p.get("price"),
+            "t": _iso(p.get("t")),
+            "state": state,
+            "t_event": _iso(p.get("t_event")) if p.get("t_event") else None,
+            "disp_atr": p.get("disp_atr"),
+            "dist_atr": p.get("dist_atr"),
+            "source": p.get("source"),
+            "label": label,
+            "note": note,
+            "tone": tone,
+        })
+    return out
+
+
+def _outlook_mark(
+    frames: dict, snaps: dict, base: pd.DataFrame, price: float, flow: dict,
+) -> dict | None:
+    """kind: "outlook" — the DIRECTION synthesis (D-071).
+
+    User directive (Bengali): "চার্ট এর ড্রয়িং আরও বিস্তারিত করতে হবে।
+    যেনো আমি বুঝতে পারি মার্কেট কোন দিকে যাবে" — one honest verdict,
+    built from the three directional engines the app already has:
+
+    1. FRESH liquidity event (strongest, shortest term): a sweep says
+       reversal, a run says continuation;
+    2. the DRAW-ON-LIQUIDITY: the nearest untouched pool the market is
+       pulled toward (price moves pool to pool);
+    3. the higher-timeframe context (D-068 regime label + MTF bias)
+       as confirmation, never as the driver.
+
+    The verdict is drawn as three compact lines on the chart canvas —
+    direction, the why, and the two-sided pool map.
+    """
+
+    if base is None or len(base) < 40 or not (price and price > 0):
+        return None
+    draw = (flow or {}).get("draw") or {}
+
+    label = None
+    vol = None
+    try:
+        from app.analysis.regime import regime_read
+
+        rg = regime_read(frames.get("M1") if isinstance(frames, dict) else None,
+                         frames, price) or {}
+        label = rg.get("label")
+        vol = (rg.get("vol") or {}).get("state")
+    except Exception:  # noqa: BLE001 — outlook must never break the set
+        label = None
+    try:
+        bias = (mtf_bias(snaps) or {}).get("bias") if snaps else None
+    except Exception:  # noqa: BLE001
+        bias = None
+
+    fresh = draw.get("fresh")
+    draw_dir = draw.get("dir")
+    direction = None
+    why = "no directional edge yet"
+    if fresh:
+        direction = fresh.get("dir")
+        word = "sweep" if fresh.get("state") == "swept" else "run"
+        exp = "reversal" if fresh.get("state") == "swept" else "continuation"
+        why = (
+            f"fresh {word} of {fresh.get('side')} "
+            f"{fresh.get('bars_ago')} bars ago — {exp}"
+        )
+    elif draw_dir:
+        direction = draw_dir
+        tgt = draw.get("above") if draw_dir == "up" else draw.get("below")
+        if tgt:
+            why = (
+                f"drawn to untouched {tgt.get('kind')} "
+                f"{tgt.get('price')} ({tgt.get('dist_atr')} ATR)"
+            )
+    elif label and str(label).endswith("UP"):
+        direction = "up"
+        why = f"{label} regime"
+    elif label and str(label).endswith("DOWN"):
+        direction = "down"
+        why = f"{label} regime"
+
+    arrow = "↑" if direction == "up" else "↓" if direction == "down" else "—"
+    line1 = f"DIRECTION {arrow} · {why}"
+    ctx_bits = []
+    if label:
+        ctx_bits.append(str(label))
+    if vol:
+        ctx_bits.append(f"vol {vol}")
+    if bias:
+        ctx_bits.append(f"bias {bias}")
+    line2 = "regime " + (" · ".join(ctx_bits) if ctx_bits else "unreadable")
+    line3_parts = []
+    for side, p in (("BSL above", draw.get("above")),
+                    ("SSL below", draw.get("below"))):
+        if p:
+            line3_parts.append(
+                f"{side} {p.get('price')} ({p.get('dist_atr')} ATR)"
+            )
+    line3 = " · ".join(line3_parts) if line3_parts else "no untouched pools in view"
+
+    return {
+        "kind": "outlook",
+        "dir": direction,
+        "regime": label,
+        "vol": vol,
+        "bias": bias,
+        "draw_dir": draw_dir,
+        "draw_side": (draw.get("above") or {}).get("kind")
+        if direction == "up" else (draw.get("below") or {}).get("kind"),
+        "draw_price": (draw.get("above") or {}).get("price") if direction == "up"
+        else (draw.get("below") or {}).get("price"),
+        "fresh": fresh,
+        "label": f"Market direction — {direction or 'neutral'} ({why})",
+        "lines": [line1, line2, line3],
+        "note": "synthesis: fresh liquidity event > draw-on-liquidity > regime",
+        "tone": "bull" if direction == "up" else "bear" if direction == "down"
+        else "gold",
+    }
+
+
+def _path_mark(price: float, flow: dict, direction: str | None) -> dict | None:
+    """kind: "path" — the dotted draw-path from live price to the target
+    pool (D-071): the visual answer to "মার্কেট কোন দিকে যাবে"."""
+
+    if not direction or not (price and price > 0):
+        return None
+    draw = (flow or {}).get("draw") or {}
+    tgt = draw.get("above") if direction == "up" else draw.get("below")
+    if not tgt:
+        return None
+    return {
+        "kind": "path",
+        "dir": direction,
+        "from_price": round(float(price), 2),
+        "to_price": tgt.get("price"),
+        "dist_atr": tgt.get("dist_atr"),
+        "label": f"draw path → {tgt.get('kind')} {tgt.get('price')}",
+        "note": "the projected pull toward the nearest untouched pool",
+        "tone": "bull" if direction == "up" else "bear",
+    }
 
 
 # ----------------------------------------------------------------- hlines
@@ -1186,7 +1420,10 @@ def _build(
         out.append(fib)
 
     # 7. liquidity sweeps + 8. BOS/CHoCH structure chips + 9. arrows
-    out.extend(_sweeps(snap))
+    # D-071 — the bare `_sweeps(snap)` X-marks are superseded by the
+    # `liq` life-cycle set below (same pools, now with the
+    # untouched/swept/run verdict + post-take displacement); the legacy
+    # `sweep` kind stays renderable for cached snapshots.
     out.extend(_structure_events(snap, t_start))
     out.extend(_arrows(snap, price))
 
@@ -1207,5 +1444,24 @@ def _build(
     # 15. D-067 — the candle battle: who dominates the last few
     #     candles, who won, and the decisive rejections inside them
     out.extend(_battle_marks(base, tf))
+
+    # 16. D-071 — the LIQUIDITY life-cycle: every pool's live state
+    #     (untouched draw / swept / run) on THIS timeframe + the
+    #     DIRECTION outlook (fresh event > draw > regime) + the
+    #     dotted draw-path to the target pool. One liquidity_flow()
+    #     read feeds all three marks.
+    try:
+        from app.analysis.liquidity_flow import liquidity_flow
+
+        flow = liquidity_flow(base, price)
+    except Exception:  # noqa: BLE001 — liquidity marks must never break
+        flow = {}
+    out.extend(_liquidity_marks(base, tf, price, flow))
+    outlook = _outlook_mark(frames, snaps, base, price, flow)
+    if outlook is not None:
+        out.append(outlook)
+        path = _path_mark(price, flow, outlook.get("dir"))
+        if path is not None:
+            out.append(path)
 
     return [d for d in out if d is not None][:MAX_DRAWINGS]

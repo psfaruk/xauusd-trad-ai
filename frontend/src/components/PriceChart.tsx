@@ -65,24 +65,27 @@ const FADED_ALPHA = 0.32;
 const FADED_WIDTH = 0.6;
 
 /** D-058 — the candle-clarity palette: fills at whisper alpha (the
- *  candles must be the loudest thing on the chart), thin cores. */
+ *  candles must be the loudest thing on the chart), thin cores.
+ *  D-071 — fills halved again + lines thinned (user directive: "শেডিং
+ *  রং গুলো হালকা করতে হবে", "লাইন গুলো চিকন করতে হবে"). */
 const TONE: Record<DrawingTone, { line: string; halo: string; text: string; fill: string }> = {
-  bull: { line: "rgba(52,211,153,0.92)", halo: "rgba(52,211,153,0.10)", text: "#5eead4", fill: "rgba(52,211,153,0.045)" },
-  bear: { line: "rgba(248,113,113,0.92)", halo: "rgba(248,113,113,0.10)", text: "#fda4a4", fill: "rgba(248,113,113,0.045)" },
-  gold: { line: "rgba(212,175,55,0.92)", halo: "rgba(212,175,55,0.10)", text: "#e7cd6f", fill: "rgba(212,175,55,0.045)" },
-  violet: { line: "rgba(167,139,250,0.92)", halo: "rgba(167,139,250,0.10)", text: "#c7b8fd", fill: "rgba(139,92,246,0.04)" },
-  neutral: { line: "rgba(154,160,170,0.75)", halo: "rgba(154,160,170,0.06)", text: "#a6adb8", fill: "rgba(154,160,170,0.04)" },
+  bull: { line: "rgba(52,211,153,0.88)", halo: "rgba(52,211,153,0.07)", text: "#5eead4", fill: "rgba(52,211,153,0.028)" },
+  bear: { line: "rgba(248,113,113,0.88)", halo: "rgba(248,113,113,0.07)", text: "#fda4a4", fill: "rgba(248,113,113,0.028)" },
+  gold: { line: "rgba(212,175,55,0.88)", halo: "rgba(212,175,55,0.07)", text: "#e7cd6f", fill: "rgba(212,175,55,0.028)" },
+  violet: { line: "rgba(167,139,250,0.88)", halo: "rgba(167,139,250,0.07)", text: "#c7b8fd", fill: "rgba(139,92,246,0.025)" },
+  neutral: { line: "rgba(154,160,170,0.72)", halo: "rgba(154,160,170,0.05)", text: "#a6adb8", fill: "rgba(154,160,170,0.025)" },
 };
 
-/** D-058 — zone boxes at whisper fills (candles visible THROUGH them),
- *  0.7px borders. Faded zones scale everything by FADED_ALPHA. */
+/** D-058 — zone boxes at whisper fills (candles visible THROUGH them).
+ *  D-071 — fills + halos lightened to near-glass (user directive),
+ *  borders stay thin hard cores. Faded zones scale by FADED_ALPHA. */
 const ZONE_STYLE: Record<string, { fill: string; border: string; halo: string; text: string }> = {
-  supply: { fill: "rgba(239,83,80,0.07)", border: "rgba(239,83,80,0.62)", halo: "rgba(239,83,80,0.07)", text: "#fda4a4" },
-  demand: { fill: "rgba(38,166,154,0.07)", border: "rgba(38,166,154,0.62)", halo: "rgba(38,166,154,0.07)", text: "#5eead4" },
-  ob_bull: { fill: "rgba(59,130,246,0.07)", border: "rgba(59,130,246,0.58)", halo: "rgba(59,130,246,0.07)", text: "#93c5fd" },
-  ob_bear: { fill: "rgba(217,119,6,0.07)", border: "rgba(217,119,6,0.58)", halo: "rgba(217,119,6,0.07)", text: "#fcd34d" },
-  fvg_bull: { fill: "rgba(139,92,246,0.07)", border: "rgba(139,92,246,0.55)", halo: "rgba(139,92,246,0.07)", text: "#c7b8fd" },
-  fvg_bear: { fill: "rgba(236,72,153,0.06)", border: "rgba(236,72,153,0.5)", halo: "rgba(236,72,153,0.06)", text: "#f9a8d4" },
+  supply: { fill: "rgba(239,83,80,0.035)", border: "rgba(239,83,80,0.55)", halo: "rgba(239,83,80,0.045)", text: "#fda4a4" },
+  demand: { fill: "rgba(38,166,154,0.035)", border: "rgba(38,166,154,0.55)", halo: "rgba(38,166,154,0.045)", text: "#5eead4" },
+  ob_bull: { fill: "rgba(59,130,246,0.035)", border: "rgba(59,130,246,0.5)", halo: "rgba(59,130,246,0.045)", text: "#93c5fd" },
+  ob_bear: { fill: "rgba(217,119,6,0.035)", border: "rgba(217,119,6,0.5)", halo: "rgba(217,119,6,0.045)", text: "#fcd34d" },
+  fvg_bull: { fill: "rgba(139,92,246,0.035)", border: "rgba(139,92,246,0.48)", halo: "rgba(139,92,246,0.04)", text: "#c7b8fd" },
+  fvg_bear: { fill: "rgba(236,72,153,0.03)", border: "rgba(236,72,153,0.44)", halo: "rgba(236,72,153,0.04)", text: "#f9a8d4" },
 };
 
 /** D-053 — compact legend names for the external MARKS panel. */
@@ -112,7 +115,7 @@ function isFaded(d: { state?: "active" | "faded"; broken?: boolean; label?: stri
   return Boolean(d.broken) || Boolean(d.label?.includes("· tested"));
 }
 
-type LayerKey = "setup" | "zones" | "levels" | "structure" | "fib" | "whales" | "momentum" | "flow";
+type LayerKey = "setup" | "zones" | "levels" | "structure" | "fib" | "whales" | "momentum" | "flow" | "liquidity";
 
 /** One row of the external MARKS legend (outside the chart canvas). */
 export interface LegendMark {
@@ -325,6 +328,47 @@ function buildLegend(drawings: ChartDrawing[], tf: string): LegendMark[] {
           layer: "flow",
         });
         break;
+
+      // D-071 — the liquidity life-cycle joins the legend
+      case "liq":
+        marks.push({
+          key,
+          swatch: TONE[d.tone].text,
+          short:
+            d.state === "untouched"
+              ? `${d.side} $$`
+              : d.state === "swept" ? `${d.side} SWEPT` : `${d.side} RUN`,
+          detail:
+            d.state === "untouched"
+              ? d.dist_atr != null ? `${d.dist_atr} ATR` : ""
+              : d.disp_atr != null ? `${d.disp_atr} ATR` : "",
+          text: d.note || d.label,
+          faded: false,
+          layer: "liquidity",
+        });
+        break;
+      case "outlook":
+        marks.push({
+          key,
+          swatch: TONE[d.tone].text,
+          short: `DIRECTION ${d.dir === "up" ? "↑" : d.dir === "down" ? "↓" : "—"}`,
+          detail: d.fresh ? `${d.fresh.state} ${d.fresh.bars_ago}b ago` : "",
+          text: d.label,
+          faded: false,
+          layer: "liquidity",
+        });
+        break;
+      case "path":
+        marks.push({
+          key,
+          swatch: TONE[d.tone].text,
+          short: "DRAW PATH",
+          detail: `${d.to_price}`,
+          text: d.label,
+          faded: false,
+          layer: "liquidity",
+        });
+        break;
     }
   });
   return marks;
@@ -435,6 +479,7 @@ export default function PriceChart({
     whales: true, // whale/institutional event markers
     momentum: true, // D-058 — EMA 9/21/50 momentum ribbon
     flow: true, // D-067 — the candle battle badge + running candle
+    liquidity: true, // D-071 — pool life-cycle + DIRECTION outlook + path
   });
   const layersRef = useRef(layers);
   layersRef.current = layers;
@@ -446,6 +491,12 @@ export default function PriceChart({
   /* ------------------------------------- D-058 chart header dropdowns */
   const [tfOpen, setTfOpen] = useState(false);
   const [marksOpen, setMarksOpen] = useState(false);
+
+  /* ---------------------------------------- D-071 grid lines toggle */
+  // user directive: "চার্ট এর প্রাইস লাইনের সাথে থাকা গ্রিড লাইন গুলো যেনো
+  // আমি নিজেই হাইড করতে ও দৃশ্যমান করতে পারি একটি বাটন যুক্ত করতে
+  // হবে" — the button toggles the chart's own price/time grid.
+  const [gridOn, setGridOn] = useState(true);
 
   /* -------------------------------------------- D-058 fullscreen (in-chart) */
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -552,8 +603,8 @@ export default function PriceChart({
     const volume = chart.addHistogramSeries({
       priceScaleId: "",
       // D-058 — ghosted volume: a hint of participation, never a wall
-      // of color under the candles
-      color: "rgba(61,67,80,0.35)",
+      // of color under the candles (D-071 — ghosted further)
+      color: "rgba(61,67,80,0.22)",
       priceFormat: { type: "volume" },
     });
     chart.priceScale("").applyOptions({ scaleMargins: { top: 0.88, bottom: 0 } });
@@ -569,7 +620,7 @@ export default function PriceChart({
       volume.update({
         time: bar.t as UTCTimestamp,
         value: bar.v,
-        color: bar.c >= bar.o ? "rgba(38,166,154,0.25)" : "rgba(239,83,80,0.25)",
+        color: bar.c >= bar.o ? "rgba(38,166,154,0.16)" : "rgba(239,83,80,0.16)",
       });
     };
 
@@ -618,6 +669,18 @@ export default function PriceChart({
     };
   }, []);
 
+  /* ------------------------------------ D-071 apply grid visibility */
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    chart.applyOptions({
+      grid: {
+        vertLines: { visible: gridOn, color: "#141720" },
+        horzLines: { visible: gridOn, color: "#141720" },
+      },
+    });
+  }, [gridOn, ready]);
+
   /* ------------------------------------ symbol/TF switch -> reset series */
   useEffect(() => {
     const key = `${symbol}|${tf}`;
@@ -659,7 +722,7 @@ export default function PriceChart({
         clean.map((c) => ({
           time: c.t as UTCTimestamp,
           value: c.v,
-          color: c.c >= c.o ? "rgba(38,166,154,0.25)" : "rgba(239,83,80,0.25)",
+          color: c.c >= c.o ? "rgba(38,166,154,0.16)" : "rgba(239,83,80,0.16)",
         })),
       );
       chartRef.current?.timeScale().setVisibleLogicalRange(
@@ -696,7 +759,7 @@ export default function PriceChart({
           volumeRef.current?.update({
             time: bar.t as UTCTimestamp,
             value: bar.v,
-            color: bar.c >= bar.o ? "rgba(38,166,154,0.25)" : "rgba(239,83,80,0.25)",
+            color: bar.c >= bar.o ? "rgba(38,166,154,0.16)" : "rgba(239,83,80,0.16)",
           });
         } catch (err) {
           console.warn("chart update rejected — requesting resync", err);
@@ -861,13 +924,14 @@ export default function PriceChart({
     };
     /** HARD stroke: a whisper halo pass under a thin near-opaque core —
      * the "hard" look without fat lines (D-058: halo width+1.5, was
-     * +2.6 — thinner, the candles stay loud). */
+     * +2.6 — thinner, the candles stay loud).
+     * D-071 — halo underlay thinned to width+0.9 ("লাইন গুলো চিকন"). */
     const hardSeg = (
       x1: number, y1: number, x2: number, y2: number,
       color: string, halo: string, width: number, dash: number[],
     ) => {
       ctx.strokeStyle = halo;
-      ctx.lineWidth = width + 1.5;
+      ctx.lineWidth = width + 0.9;
       ctx.setLineDash([]);
       ctx.beginPath();
       ctx.moveTo(x1, y1);
@@ -971,14 +1035,14 @@ export default function PriceChart({
         const bw = Math.min(rightEdge, x2) - bx;
         if (bw <= 1) continue;
         ctx.fillStyle = d.tone === "gold"
-          ? "rgba(212,175,55,0.045)"
-          : "rgba(120,130,150,0.035)";
+          ? "rgba(212,175,55,0.026)"
+          : "rgba(120,130,150,0.02)";
         ctx.fillRect(bx, 0, bw, h);
-        // the band's left edge — a 0.6px whisper line
+        // the band's left edge — a 0.5px whisper line
         ctx.strokeStyle = d.tone === "gold"
-          ? "rgba(212,175,55,0.22)"
-          : "rgba(120,130,150,0.16)";
-        ctx.lineWidth = 0.6;
+          ? "rgba(212,175,55,0.15)"
+          : "rgba(120,130,150,0.11)";
+        ctx.lineWidth = 0.5;
         ctx.beginPath();
         ctx.moveTo(Math.round(bx) + 0.5, 0);
         ctx.lineTo(Math.round(bx) + 0.5, h);
@@ -1007,7 +1071,7 @@ export default function PriceChart({
             .filter((p): p is { x: number; y: number } =>
               p.x != null && p.y != null && p.x >= -2 && p.x <= rightEdge + 2);
           if (pts.length < 2) continue;
-          const width = line.period === 9 ? 0.85 : 0.7;
+          const width = line.period === 9 ? 0.6 : 0.5;
           ctx.strokeStyle = TONE[line.tone].line;
           ctx.lineWidth = width;
           ctx.beginPath();
@@ -1030,7 +1094,7 @@ export default function PriceChart({
         const above = d.side === "low";
         // small tick at the swing point
         ctx.strokeStyle = TONE[d.tone].line;
-        ctx.lineWidth = 0.8;
+        ctx.lineWidth = 0.6;
         ctx.beginPath();
         ctx.moveTo(x, y);
         ctx.lineTo(x, y + (above ? -7 : 7));
@@ -1070,9 +1134,9 @@ export default function PriceChart({
           const xe = x2 == null ? rightEdge : Math.min(rightEdge, x2);
           if (xe <= 0 || x1 > rightEdge) continue;
           // whisper fill + dashed hard border — the coil the cycle lives in
-          ctx.fillStyle = "rgba(212,175,55,0.035)";
+          ctx.fillStyle = "rgba(212,175,55,0.02)";
           ctx.fillRect(x1, Math.min(y1, y2), xe - x1, Math.abs(y2 - y1));
-          ctx.strokeStyle = "rgba(212,175,55,0.42)";
+          ctx.strokeStyle = "rgba(212,175,55,0.32)";
           ctx.lineWidth = 0.7;
           ctx.setLineDash([3, 3]);
           ctx.strokeRect(
@@ -1156,9 +1220,9 @@ export default function PriceChart({
           const xe = x2 == null ? rightEdge : Math.min(rightEdge, x2);
           if (xe <= 0 || x1 > rightEdge) continue;
           // whisper fill + dashed hard border — the pause box
-          ctx.fillStyle = "rgba(148,163,184,0.05)";
+          ctx.fillStyle = "rgba(148,163,184,0.03)";
           ctx.fillRect(x1, Math.min(y1, y2), xe - x1, Math.abs(y2 - y1));
-          ctx.strokeStyle = "rgba(148,163,184,0.4)";
+          ctx.strokeStyle = "rgba(148,163,184,0.3)";
           ctx.lineWidth = 0.7;
           ctx.setLineDash([3, 3]);
           ctx.strokeRect(
@@ -1182,7 +1246,7 @@ export default function PriceChart({
           if (y == null || y < 0 || y > h) continue;
           // the pullback magnet — thin dashed gold line, partial span
           ctx.strokeStyle = "rgba(212,175,55,0.55)";
-          ctx.lineWidth = 0.8;
+          ctx.lineWidth = 0.6;
           ctx.setLineDash([4, 4]);
           ctx.beginPath();
           const mx = Math.max(0, rightEdge - 220);
@@ -1325,6 +1389,134 @@ export default function PriceChart({
       }
     }
 
+    /* ------------------------------------ D-071 liquidity life-cycle */
+    // The user's question answered ON the chart: "লিকুডিটি নিলো, কি নিল
+    // না। নেওয়ার পরে লিকুডিটি রান করে নাকি সুয়েপ করবে" —
+    //  - untouched: dotted line + "$$" ticks at the right edge (the draw);
+    //  - swept: dashed line to the event, the harvest X, then the line
+    //    DIES (the pool is spent) + a reversal arrow away from the pool;
+    //  - run: dashed line to the event + a continuation arrow THROUGH it.
+    if (L.liquidity && !isSignals) {
+      for (const d of drawings) {
+        if (d.kind !== "liq") continue;
+        const y = yOf(d.price);
+        if (y == null || y < -5 || y > h + 5) continue;
+        const t = TONE[d.tone];
+        const x0raw = d.t ? xOf(d.t) : null;
+        const x0 = x0raw == null ? -2 : Math.max(-2, x0raw);
+        const xEv = d.t_event ? xOf(d.t_event) : null;
+        if (d.state === "untouched") {
+          // the draw — a thin dotted line to the right edge + $$ ticks
+          ctx.strokeStyle = t.line;
+          ctx.lineWidth = 0.55;
+          ctx.setLineDash([1.5, 3.5]);
+          ctx.beginPath();
+          ctx.moveTo(Math.max(0, x0), Math.round(y) + 0.5);
+          ctx.lineTo(rightEdge, Math.round(y) + 0.5);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          // the "$$" resting-liquidity ticks at the right end
+          ctx.save();
+          ctx.font = `700 8px ${FONT_FAMILY}`;
+          ctx.shadowColor = TEXT_SHADOW;
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = t.text;
+          ctx.fillText("$$", rightEdge - 14, y - 3);
+          ctx.restore();
+          // the pool word at the right edge
+          rightTag(
+            `${d.side} · ${d.dist_atr != null ? `${d.dist_atr}A` : "draw"}`,
+            y, d.tone,
+          );
+        } else {
+          // taken — the line stops at the event (the pool is spent)
+          const xe = xEv == null ? rightEdge : Math.min(rightEdge, xEv);
+          ctx.strokeStyle = t.line;
+          ctx.lineWidth = 0.55;
+          ctx.setLineDash(d.state === "swept" ? [2, 3] : [5, 3]);
+          ctx.beginPath();
+          ctx.moveTo(Math.max(0, x0), Math.round(y) + 0.5);
+          ctx.lineTo(Math.max(0, xe), Math.round(y) + 0.5);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          if (xEv != null && xEv >= 0 && xEv <= rightEdge) {
+            // the harvest X where the liquidity was taken
+            ctx.strokeStyle = t.line;
+            ctx.lineWidth = 0.8;
+            const r = 4;
+            ctx.beginPath();
+            ctx.moveTo(xEv - r, y - r); ctx.lineTo(xEv + r, y + r);
+            ctx.moveTo(xEv + r, y - r); ctx.lineTo(xEv - r, y + r);
+            ctx.stroke();
+            // the verdict arrow + word at the event
+            const dir = d.state === "swept"
+              ? (d.side === "BSL" ? "down" : "up")
+              : (d.side === "BSL" ? "up" : "down");
+            arrow(xEv + 14, y + (dir === "up" ? -14 : 14), dir, t.line, t.halo);
+            ctx.save();
+            ctx.font = `700 8px ${FONT_FAMILY}`;
+            ctx.shadowColor = TEXT_SHADOW;
+            ctx.shadowBlur = 3;
+            ctx.fillStyle = t.text;
+            ctx.fillText(
+              d.state === "swept"
+                ? `SWEPT → ${dir === "up" ? "↑" : "↓"}${d.disp_atr ?? ""}`
+                : `RUN → ${dir === "up" ? "↑" : "↓"}${d.disp_atr ?? ""}`,
+              xEv + 24, y + (dir === "up" ? -12 : 16),
+            );
+            ctx.restore();
+          }
+        }
+      }
+      // the DIRECTION outlook — three compact lines, top-left, no box
+      for (const d of drawings) {
+        if (d.kind !== "outlook") continue;
+        ctx.save();
+        ctx.shadowColor = TEXT_SHADOW;
+        ctx.shadowBlur = 3;
+        d.lines.forEach((line, i) => {
+          ctx.font = i === 0 ? `700 9px ${FONT_FAMILY}` : `600 8px ${FONT_FAMILY}`;
+          ctx.fillStyle = i === 0 ? TONE[d.tone].text : i === 1 ? "#9aa0aa" : "#b7bcc6";
+          ctx.fillText(line, 6, 18 + i * 11);
+        });
+        ctx.restore();
+      }
+      // the draw PATH — a dotted diagonal from live price to the target
+      for (const d of drawings) {
+        if (d.kind !== "path") continue;
+        const yA = yOf(d.from_price);
+        const yB = yOf(d.to_price);
+        if (yA == null || yB == null) continue;
+        const xA = rightEdge - 110;
+        const xB = rightEdge - 46;
+        ctx.save();
+        ctx.strokeStyle = TONE[d.tone].line;
+        ctx.lineWidth = 0.7;
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath();
+        ctx.moveTo(xA, yA);
+        ctx.lineTo(xB, yB);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // the arrowhead at the target end
+        const up = d.dir === "up";
+        ctx.fillStyle = TONE[d.tone].line;
+        ctx.beginPath();
+        ctx.moveTo(xB + 6, yB);
+        ctx.lineTo(xB - 1, yB + (up ? 3.5 : -3.5));
+        ctx.lineTo(xB - 1, yB + (up ? -3.5 : 3.5));
+        ctx.closePath();
+        ctx.fill();
+        // the target word
+        ctx.font = `700 8px ${FONT_FAMILY}`;
+        ctx.shadowColor = TEXT_SHADOW;
+        ctx.shadowBlur = 3;
+        ctx.fillStyle = TONE[d.tone].text;
+        ctx.fillText(`→ ${d.to_price}`, xB - 78, yB + (up ? -6 : 12));
+        ctx.restore();
+      }
+    }
+
     /* -------------------------------------------- zone boxes (D-053) */
     if (L.zones) {
       for (const d of drawings) {
@@ -1344,7 +1536,7 @@ export default function PriceChart({
         // halo underlay — the thin "hard" border pass (active only)
         if (!faded) {
           ctx.strokeStyle = style.halo;
-          ctx.lineWidth = 1.4;
+          ctx.lineWidth = 0.9;
           ctx.setLineDash([]);
           ctx.strokeRect(
             x1 - 0.5, Math.min(y1, y2) - 0.5,
@@ -1352,7 +1544,7 @@ export default function PriceChart({
           );
         }
         ctx.strokeStyle = style.border;
-        ctx.lineWidth = faded ? FADED_WIDTH : 0.7;
+        ctx.lineWidth = faded ? FADED_WIDTH : 0.55;
         ctx.setLineDash([]);
         ctx.strokeRect(
           x1 + 0.5, Math.min(y1, y2) + 0.5,
@@ -1385,10 +1577,10 @@ export default function PriceChart({
         if (solid) {
           // halo pass under solid key levels (PDH/PDL/POC/TAP)
           hardSeg(0, Math.round(y) + 0.5, rightEdge, Math.round(y) + 0.5,
-            TONE[d.tone].line, TONE[d.tone].halo, 1.1, []);
+            TONE[d.tone].line, TONE[d.tone].halo, 0.85, []);
         } else {
           ctx.strokeStyle = TONE[d.tone].line;
-          ctx.lineWidth = 0.9;
+          ctx.lineWidth = 0.65;
           ctx.setLineDash([5, 4]);
           ctx.beginPath();
           ctx.moveTo(0, Math.round(y) + 0.5);
@@ -1411,15 +1603,15 @@ export default function PriceChart({
           if (!upper || !lower) continue;
           const t = TONE[d.tone];
           // D-053 — thin core + halo: the hard look without fat strokes
-          hardSeg(upper.x1, upper.y1, upper.x2, upper.y2, t.line, t.halo, 1.1, []);
-          hardSeg(lower.x1, lower.y1, lower.x2, lower.y2, t.line, t.halo, 1.1, []);
-          if (median) strokeSeg(median, "rgba(154,160,170,0.45)", 0.7, [5, 4]);
+          hardSeg(upper.x1, upper.y1, upper.x2, upper.y2, t.line, t.halo, 0.85, []);
+          hardSeg(lower.x1, lower.y1, lower.x2, lower.y2, t.line, t.halo, 0.85, []);
+          if (median) strokeSeg(median, "rgba(154,160,170,0.4)", 0.55, [5, 4]);
           // projections to the right edge
           const up = projectToRight(upper);
           const lo = projectToRight(lower);
           ctx.setLineDash([4, 4]);
           ctx.strokeStyle = t.line;
-          ctx.lineWidth = 0.8;
+          ctx.lineWidth = 0.6;
           ctx.beginPath();
           ctx.moveTo(upper.x2, upper.y2);
           ctx.lineTo(rightEdge, up.yEnd);
@@ -1439,10 +1631,10 @@ export default function PriceChart({
             ctx.globalAlpha = 1;
           } else {
             const t = TONE[d.tone];
-            hardSeg(s.x1, s.y1, s.x2, s.y2, t.line, t.halo, 1.1, []);
+            hardSeg(s.x1, s.y1, s.x2, s.y2, t.line, t.halo, 0.85, []);
             const proj = projectToRight(s);
             ctx.strokeStyle = t.line;
-            ctx.lineWidth = 0.8;
+            ctx.lineWidth = 0.6;
             ctx.setLineDash([5, 4]);
             ctx.beginPath();
             ctx.moveTo(s.x2, s.y2);
@@ -1461,7 +1653,7 @@ export default function PriceChart({
             ? "rgba(248,113,113,0.9)"
             : "rgba(52,211,153,0.9)";
           ctx.strokeStyle = color;
-          ctx.lineWidth = 1;
+          ctx.lineWidth = 0.7;
           ctx.setLineDash([2, 3]);
           ctx.beginPath();
           ctx.moveTo(xStart, Math.round(y) + 0.5);
@@ -1470,8 +1662,8 @@ export default function PriceChart({
           ctx.setLineDash([]);
           // the stop-hunt X — halo + thin hard core
           if (x != null && x >= 0 && x <= rightEdge) {
-            hardSeg(x - 4, y - 4, x + 4, y + 4, color, TONE[d.tone].halo, 1.1, []);
-            hardSeg(x + 4, y - 4, x - 4, y + 4, color, TONE[d.tone].halo, 1.1, []);
+            hardSeg(x - 4, y - 4, x + 4, y + 4, color, TONE[d.tone].halo, 0.8, []);
+            hardSeg(x + 4, y - 4, x - 4, y + 4, color, TONE[d.tone].halo, 0.8, []);
           }
           // D-053 — no label on the canvas (lives in the MARKS legend)
         } else if (d.kind === "structure") {
@@ -1534,10 +1726,10 @@ export default function PriceChart({
           if (key) {
             // golden pocket: halo + hard core
             hardSeg(fx, Math.round(y) + 0.5, rightEdge, Math.round(y) + 0.5,
-              "rgba(212,175,55,0.9)", TONE.gold.halo, 1, []);
+              "rgba(212,175,55,0.9)", TONE.gold.halo, 0.75, []);
           } else {
             ctx.strokeStyle = "rgba(212,175,55,0.35)";
-            ctx.lineWidth = 0.7;
+            ctx.lineWidth = 0.6;
             ctx.setLineDash([3, 3]);
             ctx.beginPath();
             ctx.moveTo(fx, Math.round(y) + 0.5);
@@ -1578,11 +1770,11 @@ export default function PriceChart({
         ctx.fillStyle = TONE[tone].fill;
         ctx.fillRect(x0, Math.min(yZhi, yZlo), rightEdge - x0, Math.abs(yZlo - yZhi));
         ctx.strokeStyle = TONE[tone].halo;
-        ctx.lineWidth = 1.4;
+        ctx.lineWidth = 0.9;
         ctx.setLineDash([]);
         ctx.strokeRect(x0 - 0.5, Math.min(yZhi, yZlo) - 0.5, rightEdge - x0 + 1, Math.abs(yZlo - yZhi) + 1);
         ctx.strokeStyle = TONE[tone].line;
-        ctx.lineWidth = 0.9;
+        ctx.lineWidth = 0.7;
         ctx.strokeRect(x0 + 0.5, Math.min(yZhi, yZlo) + 0.5, rightEdge - x0 - 1, Math.abs(yZlo - yZhi) - 1);
         tag(
           `${setup.dir} SETUP${setup.status === "triggered" ? " · ENTRY TAKEN" : " · FORMING"}`,
@@ -1599,16 +1791,16 @@ export default function PriceChart({
         // D-053 — the entry-setup lines are the one place the hard halo
         // really matters: these ARE the trade (user directive).
         hardSeg(x, Math.round(y) + 0.5, rightEdge, Math.round(y) + 0.5,
-          color, halo, 1.1, dash);
+          color, halo, 0.85, dash);
         rightTag(label, y, "neutral");
       };
       // risk / reward shading between entry and sl / tp
       if (yE != null && yS != null) {
-        ctx.fillStyle = "rgba(248,113,113,0.07)";
+        ctx.fillStyle = "rgba(248,113,113,0.045)";
         ctx.fillRect(x0, Math.min(yE, yS), rightEdge - x0, Math.abs(yS - yE));
       }
       if (yE != null && yT != null) {
-        ctx.fillStyle = "rgba(52,211,153,0.07)";
+        ctx.fillStyle = "rgba(52,211,153,0.045)";
         ctx.fillRect(x0, Math.min(yE, yT), rightEdge - x0, Math.abs(yT - yE));
       }
       line(yE, "rgba(212,175,55,0.95)", TONE.gold.halo, [], `ENTRY ${setup.entry}`, x0);
@@ -1753,6 +1945,7 @@ export default function PriceChart({
   const showLoading = candlesLoading || (!dataApplied && market !== "closed");
   const layerChips: { key: LayerKey; label: string }[] = [
     { key: "setup", label: "Setup" },
+    { key: "liquidity", label: "Liquidity" },
     { key: "zones", label: "Zones" },
     { key: "levels", label: "Levels" },
     { key: "structure", label: "Structure" },
@@ -1943,6 +2136,25 @@ export default function PriceChart({
             )}
           </div>
         )}
+
+        {/* D-071 — grid lines hide/show toggle (user directive: "গ্রিড
+         *  লাইন গুলো যেনো আমি নিজেই হাইড করতে ও দৃশ্যমান করতে পারি") */}
+        <button
+          type="button"
+          onClick={() => setGridOn((v) => !v)}
+          className={`flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] font-bold transition-colors ${
+            gridOn
+              ? "border-zinc-700 bg-zinc-900/80 text-zinc-300 hover:border-gold/40 hover:text-gold"
+              : "border-zinc-800 bg-zinc-950/80 text-zinc-600 hover:text-zinc-400"
+          }`}
+          aria-label={gridOn ? "Hide grid lines" : "Show grid lines"}
+          title={gridOn ? "Hide the price/time grid" : "Show the price/time grid"}
+        >
+          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+            <path d="M3 9h18M3 15h18M9 3v18M15 3v18" strokeLinecap="round" />
+          </svg>
+          Grid
+        </button>
 
         {/* symbol + live quote */}
         <span className="ml-1 flex min-w-0 items-center gap-1.5 text-[10px] font-semibold text-zinc-500">

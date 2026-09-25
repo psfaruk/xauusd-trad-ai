@@ -106,7 +106,9 @@ def test_setup_drawing_on_bullish_ict_tape():
     out = build_drawings(frames, _snaps(frames), price, [])
     # D-058 — the momentum ribbon / swing labels / session bands joined
     # the sheet; the cap is 42, this fixture lands ~30
-    assert len(out) <= 36
+    # D-071 — the liquidity set (up to 5 pool marks + outlook + path)
+    # joined: the fixture lands ~38
+    assert len(out) <= 42
     setups = [d for d in out if d["kind"] == "setup"]
     assert len(setups) == 1
     s = setups[0]

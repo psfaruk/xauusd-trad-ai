@@ -1408,6 +1408,67 @@ export interface RejectDrawing {
   tone: DrawingTone;
 }
 
+/**
+ * D-071 — the liquidity life-cycle mark ("রান করে নাকি সুয়েপ করবে"):
+ * every resting-liquidity pool with its LIVE state.
+ *  - untouched: the draw — resting liquidity price is pulled toward;
+ *  - swept: stops harvested then rejected -> expect REVERSAL away;
+ *  - run: pool consumed, price closed through -> expect CONTINUATION.
+ */
+export interface LiqDrawing {
+  kind: "liq";
+  side: "BSL" | "SSL";
+  price: number;
+  t: string | null;
+  state: "untouched" | "swept" | "run";
+  t_event: string | null;
+  disp_atr: number | null;
+  dist_atr: number | null;
+  source: string;
+  label: string;
+  note?: string | null;
+  tone: DrawingTone;
+}
+
+/** D-071 — the DIRECTION outlook: the one honest market-direction
+ *  verdict (fresh liquidity event > draw-on-liquidity > regime),
+ *  rendered as three compact lines on the chart canvas. */
+export interface OutlookDrawing {
+  kind: "outlook";
+  dir: "up" | "down" | null;
+  regime: string | null;
+  vol: string | null;
+  bias: string | null;
+  draw_dir: "up" | "down" | null;
+  draw_side: "BSL" | "SSL" | null;
+  draw_price: number | null;
+  fresh: {
+    state: "swept" | "run";
+    side: "BSL" | "SSL";
+    price: number;
+    t: string | null;
+    bars_ago: number;
+    disp_atr: number | null;
+    dir: "up" | "down";
+  } | null;
+  label: string;
+  lines: string[];
+  note?: string | null;
+  tone: DrawingTone;
+}
+
+/** D-071 — the dotted draw-path from live price to the target pool. */
+export interface PathDrawing {
+  kind: "path";
+  dir: "up" | "down";
+  from_price: number;
+  to_price: number;
+  dist_atr: number | null;
+  label: string;
+  note?: string | null;
+  tone: DrawingTone;
+}
+
 export type ChartDrawing =
   | HLineDrawing
   | ZoneDrawing
@@ -1427,4 +1488,7 @@ export type ChartDrawing =
   | MagnetDrawing
   | LadderDrawing
   | BattleDrawing
-  | RejectDrawing;
+  | RejectDrawing
+  | LiqDrawing
+  | OutlookDrawing
+  | PathDrawing;
