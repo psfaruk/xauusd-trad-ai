@@ -1,5 +1,13 @@
 /**
- * AiView (D-041/D-042/D-044) — the AI Trading tab.
+ * AiView (D-041/D-042/D-044/D-077) — the AI Trading tab.
+ *
+ * D-077 — ONE tab, per the user's directive (Bengali, verbatim):
+ * "দুইটি ট্যাব ... auto trad ও Ai trading, আমি দেখতে ছি দুইটার কাজ
+ * same, তোমি এই দুইটা কে মার্জ করে একটি ট্যাব রাখো, সেটি হলো Ai
+ * trading ... অটো ট্রেড ট্যাব টি দরকার নাই" — the Auto Trade tab is
+ * merged INTO this view: the per-pair control room (signal engines,
+ * auto-trade execution, per-pair lots + the shared money window) sits
+ * in sequence right under the master arm card. One tab, one truth.
  *
  * D-044 institutional multi-user model:
  *  - the auto-trading switch arms THE USER'S OWN account (practice plane:
@@ -15,32 +23,40 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   getAnalysis,
+  getConfig,
   getTradingPositions,
   getTradingSettings,
   getTradingTrades,
   postMt5AutoTrade,
   postTradingClose,
   postTradingOrder,
+  putConfig,
   putTradingSettings,
 } from "../lib/api";
 import type {
-  AnalysisResponse, Mt5AutoTradeStatus, OrderResult, Signal, TradeRecord,
-  TradingPendingOrder, TradingPosition, UserSettings, WsMt5AutoMsg,
+  AnalysisResponse, EngineConfig, Mt5AutoTradeStatus, OrderResult, Signal,
+  TradeRecord, TradingPendingOrder, TradingPosition, TradingStatus,
+  UserSettings, WsMt5AutoMsg,
 } from "../types";
 import {
   Badge, Btn, Card, EmptyState, Field, NumberField, SectionTitle, Stat, inputCls,
 } from "../components/ui";
-import { MARKET_KEYS } from "../lib/markets";
+import { MARKETS, MARKET_KEYS } from "../lib/markets";
 import { fmtTime } from "../components/SignalDetail";
 import StrategyRadar from "../components/StrategyRadar";
 
 interface Props {
   token: string;
   symbol: string;
+  /** D-077 — the live symbol list (backend symbols UNION all markets). */
+  symbols: string[];
+  isAdmin: boolean;
   autoStatus: Mt5AutoTradeStatus | null;
   autoEvents: WsMt5AutoMsg[];
+  tradingAccount: TradingStatus | null;
   refreshKey: number;
   signals: Signal[];
   onArmChanged: () => void;
@@ -54,13 +70,23 @@ function ToggleSwitch({
   onToggle,
   labelOn = "ON",
   labelOff = "OFF",
+  tone = "emerald",
 }: {
   on: boolean;
   busy?: boolean;
   onToggle: (next: boolean) => void;
   labelOn?: string;
   labelOff?: string;
+  /** D-077 — gold tone for the execution-tier switches (was the Auto Trade
+   * tab's switch; one component now serves both tiers). */
+  tone?: "emerald" | "gold";
 }) {
+  const onCls =
+    tone === "gold"
+      ? "border-gold/50 bg-gold/20"
+      : "border-emerald-500/50 bg-emerald-500/25";
+  const knobCls = tone === "gold" ? "bg-gold" : "bg-emerald-400";
+  const txtCls = tone === "gold" ? "text-gold-200" : "text-emerald-200";
   return (
     <button
       type="button"
@@ -69,17 +95,19 @@ function ToggleSwitch({
       disabled={busy}
       onClick={() => onToggle(!on)}
       className={`relative h-8 w-14 shrink-0 rounded-full border transition-colors disabled:opacity-50 ${
-        on ? "border-emerald-500/50 bg-emerald-500/25" : "border-zinc-700 bg-zinc-800"
+        on ? onCls : "border-zinc-700 bg-zinc-800"
       }`}
     >
       <span
         className={`absolute top-1/2 h-7 w-7 -translate-y-1/2 rounded-full shadow-lg transition-all ${
-          on ? "left-[calc(100%-1.75rem)] bg-emerald-400" : "left-0.5 bg-zinc-500"
+          on ? `left-[calc(100%-1.75rem)] ${knobCls}` : "left-0.5 bg-zinc-500"
         }`}
       />
-      <span className={`absolute inset-y-0 flex items-center text-[9px] font-bold tracking-wide ${
-        on ? "left-2.5 text-emerald-200" : "right-2.5 text-zinc-400"
-      }`}>
+      <span
+        className={`absolute inset-y-0 flex items-center text-[9px] font-bold tracking-wide ${
+          on ? `left-2.5 ${txtCls}` : "right-2.5 text-zinc-400"
+        }`}
+      >
         {on ? labelOn : labelOff}
       </span>
     </button>
@@ -514,6 +542,458 @@ function ArmCard({
           onClose={() => setShowMoney(false)}
         />
       )}
+    </Card>
+  );
+}
+
+/* ------------------------------------- D-077 pair control room (merged) */
+
+/** D-077 — the Auto Trade tab's content, merged INTO AI Trading (user
+ * directive: one tab). Three control layers, honestly separated:
+ *  1. SIGNAL ENGINES (admin, engine config): which pairs get signal
+ *     engines at all (signal_symbols — PUT /api/config).
+ *  2. AUTO-TRADE EXECUTION (admin, engine config): which pairs may EXECUTE
+ *     orders (auto_trade_symbols — same PUT; signals still generate).
+ *  3. LOT SIZE / MONEY WINDOW (every user, user settings): the per-pair
+ *     lot map (symbol_lots) + shared window (PUT /api/trading/settings).
+ *
+ * The MASTER arm switch is the ArmCard above — exactly ONE master per tab
+ * (the old Auto Trade tab carried a second, duplicate one).
+ */
+function LotField({
+  value,
+  fallback,
+  onCommit,
+  busy,
+}: {
+  value: number | undefined;
+  fallback: number;
+  onCommit: (v: number | undefined) => void;
+  busy?: boolean;
+}) {
+  const [draft, setDraft] = useState<string>("");
+  const [focused, setFocused] = useState(false);
+  const shown = focused
+    ? draft
+    : value != null
+      ? String(value)
+      : "";
+  const placeholder = focused ? String(fallback) : `auto (${fallback})`;
+  return (
+    <div className="flex items-center gap-2">
+      <input
+        type="text"
+        inputMode="decimal"
+        value={shown}
+        placeholder={placeholder}
+        disabled={busy}
+        onFocus={(e) => {
+          setFocused(true);
+          setDraft(value != null ? String(value) : "");
+          requestAnimationFrame(() => e.target.select());
+        }}
+        onBlur={() => {
+          setFocused(false);
+          const parsed = parseFloat(draft);
+          if (Number.isFinite(parsed) && parsed >= 0.01 && parsed <= 100) {
+            onCommit(Math.round(parsed * 100) / 100);
+          } else if (draft.trim() === "") {
+            onCommit(undefined); // back to the fallback
+          }
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") e.currentTarget.blur();
+        }}
+        onChange={(e) => setDraft(e.target.value)}
+        className="h-9 w-24 rounded-lg border border-white/10 bg-ink-800/80 px-2.5 text-right font-mono text-xs text-cream-100 outline-none transition-colors focus:border-gold/60 disabled:opacity-50"
+      />
+      <span className="text-[10px] text-cream-300/60">lots</span>
+    </div>
+  );
+}
+
+function MarketDot({ state }: { state: "open" | "closed" | "unknown" }) {
+  const color =
+    state === "open"
+      ? "bg-emerald-400"
+      : state === "closed"
+        ? "bg-zinc-500"
+        : "bg-amber-400";
+  return <span className={`inline-block h-2 w-2 rounded-full ${color}`} />;
+}
+
+function PairControlRoom({
+  token,
+  symbols,
+  autoStatus,
+  isAdmin,
+  tradingAccount,
+  onArmChanged,
+}: {
+  token: string;
+  symbols: string[];
+  autoStatus: Mt5AutoTradeStatus | null;
+  isAdmin: boolean;
+  tradingAccount: TradingStatus | null;
+  onArmChanged: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const [busyPair, setBusyPair] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [savedFlash, setSavedFlash] = useState<string | null>(null);
+  const [settings, setSettings] = useState<UserSettings | null>(null);
+  const [lotsDraft, setLotsDraft] = useState<Record<string, number>>({});
+
+  const configQuery = useQuery({
+    queryKey: ["autotrade-config"],
+    enabled: !!token,
+    queryFn: () => getConfig(token),
+    refetchOnWindowFocus: false,
+    staleTime: 15_000,
+  });
+  const cfg: EngineConfig | null = configQuery.data?.config ?? null;
+
+  useEffect(() => {
+    if (!token) return;
+    getTradingSettings(token)
+      .then((s) => {
+        setSettings(s);
+        setLotsDraft(s.symbol_lots ?? {});
+      })
+      .catch(() => undefined);
+  }, [token]);
+
+  const armed = autoStatus?.armed ?? false;
+  const markets = autoStatus?.markets ?? {};
+
+  const flash = useCallback((msg: string) => {
+    setSavedFlash(msg);
+    window.setTimeout(() => setSavedFlash(null), 2600);
+  }, []);
+
+  /* ---- engine-level toggles (admin): signal_symbols + auto_trade_symbols */
+  const patchConfig = useCallback(
+    async (patch: Partial<EngineConfig>) => {
+      if (!cfg || !token) return;
+      setBusyPair("cfg");
+      setError(null);
+      try {
+        await putConfig(token, { ...cfg, ...patch });
+        await queryClient.invalidateQueries({ queryKey: ["autotrade-config"] });
+        onArmChanged();
+        flash("Engine config saved — runtimes reconcile live");
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "config save failed");
+      } finally {
+        setBusyPair(null);
+      }
+    },
+    [cfg, token, queryClient, onArmChanged, flash],
+  );
+
+  const toggleSignal = useCallback(
+    (key: string, next: boolean) => {
+      if (!cfg) return;
+      const cur = cfg.signal_symbols ?? [];
+      const nextList = next
+        ? [...new Set([...cur, key])]
+        : cur.filter((s) => s !== key);
+      if (nextList.length === 0) return; // never empty
+      void patchConfig({ signal_symbols: nextList });
+    },
+    [cfg, patchConfig],
+  );
+
+  const toggleAuto = useCallback(
+    (key: string, next: boolean) => {
+      if (!cfg) return;
+      const signals = cfg.signal_symbols ?? [];
+      const cur = cfg.auto_trade_symbols ?? [];
+      let nextList = next
+        ? [...new Set([...cur, key])]
+        : cur.filter((s) => s !== key);
+      // the auto-trade set must stay a subset of the signal set
+      nextList = nextList.filter((s) => signals.includes(s));
+      void patchConfig({ auto_trade_symbols: nextList });
+    },
+    [cfg, patchConfig],
+  );
+
+  /* ---- per-pair lots (user settings) */
+  const commitLots = useCallback(
+    async (next: Record<string, number>) => {
+      if (!token) return;
+      setBusyPair("lots");
+      setError(null);
+      try {
+        await putTradingSettings(token, { symbol_lots: next });
+        setLotsDraft(next);
+        flash("Per-pair lot sizes saved");
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "lot save failed");
+      } finally {
+        setBusyPair(null);
+      }
+    },
+    [token, flash],
+  );
+
+  const setLot = useCallback(
+    (key: string, v: number | undefined) => {
+      const next = { ...lotsDraft };
+      if (v == null) delete next[key];
+      else next[key] = v;
+      void commitLots(next);
+    },
+    [lotsDraft, commitLots],
+  );
+
+  /* ---- the money window (user settings) */
+  const winBusy = busyPair === "window";
+  const patchWindow = useCallback(
+    async (patch: Partial<UserSettings>) => {
+      if (!token) return;
+      setBusyPair("window");
+      setError(null);
+      try {
+        const clean = await putTradingSettings(token, patch);
+        setSettings((s) => ({ ...(s ?? ({} as UserSettings)), ...clean }));
+        flash("Money window saved");
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "save failed");
+      } finally {
+        setBusyPair(null);
+      }
+    },
+    [token, flash],
+  );
+
+  const pairs = useMemo(() => {
+    const offered = symbols.length ? symbols : MARKETS.map((m) => m.key);
+    return MARKETS.filter((m) => offered.includes(m.key));
+  }, [symbols]);
+
+  const fixedLot = settings?.fixed_lot ?? cfg?.fixed_lot ?? 0.01;
+
+  return (
+    <Card>
+      <SectionTitle
+        title="Pairs & Lots"
+        right={
+          armed ? (
+            <Badge tone="green" pulse>ARMED</Badge>
+          ) : (
+            <Badge tone="amber">SIGNALS ONLY</Badge>
+          )
+        }
+      />
+      <p className="text-[11px] leading-relaxed text-zinc-400">
+        Every pair in one place: signal engines, auto-trade execution and
+        per-pair lot sizes. The master switch above arms execution; signals
+        keep generating on every enabled pair either way.
+      </p>
+
+      {error ? (
+        <div className="mt-2 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] text-red-200">
+          {error}
+        </div>
+      ) : null}
+      {savedFlash ? (
+        <div className="mt-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-200">
+          {savedFlash}
+        </div>
+      ) : null}
+
+      <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+        {pairs.map((m) => {
+          const key = m.key;
+          const signalOn = (cfg?.signal_symbols ?? []).includes(key);
+          const autoOn = (cfg?.auto_trade_symbols ?? []).includes(key);
+          const mkState = markets[key]?.open;
+          const dotState =
+            mkState === true
+              ? "open"
+              : mkState === false
+                ? "closed"
+                : "unknown";
+          const lot = lotsDraft[key];
+          const busy = busyPair === "cfg" || busyPair === "lots";
+          return (
+            <div
+              key={key}
+              className={`rounded-2xl border p-4 transition-colors ${
+                autoOn && armed
+                  ? "border-emerald-500/30 bg-emerald-500/5"
+                  : "border-white/10 bg-ink-900/60"
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <MarketDot state={dotState} />
+                  <div className="min-w-0">
+                    <div className="text-sm font-bold text-cream-100">
+                      {key}
+                    </div>
+                    <div className="truncate text-[10px] text-cream-300/60">
+                      {m.name}
+                      {markets[key]?.detail
+                        ? ` · ${markets[key].detail}`
+                        : ""}
+                    </div>
+                  </div>
+                </div>
+                <span
+                  className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                    autoOn
+                      ? "bg-emerald-500/20 text-emerald-300"
+                      : "bg-zinc-700/60 text-zinc-300"
+                  }`}
+                >
+                  {autoOn ? (armed ? "TRADING" : "ENABLED") : "OFF"}
+                </span>
+              </div>
+
+              <div className="mt-3 flex flex-col gap-2.5">
+                {/* signals engine (admin) */}
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-semibold text-cream-200">
+                      Signals
+                    </div>
+                    <div className="text-[10px] text-cream-300/50">
+                      engine + chart drawings for this pair
+                    </div>
+                  </div>
+                  <ToggleSwitch
+                    on={signalOn}
+                    busy={busy}
+                    onToggle={(next) => {
+                      if (isAdmin) toggleSignal(key, next);
+                    }}
+                  />
+                </div>
+
+                {/* auto-trade execution (admin) */}
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-semibold text-cream-200">
+                      Auto trade
+                    </div>
+                    <div className="text-[10px] text-cream-300/50">
+                      execute orders on this pair
+                    </div>
+                  </div>
+                  <ToggleSwitch
+                    on={autoOn}
+                    busy={busy}
+                    tone="gold"
+                    onToggle={(next) => {
+                      if (isAdmin) toggleAuto(key, next);
+                    }}
+                  />
+                </div>
+
+                {/* per-pair lot (user) */}
+                <div className="flex items-center justify-between gap-2 border-t border-white/5 pt-2.5">
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-semibold text-cream-200">
+                      Lot size
+                    </div>
+                    <div className="text-[10px] text-cream-300/50">
+                      empty = window default ({fixedLot})
+                    </div>
+                  </div>
+                  <LotField
+                    value={lot}
+                    fallback={fixedLot}
+                    busy={busyPair === "lots"}
+                    onCommit={(v) => setLot(key, v)}
+                  />
+                </div>
+              </div>
+
+              {!isAdmin ? (
+                <p className="mt-2.5 text-[10px] text-cream-300/40">
+                  Signal/auto-trade switches are admin-controlled.
+                </p>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* ---------------------------------------------- money window */}
+      <div className="mt-3 rounded-2xl border border-white/10 bg-ink-900/60 p-4">
+        <h3 className="text-sm font-bold text-cream-100">
+          Money window{" "}
+          <span className="text-[10px] font-normal text-cream-300/50">
+            shared by every pair (per-pair lots above override the default)
+          </span>
+        </h3>
+        <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+          {(
+            [
+              ["day_start_balance", "Today's balance", "USD"],
+              ["daily_loss_usd", "Daily stop loss", "USD"],
+              ["daily_profit_usd", "Daily target", "USD"],
+              ["max_trades_per_day", "Signals / day", ""],
+              ["max_positions", "Open trades", ""],
+            ] as const
+          ).map(([k, label, unit]) => (
+            <label key={k} className="flex min-w-0 flex-col gap-1">
+              <span className="text-[10px] font-semibold text-cream-300/70">
+                {label}
+                {unit ? ` (${unit})` : ""}
+              </span>
+              <input
+                type="text"
+                inputMode="decimal"
+                disabled={winBusy}
+                defaultValue={
+                  settings?.[k] != null ? String(settings[k]) : ""
+                }
+                key={`${k}-${settings?.[k] ?? ""}`}
+                onBlur={(e) => {
+                  const parsed = parseFloat(e.target.value);
+                  if (!Number.isFinite(parsed)) return;
+                  void patchWindow({
+                    [k]:
+                      k === "max_trades_per_day" || k === "max_positions"
+                        ? Math.round(parsed)
+                        : Math.round(parsed * 100) / 100,
+                  } as Partial<UserSettings>);
+                }}
+                className="h-9 rounded-lg border border-white/10 bg-ink-800/80 px-2.5 text-xs text-cream-100 outline-none transition-colors focus:border-gold/60 disabled:opacity-50"
+              />
+            </label>
+          ))}
+        </div>
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <p className="text-[10px] text-cream-300/50">
+            Practice balance:{" "}
+            <span className="font-mono text-cream-200">
+              {tradingAccount?.account?.balance?.toFixed(2) ?? "—"}{" "}
+              {tradingAccount?.account?.currency ?? "USD"}
+            </span>
+          </p>
+          <label className="flex items-center gap-2 text-[11px] text-cream-200">
+            risk mode
+            <select
+              value={settings?.risk_mode ?? "fixed"}
+              disabled={winBusy}
+              onChange={(e) =>
+                void patchWindow({
+                  risk_mode: e.target.value as "fixed" | "percent",
+                })
+              }
+              className="h-8 rounded-lg border border-white/10 bg-ink-800/80 px-2 text-xs text-cream-100 outline-none focus:border-gold/60"
+            >
+              <option value="fixed">fixed lot</option>
+              <option value="percent">% risk</option>
+            </select>
+          </label>
+        </div>
+      </div>
     </Card>
   );
 }
@@ -1141,27 +1621,43 @@ function HistoryCard({ token, refreshKey }: { token: string; refreshKey: number 
 export default function AiView({
   token,
   symbol,
+  symbols,
+  isAdmin,
   autoStatus,
   autoEvents,
+  tradingAccount,
   refreshKey,
   signals,
   onArmChanged,
 }: Props) {
   const [tick, setTick] = useState(0);
   const bump = useCallback(() => setTick((t) => t + 1), []);
-  const symbols = useMemo(() => {
-    // D-076 — every market (was the hardcoded gold/btc pair)
-    const s = [symbol, ...MARKET_KEYS];
+  const orderSymbols = useMemo(() => {
+    // D-077 — the manual-order pad uses the live symbol list (backend
+    // symbols UNION every market) with the active pair first
+    const s = [symbol, ...symbols, ...MARKET_KEYS];
     return [...new Set(s.filter(Boolean))];
-  }, [symbol]);
+  }, [symbol, symbols]);
   const activeSignals = signals.filter((s) => s.status === "active");
 
   return (
     <div className="flex min-w-0 flex-col gap-3">
       <ArmCard status={autoStatus} token={token} onArmChanged={onArmChanged} />
 
+      {/* D-077 — the merged Auto Trade control room: per-pair signal /
+       * execute switches + per-pair lots + the shared money window, in
+       * sequence under the ONE master arm card above. */}
+      <PairControlRoom
+        token={token}
+        symbols={symbols}
+        autoStatus={autoStatus}
+        isAdmin={isAdmin}
+        tradingAccount={tradingAccount}
+        onArmChanged={onArmChanged}
+      />
+
       {/* D-051 — live per-strategy state, every M1 close (all markets) */}
-      <StrategyRadar symbols={symbols} />
+      <StrategyRadar symbols={orderSymbols} />
 
       {activeSignals.length > 0 && (
         <Card>
@@ -1185,7 +1681,7 @@ export default function AiView({
           last (collapsible) */}
       <EventFeed events={autoEvents} />
       <PositionsCard token={token} refreshKey={refreshKey + tick} onChanged={bump} />
-      <ManualTradeCard token={token} symbols={symbols} refresh={bump} />
+      <ManualTradeCard token={token} symbols={orderSymbols} refresh={bump} />
       <HistoryCard token={token} refreshKey={refreshKey + tick} />
       <MarketIntelligenceCard token={token} symbol={symbol} />
     </div>

@@ -1035,9 +1035,10 @@ export interface CotBlock {
   note?: string;
 }
 
-/** D-039/D-076: app-level navigation tabs (mobile bottom bar / desktop
- * ⋮ menu). "autotrade" — the per-pair Auto Trading control room. */
-export type AppTab = "home" | "charts" | "ai" | "autotrade" | "settings";
+/** D-039/D-077: app-level navigation tabs (mobile bottom bar / desktop
+ * rail). The Auto Trade tab was merged INTO "ai" (AI Trading) per the
+ * user's directive — the per-pair control room lives inside it. */
+export type AppTab = "home" | "charts" | "ai" | "settings";
 
 /* ------------------------------------------------ D-042: ICT/SMC analysis */
 

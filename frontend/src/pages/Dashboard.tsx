@@ -6,7 +6,6 @@ import ErrorBoundary from "../components/ErrorBoundary";
 import HomeView from "../views/HomeView";
 import ChartsView from "../views/ChartsView";
 import AiView from "../views/AiView";
-import AutoTradeView from "../views/AutoTradeView";
 import SettingsView from "../views/SettingsView";
 import { useAuth } from "../lib/auth";
 import { allSymbols } from "../lib/markets";
@@ -326,7 +325,16 @@ export default function Dashboard() {
                 <span className="flex items-center gap-1 text-amber-400">reconnecting…</span>
               )}
               {mt5?.status === "disconnected" && (
-                <span className="flex items-center gap-1 text-red-400">offline</span>
+                <span
+                  className="flex items-center gap-1 text-red-400"
+                  title={
+                    mt5?.feed?.note ??
+                    mt5?.feed?.detail ??
+                    "data source offline — reconnecting"
+                  }
+                >
+                  offline
+                </span>
               )}
               <button
                 type="button"
@@ -389,25 +397,20 @@ export default function Dashboard() {
             )}
             {activeTab === "ai" && (
               <div className="mx-auto w-full max-w-5xl">
+                {/* D-077 — ONE tab: the Auto Trade control room merged INTO
+                 * AI Trading (user directive: "দুইটা কে মার্জ করে একটি ট্যাব
+                 * রাখো, সেটি হলো Ai trading") — per-pair switches + lots live
+                 * here, in sequence under the master arm card. */}
                 <AiView
                   token={token ?? ""}
                   symbol={symbol}
+                  symbols={symbols}
+                  isAdmin={isAdmin}
                   autoStatus={autoStatus}
                   autoEvents={autoEvents}
+                  tradingAccount={tradingAccount}
                   refreshKey={aiRefreshKey}
                   signals={signals}
-                  onArmChanged={refreshSlow}
-                />
-              </div>
-            )}
-            {activeTab === "autotrade" && (
-              <div className="mx-auto w-full max-w-5xl">
-                <AutoTradeView
-                  token={token ?? ""}
-                  symbols={symbols}
-                  autoStatus={autoStatus}
-                  isAdmin={isAdmin}
-                  tradingAccount={tradingAccount}
                   onArmChanged={refreshSlow}
                 />
               </div>

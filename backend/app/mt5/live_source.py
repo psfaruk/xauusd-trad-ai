@@ -814,6 +814,11 @@ class MarketFeed:
     #: user directive: "আরও দুইটি পেয়ার অ্যাড করবেন ... USOIL ও USTEC")
     SYMBOLS = ("XAUUSD", "BTCUSD", "USOIL", "USTEC")
 
+    #: D-077 — re-attach probe cadence while the terminal bridge is absent.
+    #: A bridge that was unreachable at boot no longer freezes the platform
+    #: "offline" forever: this loop re-probes until the terminal answers.
+    MCP_REATTACH_S = float(os.environ.get("MT5_MCP_REATTACH_S", "20"))
+
     def __init__(
         self,
         http_factory: HttpFactory | None = None,
@@ -825,23 +830,18 @@ class MarketFeed:
         mcp_market: Any = None,  # McpMarketFeed | None (D-035)
         mt5_only: bool = MT5_ONLY,  # D-037: broker feed only, no composite
     ) -> None:
-        # D-035 — the REAL broker overlay (None when the terminal is absent,
-        # e.g. Railway: crypto composite only, zero behavior change).
+        # D-035 — the REAL broker overlay. D-077: NO synchronous boot probe
+        # (it used to block the event loop for the whole connect timeout and
+        # — far worse — a bridge that was down at THAT instant left mcp=None
+        # FOREVER: the heartbeat retried connect() but MT5_ONLY feeds with no
+        # overlay can never produce a tick, so the platform showed "offline"
+        # permanently even after the terminal came back). The overlay now
+        # attaches lazily: start() probes once (bounded), then a watch loop
+        # re-probes until the bridge answers — see _try_attach_mcp().
         self.mcp = mcp_market
-        if self.mcp is None:
-            try:
-                from app.mt5.mcp_market import mcp_market_available
-
-                if mcp_market_available():
-                    from app.mt5.mcp import terminal_client
-                    from app.mt5.mcp_market import McpMarketFeed
-
-                    self.mcp = McpMarketFeed(
-                        client=terminal_client(), watch=list(self.SYMBOLS),
-                        on_tick=self._route_mt5_tick,
-                    )
-            except Exception:  # noqa: BLE001 — overlay is strictly optional
-                self.mcp = None
+        self._mcp_watch_task: asyncio.Task | None = None
+        self._attach_lock = asyncio.Lock()
+        self._stop_evt = asyncio.Event()
 
         btc_spec = SymbolSpec(
             key="BTCUSD", binance_symbol="BTCUSDT", ws_venues="BTC",
@@ -916,12 +916,97 @@ class MarketFeed:
     # ------------------------------------------------------------- lifecycle
 
     async def start(self) -> None:
-        if self.mcp is not None and not self.mcp.running:
+        self._stop_evt.clear()
+        if self.mcp is None:
+            # D-077 — bounded first attach attempt: a bridge that answers
+            # quickly (the normal case) is attached before the first tick
+            # wait; a dead/black-holing bridge cannot stall boot for long.
+            try:
+                await asyncio.wait_for(
+                    self._try_attach_mcp(), timeout=self.MCP_REATTACH_S * 0.75
+                )
+            except Exception:  # noqa: BLE001 — background loop takes over
+                logger.warning(
+                    "MT5 terminal bridge not answering yet — live feed waits, "
+                    "reattach probing every %.0fs (D-077)",
+                    self.MCP_REATTACH_S,
+                )
+        elif not self.mcp.running:
             await self.mcp.start()
         for feed in self.feeds.values():
             await feed.start()
+        self._ensure_mcp_watch()
+
+    async def _try_attach_mcp(self) -> bool:
+        """D-077 — attach the terminal overlay when the bridge answers.
+
+        Probe + construct + start off the critical path (thread + lock); on
+        success every symbol core's `_mt5` reference is (re)wired so quotes,
+        bars and market-state all switch to the real broker feed immediately
+        — no restart, no redeploy. Idempotent while attached.
+        """
+        async with self._attach_lock:
+            if self.mcp is not None:
+                return True  # already attached (concurrent probe race)
+            try:
+                from app.mt5.mcp_market import mcp_market_available
+
+                reachable = await asyncio.to_thread(mcp_market_available)
+            except Exception:  # noqa: BLE001 — probe failure = not attached
+                return False
+            if not reachable:
+                return False
+            try:
+                from app.mt5.mcp import terminal_client
+                from app.mt5.mcp_market import McpMarketFeed
+
+                mcp = McpMarketFeed(
+                    client=terminal_client(), watch=list(self.SYMBOLS),
+                    on_tick=self._route_mt5_tick,
+                )
+                await mcp.start()
+            except Exception:  # noqa: BLE001 — strictly optional overlay
+                logger.warning("MT5 overlay attach failed", exc_info=True)
+                return False
+            self.mcp = mcp
+            for feed in self.feeds.values():
+                feed._mt5 = mcp  # noqa: SLF001 — same module family
+            logger.info(
+                "MT5 terminal bridge ATTACHED (D-077 lazy reattach) — "
+                "broker overlay live for %s", ", ".join(self.feeds),
+            )
+            return True
+
+    def _ensure_mcp_watch(self) -> None:
+        """D-077 — keep re-probing for the terminal bridge while absent."""
+        if self.mcp is not None:
+            return  # attached; the overlay self-heals its own workers
+        if self._mcp_watch_task is None or self._mcp_watch_task.done():
+            self._mcp_watch_task = asyncio.create_task(
+                self._mcp_watch_loop(), name="mcp-reattach-watch"
+            )
+
+    async def _mcp_watch_loop(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop_evt.wait(), timeout=self.MCP_REATTACH_S
+                )
+                return  # stop requested
+            except TimeoutError:
+                pass
+            if await self._try_attach_mcp():
+                return  # attached — done (overlay self-heals from here)
 
     async def stop(self) -> None:
+        self._stop_evt.set()
+        if self._mcp_watch_task is not None:
+            self._mcp_watch_task.cancel()
+            try:
+                await self._mcp_watch_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._mcp_watch_task = None
         for feed in self.feeds.values():
             await feed.stop()
         if self.mcp is not None:
@@ -1328,6 +1413,15 @@ class LiveDataSource(PaperPlaneMixin, DataSource):
                     "MT5 forex feed inactive (weekend/holiday or terminal down) "
                     "— live crypto composite active; MT5 resumes automatically"
                 )
+        else:
+            # D-077 — honest bridge-absent state (previously indistinguishable
+            # from "market closed"): the reattach probe is running
+            st["mt5"] = {"bridge": "not_attached"}
+            st["note"] = (
+                "MetaTrader 5 terminal bridge not attached — reconnecting "
+                "every few seconds; live data resumes automatically once the "
+                "terminal answers (check MT5 terminal + bridge tunnel)"
+            )
         return st
 
     def _contract_for(self, symbol: str) -> float:
