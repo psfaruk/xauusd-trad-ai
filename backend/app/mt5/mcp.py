@@ -30,6 +30,13 @@ DEFAULT_URL = "http://127.0.0.1:22346/mcp"
 DEFAULT_KEY_FILE = "/home/z/mt5stack/mcp_key.txt"
 _TIMEOUT = 60  # order ops can take a few seconds; info ops are fast
 
+# D-078 — the endpoint is RUNTIME state (see bridge_config.py): a client
+# constructed WITHOUT an explicit URL resolves the effective endpoint on
+# EVERY call, so an in-app URL update (tunnel rotation) hot-swaps every
+# live client without a redeploy. No import cycle: bridge_config only
+# pulls _cfg_key lazily inside diagnose_bridge().
+from app.mt5.bridge_config import get_bridge_url, url_stamp  # noqa: E402
+
 #: D-055 — MT5 return codes. A pending order is ACCEPTED by the terminal
 #: with TRADE_RETCODE_PLACED (10008, "order placed") just as often as with
 #: TRADE_RETCODE_DONE (10009) depending on server/bridge; treating 10008 as
@@ -83,6 +90,11 @@ def _cfg_url() -> str:
     return os.environ.get("MT5_MCP_URL", DEFAULT_URL).rstrip("/")
 
 
+def _effective_url(fixed: str | None) -> str:
+    """D-078 — fixed endpoint, or the runtime-resolved one when dynamic."""
+    return fixed if fixed is not None else get_bridge_url()
+
+
 def _cfg_key() -> str:
     key = os.environ.get("MT5_MCP_KEY", "")
     if key:
@@ -99,7 +111,11 @@ class MT5TerminalClient:
     """Thread-safe JSON-RPC client for the terminal's MCP server."""
 
     def __init__(self, url: str | None = None, key: str | None = None) -> None:
-        self.url = url or _cfg_url()
+        # D-078 — url=None means RUNTIME-RESOLVED: every call takes the
+        # current bridge_config endpoint (admin hot-swap, no redeploy). An
+        # explicit url (tests, explicit hosts) stays frozen as before.
+        self._fixed_url: str | None = url
+        self._url_stamp_seen = url_stamp()
         self._key = key  # None -> resolve lazily (key file may appear later)
         self._session: str | None = None
         self._id = 0
@@ -112,6 +128,11 @@ class MT5TerminalClient:
         # handshakes ONCE and reuses; on any transport error it is discarded
         # and rebuilt (fresh path through the tunnel).
         self._local = threading.local()
+
+    @property
+    def url(self) -> str:
+        """Effective endpoint — dynamic unless fixed at construction."""
+        return _effective_url(self._fixed_url)
 
     # ------------------------------------------------------- connection pool
 
@@ -168,6 +189,17 @@ class MT5TerminalClient:
         - every retry drops the thread's cached connection first so the next
           attempt takes a brand-new path through the tunnel.
         """
+        # D-078 — hot-swap checkpoint: when bridge_config's stamp moved
+        # (admin updated the endpoint), drop this thread's pooled connection
+        # AND the MCP session so the very next request takes the NEW url.
+        # _post is always called under self._lock (see _call_once), so the
+        # session mutation is race-free; each worker thread drops its own
+        # pooled conn here on its next call.
+        stamp = url_stamp()
+        if stamp != self._url_stamp_seen:
+            self._url_stamp_seen = stamp
+            self._drop_local_conn()
+            self._session = None
         key = self._key if self._key is not None else _cfg_key()
         if not key:
             raise MCPError("MT5 MCP key not configured (MT5_MCP_KEY / key file)")
@@ -380,8 +412,10 @@ class MT5TerminalClient:
 
         The tick-poller runs one clone per worker so slow bridge round
         trips pipeline instead of serializing behind the single lock.
+        D-078 — clones inherit the DYNAMIC mode (url=None) so an in-app
+        endpoint update reaches every worker on its next call.
         """
-        return MT5TerminalClient(url=self.url, key=self._key)
+        return MT5TerminalClient(url=self._fixed_url, key=self._key)
 
     def account(self) -> dict[str, Any]:
         return self._call("get_trading_account_info")  # type: ignore[return-value]

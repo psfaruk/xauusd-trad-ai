@@ -21,6 +21,7 @@ EXPECTED_TABLES = {
     "signals",
     "trades",
     "logs",
+    "app_config",  # D-078 — runtime bridge endpoint override lives here
 }
 
 

@@ -895,6 +895,49 @@ export interface Mt5OrderResult {
 
 /* --------------------------------------------- D-036/D-044 AI auto-trade */
 
+/* ------------------------------------- D-078 terminal bridge control */
+
+export interface BridgeProbe {
+  ok: boolean;
+  stage: string;
+  detail: string;
+  url_source?: string;
+  at: string;
+}
+
+export interface BridgeInfo {
+  url: string;
+  source: "runtime" | "env";
+  env_url: string;
+  attached: boolean;
+  last_probe: BridgeProbe | null;
+}
+
+export interface BridgeStage {
+  stage: string;
+  ok: boolean;
+  detail: string;
+  ms: number;
+  hint: string | null;
+}
+
+export interface BridgeDiagnosis {
+  url: string;
+  ok: boolean;
+  stages: BridgeStage[];
+  verdict: string;
+  hint: string | null;
+  at: string;
+}
+
+export interface BridgeUpdateResult {
+  url: string;
+  source: "runtime" | "env";
+  attached: boolean;
+  persisted?: boolean;
+  diagnosis?: BridgeDiagnosis;
+}
+
 export interface Mt5AutoTradeStatus {
   armed: boolean;
   armed_at: string | null;

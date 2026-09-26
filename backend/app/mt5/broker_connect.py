@@ -217,18 +217,27 @@ class BrokerConnectionService:
     # ---------------------------------------------------------- terminal
     @staticmethod
     def _terminal_account() -> dict[str, Any]:
-        """Live account snapshot from the REAL terminal (blocking MCP call)."""
+        """Live account snapshot from the REAL terminal (blocking MCP call).
+
+        D-078 — failures carry the actionable remediation (what the 502
+        MEANS, where to fix it) instead of a raw transport error: the
+        user's "exness লগিং দিলে frontend এ কানেক্ট হয় না" report was this
+        exact opaque string.
+        """
+        from app.mt5.bridge_config import hint_for_error
         from app.mt5.mcp import MCPError, terminal_client
 
         try:
             return terminal_client().account()
         except MCPError as exc:
             raise BrokerUnavailableError(
-                f"MetaTrader 5 terminal bridge unavailable: {exc}"
+                f"MetaTrader 5 terminal bridge unavailable: {exc} — "
+                f"{hint_for_error(str(exc))}"
             ) from exc
         except Exception as exc:  # noqa: BLE001 — any transport failure
             raise BrokerUnavailableError(
-                f"MetaTrader 5 terminal bridge unreachable: {exc}"
+                f"MetaTrader 5 terminal bridge unreachable: {exc} — "
+                f"{hint_for_error(str(exc))}"
             ) from exc
 
     # ----------------------------------------------------------- connect

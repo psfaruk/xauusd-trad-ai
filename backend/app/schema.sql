@@ -42,6 +42,17 @@ create table if not exists engine_config (
 alter table engine_config add column if not exists auto_trade_live boolean not null default false;
 alter table engine_config add column if not exists auto_trade_live_by uuid references profiles(id);
 
+-- D-078: runtime app configuration (key/value). Holds the MT5 terminal
+-- bridge endpoint override (mt5_bridge_url) so a rotated tunnel URL is
+-- fixed IN THE APP (Settings -> Terminal Bridge) instead of a Railway
+-- env change + redeploy. TEXT value: portable across PG/sqlite, no jsonb
+-- binding friction for plain strings.
+create table if not exists app_config (
+  key text primary key,
+  value text not null,
+  updated_at text
+);
+
 create table if not exists signals (
   id uuid primary key default gen_random_uuid(),
   ts timestamptz not null,

@@ -4,6 +4,7 @@ import type {
   OrderResult, ExternalSnapshot, LogEntry, Mt5Account, Mt5OpenPosition,
   Mt5HistoryPosition, Mt5Symbol, Mt5OrderResult, Mt5AutoTradeStatus,
   AnalysisResponse, UserSettings, TradingPendingOrder,
+  BridgeInfo, BridgeDiagnosis, BridgeUpdateResult,
 } from "../types";
 
 /**
@@ -95,6 +96,32 @@ export function postMt5Connect(
 
 export function postMt5Disconnect(token: string): Promise<Mt5Status> {
   return request<Mt5Status>("/api/mt5/disconnect", { method: "POST" }, token);
+}
+
+/* ------------------------------------ D-078 terminal bridge control */
+
+export function getBridge(token: string): Promise<BridgeInfo> {
+  return request<BridgeInfo>("/api/mt5/bridge", {}, token);
+}
+
+export function putBridge(token: string, url: string): Promise<BridgeUpdateResult> {
+  return request<BridgeUpdateResult>("/api/mt5/bridge", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  }, token);
+}
+
+export function resetBridge(token: string): Promise<{ url: string; source: string }> {
+  return request<{ url: string; source: string }>("/api/mt5/bridge", {
+    method: "DELETE",
+  }, token);
+}
+
+export function diagnoseBridge(token: string): Promise<BridgeDiagnosis> {
+  return request<BridgeDiagnosis>("/api/mt5/bridge/diagnose", {
+    method: "POST",
+  }, token);
 }
 
 /* --------------------------------------------- D-034 real MT5 account (MCP) */

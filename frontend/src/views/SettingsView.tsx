@@ -8,10 +8,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   getConfig, getLogs, getTradingStatus, postMt5Connect, postMt5Disconnect,
-  postTradingReset, putConfig,
+  postTradingReset, putConfig, getBridge, putBridge, resetBridge, diagnoseBridge,
 } from "../lib/api";
 import type {
   BrokerConnection, EngineConfig, LogEntry, Mt5Status, TradingStatus,
+  BridgeDiagnosis, BridgeInfo,
 } from "../types";
 import { Badge, Btn, Card, Dot, EmptyState, Field, NumberField, SectionTitle, Stat, inputCls } from "../components/ui";
 import { useAuth } from "../lib/auth";
@@ -130,6 +131,177 @@ function BrokerCard({
             </p>
           )}
         </>
+      )}
+    </Card>
+  );
+}
+
+/* ------------------------------------------------- D-078 terminal bridge */
+
+/** Admin control room for the MT5 terminal bridge endpoint — the in-app
+ * fix for the permanent "MT5 MCP HTTP 502" offline report. Free tunnels
+ * rotate their URL on every restart; before D-078 that meant a Railway
+ * env change + redeploy. Here the admin pastes the new tunnel URL, the
+ * platform hot-swaps every live client, persists it, re-attaches the
+ * broker feed immediately, and the staged diagnosis says exactly where
+ * any remaining break is (dns / tcp / tls / http 502 / mcp). */
+function BridgeCard({ token }: { token: string }) {
+  const [info, setInfo] = useState<BridgeInfo | null>(null);
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState<"" | "save" | "diag" | "reset">("");
+  const [diag, setDiag] = useState<BridgeDiagnosis | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState(0);
+
+  const reload = useCallback(() => {
+    getBridge(token)
+      .then((r) => {
+        setInfo(r);
+        setUrl((cur) => cur || r.url);
+      })
+      .catch(() => setInfo(null));
+  }, [token]);
+  useEffect(reload, [reload]);
+  useEffect(() => {
+    const t = window.setInterval(reload, 15_000);
+    return () => window.clearInterval(t);
+  }, [reload]);
+
+  const save = async () => {
+    setBusy("save");
+    setError(null);
+    try {
+      const r = await putBridge(token, url.trim());
+      setDiag(r.diagnosis ?? null);
+      setSavedAt(Date.now());
+      window.setTimeout(() => setSavedAt(0), 2500);
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "save failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const runDiag = async () => {
+    setBusy("diag");
+    setError(null);
+    try {
+      setDiag(await diagnoseBridge(token));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "diagnose failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const reset = async () => {
+    setBusy("reset");
+    setError(null);
+    try {
+      await resetBridge(token);
+      setDiag(null);
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "reset failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const attached = info?.attached ?? false;
+  const probe = info?.last_probe ?? null;
+
+  return (
+    <Card>
+      <SectionTitle
+        title="Terminal Bridge"
+        right={
+          attached ? (
+            <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400">
+              <Dot tone="green" /> attached
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-400">
+              <Dot tone="amber" /> not attached
+            </span>
+          )
+        }
+      />
+      <p className="mb-3 text-[11px] leading-relaxed text-zinc-400">
+        The link between this app and the MetaTrader 5 terminal on your PC
+        (through your tunnel). When the tunnel restarts its URL changes — paste
+        the new one here; the platform reconnects without a redeploy.
+      </p>
+
+      <div className="mb-2 flex min-w-0 flex-wrap items-center gap-1.5">
+        <Badge tone={info?.source === "runtime" ? "gold" : "zinc"}>
+          {info?.source === "runtime" ? "URL: saved in-app" : "URL: deploy env"}
+        </Badge>
+        {probe && !probe.ok && (
+          <Badge tone="red">last probe: {probe.stage}</Badge>
+        )}
+      </div>
+      {probe && !probe.ok && (
+        <p className="mb-3 break-words rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[10px] leading-relaxed text-amber-300">
+          {probe.detail}
+        </p>
+      )}
+
+      <div className="flex flex-col gap-2">
+        <Field label="Bridge URL (terminal MCP endpoint)">
+          <input
+            className={inputCls}
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://your-tunnel.example.com/mcp"
+            spellCheck={false}
+          />
+        </Field>
+        <div className="flex flex-wrap gap-2">
+          <Btn
+            variant="gold"
+            onClick={() => void save()}
+            disabled={busy !== "" || url.trim().length < 8}
+          >
+            {busy === "save" ? "Saving…" : savedAt ? "Saved ✓" : "Save & reconnect"}
+          </Btn>
+          <Btn variant="default" onClick={() => void runDiag()} disabled={busy !== ""}>
+            {busy === "diag" ? "Diagnosing…" : "Diagnose"}
+          </Btn>
+          {info?.source === "runtime" && (
+            <Btn variant="ghost" onClick={() => void reset()} disabled={busy !== ""}>
+              {busy === "reset" ? "Resetting…" : "Reset to env"}
+            </Btn>
+          )}
+        </div>
+      </div>
+
+      {diag && (
+        <div className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-900/40 p-3">
+          <p className={`text-[11px] font-semibold ${diag.ok ? "text-emerald-400" : "text-amber-400"}`}>
+            {diag.ok ? "✓ " : "⚠ "}{diag.verdict}
+          </p>
+          <div className="mt-2 flex flex-col gap-1">
+            {diag.stages.map((s) => (
+              <p key={s.stage} className="flex min-w-0 items-start gap-2 text-[10px] leading-relaxed">
+                <span className={s.ok ? "text-emerald-400" : "text-red-400"}>
+                  {s.ok ? "✓" : "✗"}
+                </span>
+                <span className="min-w-0 break-words text-zinc-400">
+                  <b className="text-zinc-300">{s.stage}</b> · {s.detail}
+                  {s.hint && <span className="block text-amber-400/90">→ {s.hint}</span>}
+                </span>
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <p className="mt-2.5 break-words rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
+          {error}
+        </p>
       )}
     </Card>
   );
@@ -513,6 +685,7 @@ export default function SettingsView({
     <div className="flex min-w-0 flex-col gap-3">
       <YourAccountCard token={token} />
       <BrokerCard token={token} broker={broker} onConnected={onBrokerConnected} />
+      {isAdmin && <BridgeCard token={token} />}
       <EngineCard token={token} isAdmin={isAdmin} />
       <DataPrivacyCard />
       <LogsCard token={token} engineLogs={engineLogs} />

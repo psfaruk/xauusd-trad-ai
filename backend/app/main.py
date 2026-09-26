@@ -93,6 +93,25 @@ async def lifespan(app: FastAPI):
     # --- Shared httpx client (Supabase auth checks; external APIs)
     app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
 
+    # --- D-078 — runtime MT5 bridge endpoint: a persisted app_config
+    # override beats the MT5_MCP_URL env var (tunnel URLs rotate on every
+    # free-tunnel restart; fixing the env var needs a Railway redeploy,
+    # the override is set in-app from Settings → Terminal Bridge and
+    # hot-swaps every live client). Restored BEFORE any feed/client is
+    # constructed so the whole process starts on the right endpoint.
+    from app.mt5 import bridge_config as _bridge_cfg
+
+    try:
+        _saved_url = await _bridge_cfg.load_persisted_url(app.state.db_engine)
+        if _saved_url:
+            _bridge_cfg.set_bridge_url(_saved_url)
+            logger.info(
+                "MT5 bridge URL restored from app_config (D-078) — %s",
+                _bridge_cfg.mask_url(_saved_url),
+            )
+    except Exception:  # noqa: BLE001 — restore is best-effort, env stays
+        logger.warning("bridge URL boot restore skipped", exc_info=True)
+
     # --- Free external reference data (user req #6): Binance PAXG + ECB FX
     app.state.external = ExternalMarketService(
         http_factory=lambda: _get_http(app)

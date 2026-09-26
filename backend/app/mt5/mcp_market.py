@@ -489,10 +489,37 @@ class McpMarketFeed:
 
 
 def mcp_market_available() -> bool:
-    """Fast probe — is the terminal MCP bridge reachable? (boot decision)"""
-    try:
-        from app.mt5.mcp import terminal_client
+    """Fast probe — is the terminal MCP bridge reachable? (boot decision)
 
-        return terminal_client().available()
-    except Exception:  # noqa: BLE001
+    D-078 — the outcome is journaled (bridge_config.record_probe) so the
+    honest feed_status note and the Exness connect errors can say WHY the
+    bridge is down ("HTTP 502 — tunnel client offline") instead of a bare
+    "not attached". account() is probed DIRECTLY: available() swallows
+    MCPError, which would make a 502 indistinguishable from a terminal
+    that answered without a broker session.
+    """
+    from app.mt5 import bridge_config
+    from app.mt5.mcp import MCPError, terminal_client
+
+    try:
+        info = terminal_client().account()
+    except MCPError as exc:
+        text = str(exc)
+        stage = "http" if "HTTP " in text else "transport"
+        bridge_config.record_probe(False, stage, text)
         return False
+    except Exception as exc:  # noqa: BLE001 — any transport failure
+        bridge_config.record_probe(False, "transport", f"{type(exc).__name__}: {exc}")
+        return False
+    if (info.get("terminal") or {}).get("server_connected") is True:
+        bridge_config.record_probe(True, "mcp", "terminal session live")
+        return True
+    # the bridge + MCP layer ANSWERED — the terminal just has no active
+    # broker session (Exness not logged in on the terminal). Different
+    # remediation than a dead tunnel, so it gets its own stage.
+    bridge_config.record_probe(
+        False, "terminal",
+        "bridge reachable — the MT5 terminal has no active broker session "
+        "(log in to your Exness account on the terminal)",
+    )
+    return False

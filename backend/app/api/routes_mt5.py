@@ -33,11 +33,22 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.auth import AdminUser, CurrentUser
+from app.auth import AdminUser, CurrentUser, require_admin
 from app.mt5.auto_trader import ArmError
+from app.mt5.bridge_config import (
+    bridge_source,
+    clear_runtime_url,
+    diagnose_bridge,
+    env_url,
+    get_bridge_url,
+    last_probe,
+    persist_url,
+    set_bridge_url,
+    validate_bridge_url,
+)
 from app.mt5.broker_connect import (
     AccountMismatchError,
     BrokerUnavailableError,
@@ -122,10 +133,96 @@ async def _mcp_call(fn, *args, **kwargs):
             raise HTTPException(
                 status_code=409, detail=TRADING_NOT_PERMITTED_HINT
             ) from exc
+        # D-078 — the opaque "MT5 MCP HTTP 502" becomes an actionable
+        # diagnosis: what broke + how to fix it.
+        from app.mt5.bridge_config import hint_for_error
+
         raise HTTPException(
             status_code=502,
-            detail=f"MT5 terminal bridge unavailable: {exc}",
+            detail=(
+                f"MT5 terminal bridge unavailable: {exc} — {hint_for_error(str(exc))}"
+            ),
         ) from exc
+
+
+# ------------------------------------------------------------------ D-078
+# The terminal bridge endpoint + staged diagnostics. Admin-only: the
+# endpoint is institution infrastructure. This is the in-app fix for the
+# "MT5 MCP HTTP 502" permanent-offline report — see bridge_config.py.
+def _market_feed(request: Request):
+    """The live MarketFeed (owns the MT5 overlay + reattach loop)."""
+    source = getattr(request.app.state, "mt5", None)
+    src = getattr(source, "source", None) if source is not None else None
+    return getattr(src, "market", None)
+
+
+class BridgeBody(BaseModel):
+    url: str = Field(min_length=8, max_length=500)
+
+
+@router.get("/bridge", dependencies=[Depends(require_admin)])
+async def mt5_bridge_get(request: Request) -> dict:
+    feed = _market_feed(request)
+    return {
+        "url": get_bridge_url(),
+        "source": bridge_source(),
+        "env_url": env_url(),
+        "attached": bool(feed is not None and getattr(feed, "mcp", None)),
+        "last_probe": last_probe(),
+    }
+
+
+@router.put("/bridge", dependencies=[Depends(require_admin)])
+async def mt5_bridge_put(body: BridgeBody, request: Request) -> dict:
+    """Hot-swap the bridge endpoint (tunnel URL rotation) — no redeploy.
+
+    Validates, activates for every live client, persists to app_config
+    (restarts keep it), forces an immediate reattach attempt, and returns
+    a full staged diagnosis of the NEW endpoint so the admin sees the
+    result of the change in the same response.
+    """
+    try:
+        url = validate_bridge_url(body.url)
+        set_bridge_url(url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    persisted = await persist_url(request.app.state.db_engine, url)
+    feed = _market_feed(request)
+    attached = False
+    if feed is not None:
+        try:
+            attached = await feed.reattach_now()
+        except Exception:  # noqa: BLE001 — attach is best-effort
+            attached = False
+    diagnosis = await asyncio.to_thread(diagnose_bridge)
+    return {
+        "url": get_bridge_url(),
+        "source": bridge_source(),
+        "attached": attached,
+        "persisted": persisted,
+        "diagnosis": diagnosis,
+    }
+
+
+@router.delete("/bridge", dependencies=[Depends(require_admin)])
+async def mt5_bridge_reset(request: Request) -> dict:
+    """Drop the runtime override — back to the deploy-time env endpoint."""
+    clear_runtime_url()
+    feed = _market_feed(request)
+    if feed is not None:
+        try:
+            await feed.reattach_now()
+        except Exception:  # noqa: BLE001
+            pass
+    return {"url": get_bridge_url(), "source": bridge_source()}
+
+
+@router.post("/bridge/diagnose", dependencies=[Depends(require_admin)])
+async def mt5_bridge_diagnose(request: Request) -> dict:
+    """Staged probe of the CURRENT endpoint (parse→dns→tcp→tls→http→mcp)
+    with human remediation per failing stage — the 502 explainer."""
+    diagnosis = await asyncio.to_thread(diagnose_bridge)
+    return diagnosis
 
 
 @router.post("/connect")

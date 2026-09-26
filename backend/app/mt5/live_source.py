@@ -842,6 +842,10 @@ class MarketFeed:
         self._mcp_watch_task: asyncio.Task | None = None
         self._attach_lock = asyncio.Lock()
         self._stop_evt = asyncio.Event()
+        # D-078 — immediate-wake channel for the reattach watch loop: an
+        # admin bridge-URL update must probe the NEW endpoint within
+        # milliseconds, not wait out the 20s cadence.
+        self._bridge_wake_evt = asyncio.Event()
 
         btc_spec = SymbolSpec(
             key="BTCUSD", binance_symbol="BTCUSDT", ws_venues="BTC",
@@ -986,15 +990,46 @@ class MarketFeed:
                 self._mcp_watch_loop(), name="mcp-reattach-watch"
             )
 
+    # ------------------------------------------------------- D-078 control
+
+    def bridge_url_changed(self) -> None:
+        """Wake the reattach watch loop NOW (admin updated the endpoint)."""
+        self._bridge_wake_evt.set()
+
+    async def reattach_now(self) -> bool:
+        """D-078 — force an immediate attach attempt on the CURRENT bridge
+        URL (the admin 'Save' path). While ATTACHED an endpoint switch is
+        treated as a possibly DIFFERENT terminal: the overlay is stopped
+        and symbol discovery re-runs instead of reusing a stale symbol map
+        (XAUUSD vs XAUUSDm spellings differ per terminal)."""
+        if self.mcp is not None:
+            try:
+                await self.mcp.stop()
+            except Exception:  # noqa: BLE001 — stop is best-effort
+                pass
+            self.mcp = None
+            for feed in self.feeds.values():
+                feed._mt5 = None  # noqa: SLF001 — same module family
+        self._bridge_wake_evt.set()
+        try:
+            return await asyncio.wait_for(
+                self._try_attach_mcp(), timeout=self.MCP_REATTACH_S * 1.5
+            )
+        except Exception:  # noqa: BLE001 — probe result only
+            return False
+
     async def _mcp_watch_loop(self) -> None:
         while not self._stop_evt.is_set():
+            # wake on: explicit bridge change (D-078) or the reattach cadence
             try:
                 await asyncio.wait_for(
-                    self._stop_evt.wait(), timeout=self.MCP_REATTACH_S
+                    self._bridge_wake_evt.wait(), timeout=self.MCP_REATTACH_S
                 )
-                return  # stop requested
             except TimeoutError:
                 pass
+            self._bridge_wake_evt.clear()
+            if self._stop_evt.is_set():
+                return
             if await self._try_attach_mcp():
                 return  # attached — done (overlay self-heals from here)
 
@@ -1415,13 +1450,36 @@ class LiveDataSource(PaperPlaneMixin, DataSource):
                 )
         else:
             # D-077 — honest bridge-absent state (previously indistinguishable
-            # from "market closed"): the reattach probe is running
-            st["mt5"] = {"bridge": "not_attached"}
-            st["note"] = (
-                "MetaTrader 5 terminal bridge not attached — reconnecting "
-                "every few seconds; live data resumes automatically once the "
-                "terminal answers (check MT5 terminal + bridge tunnel)"
-            )
+            # from "market closed"): the reattach probe is running.
+            # D-078 — plus the journaled probe: the note now says WHY the
+            # bridge is down ("HTTP 502 — tunnel client offline") and where
+            # an admin can fix it, instead of a generic retry promise.
+            from app.mt5 import bridge_config as _bc
+
+            mt5_block: dict = {"bridge": "not_attached"}
+            probe = _bc.last_probe()
+            if probe:
+                mt5_block["probe"] = probe
+                if probe.get("ok"):
+                    note = (
+                        "MetaTrader 5 terminal bridge answered — attaching "
+                        "the broker feed now"
+                    )
+                else:
+                    note = (
+                        f"MT5 terminal bridge not attached — last probe failed "
+                        f"at '{probe.get('stage')}': {probe.get('detail')}. "
+                        "The app retries automatically; an admin can update "
+                        "the bridge URL in Settings → Terminal Bridge."
+                    )
+            else:
+                note = (
+                    "MetaTrader 5 terminal bridge not attached — reconnecting "
+                    "every few seconds; live data resumes automatically once the "
+                    "terminal answers (check MT5 terminal + bridge tunnel)"
+                )
+            st["mt5"] = mt5_block
+            st["note"] = note
         return st
 
     def _contract_for(self, symbol: str) -> float:
