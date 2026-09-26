@@ -68,7 +68,9 @@ class TestMt5Routes:
         assert r.status_code == 200
         body = r.json()
         assert body["status"] == "connected"
-        assert body["symbol"] == "XAUUSDm"
+        # D-076 — the API speaks MARKET KEYS (mock platform_symbols are the
+        # keys now, not the broker-suffixed "XAUUSDm" spelling).
+        assert body["symbol"] == "XAUUSD"
         assert body["account"]["currency"] == "USD"
         assert body["engine_running"] is True
 
@@ -151,7 +153,8 @@ class TestCandlesRoute:
                        params={"tf": "M15", "limit": 50})
         assert r.status_code == 200
         body = r.json()
-        assert body["symbol"] == "XAUUSDm"
+        # D-076 — market-key symbol contract (was broker-suffixed "XAUUSDm").
+        assert body["symbol"] == "XAUUSD"
         assert body["tf"] == "M15"
         assert len(body["candles"]) == 50
         first = body["candles"][0]
@@ -198,7 +201,7 @@ class TestConfigRoutes:
         assert body["config"]["pending_target_usd"] == 4.5
         assert body["config"]["scalp_profile"] is True
         assert body["config"]["trusted_min_votes"] == 2.0
-        assert body["config"]["signal_symbols"] == ["XAUUSD", "BTCUSD"]
+        assert body["config"]["signal_symbols"] == ["XAUUSD", "BTCUSD", "USOIL", "USTEC"]
         assert body["config"]["auto_trade_symbols"] == ["XAUUSD"]
         assert body["config"]["bias_tfs"] == ["H4"]
         assert body["config"]["max_positions"] == 4  # D-070 scalp budget

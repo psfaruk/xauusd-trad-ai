@@ -1366,6 +1366,9 @@ class SignalEngine:
         self._lock = asyncio.Lock()
         self._last_signal_bar: datetime | None = None  # cooldown anchor
         self._last_spread_points: float = 0.0
+        # D-076 — per-market scaled config views (cached against the raw
+        # cfg object so apply_config invalidates them automatically)
+        self._scaled_cfgs: dict[str, tuple[EngineConfig, EngineConfig]] = {}
         # D-070 — rolling spread window: the gates read the MEDIAN of the
         # last SPREAD_MEDIAN_WINDOW quotes (one rollover/news print must
         # not kill an evaluation; the median is what the trade would pay)
@@ -1381,9 +1384,45 @@ class SignalEngine:
     def cfg(self) -> EngineConfig:
         return self._cfg
 
+    def _market_cfg(self, symbol: str) -> EngineConfig:
+        """D-076 — the config view calibrated for THIS market.
+
+        The engine's USD windows (entry_min_usd / pending_target_usd /
+        pending_max_usd) were calibrated on XAUUSD prices: a 1.0 USD entry
+        floor is ~20 ATRs on USOIL (price ~70) and sub-noise on USTEC
+        (price ~18000). They scale by the market's price ratio
+        (XAUUSD = 1.0 — zero behavior change for gold). The spread-points
+        budget scales by the market's typical spread width: BTCUSD's real
+        ~13 USD spread = ~1300 points ALWAYS failed the gold-tuned 45-point
+        cap — the D-051-era 'বিটকয়েনের উপর কোন সিগন্যাল হচ্ছে না' root
+        cause now fixed. Views are cached per raw-cfg identity, so
+        apply_config() invalidates them by construction.
+        """
+        from app.mt5.base import market_key, market_scale, market_spread_scale
+
+        mk = market_key(symbol)
+        if mk == "XAUUSD":
+            return self._cfg
+        cached = self._scaled_cfgs.get(mk)
+        if cached is not None and cached[0] is self._cfg:
+            return cached[1]
+        scale = market_scale(mk)
+        sscale = market_spread_scale(mk)
+        view = self._cfg.model_copy(
+            update={
+                "entry_min_usd": self._cfg.entry_min_usd * scale,
+                "pending_target_usd": self._cfg.pending_target_usd * scale,
+                "pending_max_usd": self._cfg.pending_max_usd * scale,
+                "max_spread_points": self._cfg.max_spread_points * sscale,
+            }
+        )
+        self._scaled_cfgs[mk] = (self._cfg, view)
+        return view
+
     async def apply_config(self, cfg: EngineConfig) -> None:
         async with self._lock:
             self._cfg = cfg
+            self._scaled_cfgs.clear()  # D-076 — rebuild per-market views
             self._htf_cache.clear()  # TF set may have changed
 
     def invalidate_frames(self) -> None:
@@ -1450,7 +1489,10 @@ class SignalEngine:
         if tf != self._cfg.timeframe:
             return
         async with self._lock:
-            cfg = self._cfg
+            # D-076 — the per-market CALIBRATED view (USD windows scaled to
+            # the market's price level, spread budget to its spread width;
+            # XAUUSD unchanged at 1.0x on every axis)
+            cfg = self._market_cfg(symbol)
         tf_min = TIMEFRAME_MINUTES[tf]
         bar_open = datetime.fromtimestamp(closed_bar["t"], tz=UTC)
         bar_close_time = bar_open + timedelta(minutes=tf_min)

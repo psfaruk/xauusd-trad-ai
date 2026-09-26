@@ -414,7 +414,7 @@ class TestD050Config:
         assert DEFAULT_CONFIG.pending_max_usd == 3.0
         assert DEFAULT_CONFIG.pending_expiry_bars == 30
         assert DEFAULT_CONFIG.scalp_profile is True
-        assert DEFAULT_CONFIG.signal_symbols == ["XAUUSD", "BTCUSD"]
+        assert DEFAULT_CONFIG.signal_symbols == ["XAUUSD", "BTCUSD", "USOIL", "USTEC"]
         assert DEFAULT_CONFIG.auto_trade_symbols == ["XAUUSD"]
         assert DEFAULT_CONFIG.trusted_min_votes == 2.0
 

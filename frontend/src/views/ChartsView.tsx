@@ -14,6 +14,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useTick } from "../state/feed";
 import { getAnalysis } from "../lib/api";
 import { sameMarket } from "../lib/liveSetup";
+import { marketMeta } from "../lib/markets";
+import SymbolSelect from "../components/SymbolSelect";
 import {
   type AnalysisResponse,
   type Candle,
@@ -115,32 +117,27 @@ export default function ChartsView({
 
   return (
     <div className="flex min-w-0 flex-col gap-3">
-      {/* header: pair pills + live quote (the TF selector lives in the
-       *  chart's own header now — D-058 user directive) */}
-      <Card padded={false} className="p-2.5">
+      {/* header: pair dropdown + live quote (the TF selector lives in the
+       *  chart's own header now — D-058 user directive; the pairs moved
+       *  into ONE dropdown — D-076 user directive: "জায়গা বাঁচবে").
+       *  relative z-30 — Card's backdrop-blur creates a stacking context
+       *  that TRAPS the dropdown popover (z-40) inside it; without this
+       *  the chart's loading overlay (absolute inset-0 z-10, root context)
+       *  painted OVER the open dropdown options (the "can't click USTEC"
+       *  e2e catch). z-30 > z-10 lifts the whole toolbar above the chart. */}
+      <Card padded={false} className="relative z-30 p-2.5">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          {symbols.length > 1 && (
-            <div className="flex min-w-0 gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-              {symbols.map((s) => (
-                <button
-                  key={s}
-                  type="button"
-                  onClick={() => onSymbolChange(s)}
-                  className={`shrink-0 rounded-full border px-3.5 py-1.5 text-xs font-bold transition-colors ${
-                    s === symbol
-                      ? "border-gold/60 bg-gold/15 text-gold"
-                      : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200"
-                  }`}
-                >
-                  {s}
-                </button>
-              ))}
-            </div>
-          )}
+          <SymbolSelect
+            symbol={symbol}
+            symbols={symbols}
+            onChange={onSymbolChange}
+            compact
+            quote={tick ? tick.bid.toFixed(marketMeta(symbol).digits) : null}
+          />
           <div className="ml-auto flex shrink-0 items-center gap-2">
             {tick ? (
               <span className="font-mono text-sm font-bold tabular-nums text-zinc-100">
-                {tick.bid.toFixed(2)}
+                {tick.bid.toFixed(marketMeta(symbol).digits)}
               </span>
             ) : (
               <span className="h-4 w-14 animate-pulse rounded bg-zinc-800" />

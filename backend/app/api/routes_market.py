@@ -63,7 +63,13 @@ async def candles(
     # D-035: any symbol the source streams is chartable (XAUUSD + BTCUSD)
     sym = symbol or mgr.symbol
     available = getattr(mgr.source, "platform_symbols", None) or []
-    if available and sym not in available and sym != mgr.symbol:
+    # D-076 — the frontend sends MARKET KEYS while sources may list broker
+    # spellings (XAUUSDm/BTCUSDm); compare on market_key so every spelling
+    # resolves (USOIL/USTEC whose broker names equal their keys always did).
+    from app.mt5.base import market_key
+
+    if available and sym not in available and sym != mgr.symbol \
+            and market_key(sym) not in {market_key(s) for s in available}:
         raise HTTPException(
             status_code=404,
             detail=f"symbol {sym} not served (available: {available})",

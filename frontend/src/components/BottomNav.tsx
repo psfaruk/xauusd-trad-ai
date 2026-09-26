@@ -46,6 +46,15 @@ function AiIcon({ active }: { active: boolean }) {
     </svg>
   );
 }
+function AutoIcon({ active }: { active: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className={`h-6 w-6 ${stroke(active)}`} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      {/* D-076 — the Auto Trading tab: a bolt inside a rounded square */}
+      <rect x="4" y="4" width="16" height="16" rx="4" />
+      <path d="M12.8 7.5l-3.3 4.4h2.6l-.6 4.6 3.3-4.8h-2.5z" fill="currentColor" className={active ? "fill-gold" : "fill-zinc-500"} stroke="none" />
+    </svg>
+  );
+}
 function SettingsIcon({ active }: { active: boolean }) {
   return (
     <svg viewBox="0 0 24 24" fill="none" className={`h-6 w-6 ${stroke(active)}`} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -59,6 +68,7 @@ const ITEMS: Item[] = [
   { id: "home", label: "Home", href: "/", icon: (a) => <HomeIcon active={a} /> },
   { id: "charts", label: "Charts", href: "/charts", icon: (a) => <ChartIcon active={a} /> },
   { id: "ai", label: "AI Trading", href: "/ai", icon: (a) => <AiIcon active={a} /> },
+  { id: "autotrade", label: "Auto Trade", href: "/autotrade", icon: (a) => <AutoIcon active={a} /> },
   { id: "settings", label: "Settings", href: "/settings", icon: (a) => <SettingsIcon active={a} /> },
 ];
 

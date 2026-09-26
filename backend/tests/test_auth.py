@@ -46,11 +46,20 @@ def make_settings(**overrides) -> Settings:
 
 
 def supabase_mock(calls: dict, fail: bool = False):
-    """MockTransport that accepts `good-token` / `admin-token` only."""
+    """MockTransport that accepts `good-token` / `admin-token` only.
+
+    D-076 — counts are ALSO tracked per-host: the shared app http client
+    legitimately carries non-auth traffic (e.g. the news service's
+    ForexFactory refresh through app.state.http), so auth-verdict tests
+    assert on the supabase.test host count, not the global counter.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
         calls.setdefault("paths", set()).add(str(request.url))
+        from collections import Counter
+
+        calls.setdefault("hosts", Counter())[request.url.host] += 1
         if fail:
             raise httpx.ConnectError("supabase down")
         authz = request.headers.get("authorization", "")
@@ -93,7 +102,9 @@ def test_me_rejects_bad_token(client) -> None:
     c, calls = client
     resp = c.get("/api/me", headers={"Authorization": "Bearer wrong"})
     assert resp.status_code == 401
-    assert calls["n"] == 1  # negative verdicts hit Supabase too
+    # negative verdicts hit Supabase too (auth host only — the shared
+    # client also carries non-auth traffic, D-076)
+    assert calls["hosts"]["supabase.test"] == 1
 
 
 def test_me_valid_token_viewer(client) -> None:
@@ -118,10 +129,10 @@ def test_token_cache_60s(client) -> None:
     c, calls = client
     for _ in range(3):
         assert c.get("/api/me", headers={"Authorization": GOOD}).status_code == 200
-    assert calls["n"] == 1  # cached per token-hash (SPEC §12 Phase 1)
+    assert calls["hosts"]["supabase.test"] == 1  # cached per token-hash
     # A different token must not reuse the verdict.
     assert c.get("/api/me", headers={"Authorization": ADMIN_TOKEN}).status_code == 200
-    assert calls["n"] == 2
+    assert calls["hosts"]["supabase.test"] == 2
 
 
 def test_health_stays_public(client) -> None:

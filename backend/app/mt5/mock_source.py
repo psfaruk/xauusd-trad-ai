@@ -42,11 +42,60 @@ from app.mt5.paper import PaperPlaneMixin
 
 TRADE_RETCODE_DONE = 10009
 
-# Mock lot-sizing metadata mirrors a typical Exness XAUUSD standard account.
+# Mock lot-sizing metadata mirrors a typical Exness account.
 MOCK_SYMBOL_INFO = SymbolInfo(
     name="XAUUSDm", point=0.01, contract_size=100.0,
     volume_min=0.01, volume_max=100.0, volume_step=0.01,
 )
+
+
+from app.mt5.base import MARKETS, market_key  # noqa: E402 — used below
+
+
+def _mock_symbol_infos() -> dict[str, SymbolInfo]:
+    """D-076 — per-market SymbolInfo for the mock stack (specs mirror the
+    Exness account the engine's lot math must be honest about)."""
+    out: dict[str, SymbolInfo] = {"XAUUSD": MOCK_SYMBOL_INFO}
+    for mk, spec in MARKETS.items():
+        if mk == "XAUUSD":
+            continue
+        out[mk] = SymbolInfo(
+            name=spec.broker_name, point=spec.point,
+            contract_size=spec.contract_size,
+            volume_min=spec.volume_min, volume_max=spec.volume_max,
+            volume_step=spec.volume_step,
+        )
+    return out
+
+
+MOCK_SYMBOL_INFOS = _mock_symbol_infos()
+
+
+class _Tape:
+    """D-076 — one market's deterministic M1 tape (multi-market mock).
+
+    Bars are generated from `np.random.default_rng([seed, minute])` — two
+    sources with the same (seed, origin) produce IDENTICAL prices, which
+    is what keeps sibling demo planes priced off the public market for
+    every pair, not just gold.
+    """
+
+    __slots__ = ("seed", "base_price", "spread", "regimes", "cache_minute",
+                 "o", "h", "l", "c", "v", "overrides")
+
+    def __init__(self, seed: int, base_price: float, spread: float,
+                 regimes: list[VolRegime]) -> None:
+        self.seed = int(seed)
+        self.base_price = float(base_price)
+        self.spread = float(spread)
+        self.regimes = sorted(regimes, key=lambda r: r.start_minute)
+        self.cache_minute = -1
+        self.o: list[float] = []
+        self.h: list[float] = []
+        self.l: list[float] = []
+        self.c: list[float] = []
+        self.v: list[int] = []
+        self.overrides: dict[int, tuple[float, float, float, float, int]] = {}
 
 
 @dataclass(frozen=True)
@@ -129,15 +178,29 @@ class MockDataSource(PaperPlaneMixin, DataSource):
         regimes = vol_regimes or [VolRegime(0, base_vol)]
         self._regimes = sorted(regimes, key=lambda r: r.start_minute)
 
-        # M1 cache (index 0 == origin minute)
-        self._cache_minute = -1
-        self._o: list[float] = []
-        self._h: list[float] = []
-        self._l: list[float] = []
-        self._c: list[float] = []
-        self._v: list[int] = []
+        # D-076 — one tape per market (4 pairs). The GOLD tape carries the
+        # constructor parameters (custom seeds/spreads/regimes in tests);
+        # the other markets use their MARKETS spec (fixed seeds keep every
+        # instance — and every sibling plane — on identical prices).
+        gold = _Tape(self._seed, self._base_price, self._spread, self._regimes)
+        self._tapes: dict[str, _Tape] = {"XAUUSD": gold}
+        for mk, spec in MARKETS.items():
+            if mk == "XAUUSD":
+                continue
+            self._tapes[mk] = _Tape(
+                spec.mock_seed, spec.mock_base_price, spec.mock_spread,
+                [VolRegime(0, spec.mock_sigma)],
+            )
 
-        self._m1_overrides: dict[int, tuple[float, float, float, float, int]] = {}
+        # M1 cache (index 0 == origin minute) — compat aliases onto the
+        # GOLD tape's live objects (tests read/write these directly)
+        self._o = gold.o
+        self._h = gold.h
+        self._l = gold.l
+        self._c = gold.c
+        self._v = gold.v
+        self._m1_overrides = gold.overrides
+
         self.injected: list[InjectedScenario] = []
 
         self._connected = False
@@ -151,6 +214,29 @@ class MockDataSource(PaperPlaneMixin, DataSource):
         self._manual_seconds = 0.0
 
     # ------------------------------------------------------------------ clock
+
+    @property
+    def _cache_minute(self) -> int:
+        """Compat view of the GOLD tape's generation cursor."""
+        return self._tapes["XAUUSD"].cache_minute
+
+    @_cache_minute.setter
+    def _cache_minute(self, v: int) -> None:
+        self._tapes["XAUUSD"].cache_minute = v
+
+    def _tape_for(self, symbol: str | None) -> _Tape:
+        """D-076 — the tape for any broker spelling of a known market."""
+        mk = market_key(symbol or "XAUUSD")
+        return self._tapes.get(mk, self._tapes["XAUUSD"])
+
+    @property
+    def platform_symbols(self) -> list[str]:
+        """D-076 — the MARKET KEYS this mock streams (matching the live
+        source's platform_symbols contract; ConnectionManager normalizes
+        either spelling, but routes/frontend speak market keys)."""
+        return [market_key(self.SYMBOL)] + [
+            mk for mk in self._tapes if mk != "XAUUSD"
+        ]
 
     def market_params(self) -> dict:
         """Clock/market identity — consumed by `sibling()` so a per-user demo
@@ -199,34 +285,36 @@ class MockDataSource(PaperPlaneMixin, DataSource):
 
     # ------------------------------------------------------------- generation
 
-    def _sigma_for(self, minute_index: int) -> float:
-        sigma = self._regimes[0].sigma
-        for regime in self._regimes:
+    def _sigma_for(self, minute_index: int, tape: _Tape | None = None) -> float:
+        regimes = (tape or self._tapes["XAUUSD"]).regimes
+        sigma = regimes[0].sigma
+        for regime in regimes:
             if regime.start_minute <= minute_index:
                 sigma = regime.sigma
             else:
                 break
         return sigma
 
-    def _ensure_m1(self, upto_minute: int) -> None:
+    def _ensure_m1(self, upto_minute: int, tape: _Tape | None = None) -> None:
         """Generate M1 bars [cache_minute+1 .. upto_minute] (deterministic)."""
-        for m in range(self._cache_minute + 1, upto_minute + 1):
-            rng = np.random.default_rng([self._seed, m])
+        tape = tape or self._tapes["XAUUSD"]
+        for m in range(tape.cache_minute + 1, upto_minute + 1):
+            rng = np.random.default_rng([tape.seed, m])
             z = rng.standard_normal(4)
-            sigma = self._sigma_for(m)
-            o = self._c[m - 1] if m > 0 else self._base_price
+            sigma = self._sigma_for(m, tape)
+            o = tape.c[m - 1] if m > 0 else tape.base_price
             c = o + sigma * float(z[0])
             h = max(o, c) + abs(sigma * float(z[1]))
             low = min(o, c) - abs(sigma * float(z[2]))
             v = int(50 + 200 * abs(float(z[3])))
-            if m in self._m1_overrides:
-                o, h, low, c, v = self._m1_overrides[m]
-            self._o.append(o)
-            self._h.append(h)
-            self._l.append(low)
-            self._c.append(c)
-            self._v.append(v)
-            self._cache_minute = m
+            if m in tape.overrides:
+                o, h, low, c, v = tape.overrides[m]
+            tape.o.append(o)
+            tape.h.append(h)
+            tape.l.append(low)
+            tape.c.append(c)
+            tape.v.append(v)
+            tape.cache_minute = m
 
     def _last_closed_minute(self, vnow: datetime) -> int:
         cur = int((vnow - self._origin).total_seconds() // 60)
@@ -235,25 +323,27 @@ class MockDataSource(PaperPlaneMixin, DataSource):
     def _last_closed_bucket(self, tf_min: int, vnow: datetime) -> int:
         return (self._last_closed_minute(vnow) + 1) // tf_min - 1
 
-    def _rates_sync(self, tf: str, count: int, vnow: datetime | None = None) -> pd.DataFrame:
+    def _rates_sync(self, tf: str, count: int, vnow: datetime | None = None,
+                    tape: _Tape | None = None) -> pd.DataFrame:
         tf_min = validate_tf(tf)
         now = vnow or self._vnow()
+        tape = tape or self._tapes["XAUUSD"]
         last_bucket = self._last_closed_bucket(tf_min, now)
         if last_bucket < 0:
             return empty_rates()
         first_bucket = max(0, last_bucket - count + 1)
-        self._ensure_m1((last_bucket + 1) * tf_min - 1)
+        self._ensure_m1((last_bucket + 1) * tf_min - 1, tape)
         rows = []
         for b in range(first_bucket, last_bucket + 1):
             s, e = b * tf_min, (b + 1) * tf_min
             rows.append(
                 {
                     "time_utc": self._origin + timedelta(minutes=b * tf_min),
-                    "o": self._o[s],
-                    "h": max(self._h[s:e]),
-                    "l": min(self._l[s:e]),
-                    "c": self._c[e - 1],
-                    "v": int(sum(self._v[s:e])),
+                    "o": tape.o[s],
+                    "h": max(tape.h[s:e]),
+                    "l": min(tape.l[s:e]),
+                    "c": tape.c[e - 1],
+                    "v": int(sum(tape.v[s:e])),
                 }
             )
         return pd.DataFrame(rows, columns=RATES_COLUMNS)
@@ -385,32 +475,33 @@ class MockDataSource(PaperPlaneMixin, DataSource):
         ]
 
     async def get_rates(self, symbol: str, tf: str, count: int) -> pd.DataFrame:
-        return self._rates_sync(tf, count)
+        return self._rates_sync(tf, count, tape=self._tape_for(symbol))
 
     def get_forming_bar(self, symbol: str, tf: str) -> dict | None:
         """Current forming tf-bar built from closed M1 minutes + live tick."""
         tf_min = validate_tf(tf)
         now = self._vnow()
+        tape = self._tape_for(symbol)
         cur_minute = int((now - self._origin).total_seconds() // 60)
         bucket_start = cur_minute // tf_min * tf_min
-        self._ensure_m1(cur_minute - 1)
+        self._ensure_m1(cur_minute - 1, tape)
         if cur_minute <= bucket_start:  # empty bucket edge
             return None
-        o = self._o[bucket_start]
-        h = max(self._h[bucket_start:cur_minute])
-        low = min(self._l[bucket_start:cur_minute])
-        v = int(sum(self._v[bucket_start:cur_minute]))
+        o = tape.o[bucket_start]
+        h = max(tape.h[bucket_start:cur_minute])
+        low = min(tape.l[bucket_start:cur_minute])
+        v = int(sum(tape.v[bucket_start:cur_minute]))
         # live forming minute: interpolate toward its target close
         progress = min(max((now - self._origin).total_seconds() % 60.0 / 60.0, 0.0), 0.999)
-        rng = np.random.default_rng([self._seed, cur_minute])
+        rng = np.random.default_rng([tape.seed, cur_minute])
         z = rng.standard_normal(4)
-        sigma = self._sigma_for(cur_minute)
+        sigma = self._sigma_for(cur_minute, tape)
         target = (
-            self._m1_overrides[cur_minute][3]
-            if cur_minute in self._m1_overrides
-            else self._c[cur_minute - 1] + sigma * float(z[0])
+            tape.overrides[cur_minute][3]
+            if cur_minute in tape.overrides
+            else tape.c[cur_minute - 1] + sigma * float(z[0])
         )
-        price = self._c[cur_minute - 1] + (target - self._c[cur_minute - 1]) * progress
+        price = tape.c[cur_minute - 1] + (target - tape.c[cur_minute - 1]) * progress
         return {
             "t": int((self._origin + timedelta(minutes=bucket_start)).timestamp()),
             "o": o,
@@ -435,7 +526,13 @@ class MockDataSource(PaperPlaneMixin, DataSource):
             return
 
     def discover_symbols(self, pattern: str = "*XAUUSD*") -> list[str]:
-        return [self.SYMBOL]
+        """D-076 — every market (pattern-respecting for the legacy callers
+        that expect one gold symbol)."""
+        import fnmatch
+
+        syms = self.platform_symbols
+        matched = [s for s in syms if fnmatch.fnmatch(s.upper(), pattern.upper())]
+        return matched or syms
 
     async def place_order(self, order: Order) -> OrderResult:
         if not self._connected:
@@ -571,7 +668,8 @@ class MockDataSource(PaperPlaneMixin, DataSource):
         )
 
     def symbol_info(self, symbol: str) -> SymbolInfo:
-        return MOCK_SYMBOL_INFO
+        """D-076 — per-market spec (lot math honest on every pair)."""
+        return MOCK_SYMBOL_INFOS.get(market_key(symbol), MOCK_SYMBOL_INFO)
 
     # ------------------------------------------------------- account simulation
 
@@ -601,20 +699,21 @@ class MockDataSource(PaperPlaneMixin, DataSource):
     def _tick_from_now(self, symbol: str) -> Tick:
         """Pure-sync tick computation (no awaits) reusing get_tick's math."""
         now = self._vnow()
+        tape = self._tape_for(symbol)
         m = int((now - self._origin).total_seconds() // 60)
-        self._ensure_m1(m - 1)
-        o_prev = self._c[m - 1]
-        rng = np.random.default_rng([self._seed, m])
+        self._ensure_m1(m - 1, tape)
+        o_prev = tape.c[m - 1]
+        rng = np.random.default_rng([tape.seed, m])
         z = rng.standard_normal(4)
-        sigma = self._sigma_for(m)
-        if m in self._m1_overrides:
-            target_c = self._m1_overrides[m][3]
+        sigma = self._sigma_for(m, tape)
+        if m in tape.overrides:
+            target_c = tape.overrides[m][3]
         else:
             target_c = o_prev + sigma * float(z[0])
         bar_start = self._origin + timedelta(minutes=m)
         progress = min(max((now - bar_start).total_seconds() / 60.0, 0.0), 0.999)
         price = o_prev + (target_c - o_prev) * progress
-        return Tick(bid=price - self._spread / 2, ask=price + self._spread / 2, time=now)
+        return Tick(bid=price - tape.spread / 2, ask=price + tape.spread / 2, time=now)
 
     def set_starting_balance(self, balance: float) -> None:
         """Test helper — deterministic account seeding."""

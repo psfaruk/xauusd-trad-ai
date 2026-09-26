@@ -45,8 +45,13 @@ FRESH_S = 15.0               # MT5 authority window since last broker tick
 BARS_CACHE_TTL_S = 20.0      # chart-history cache per (symbol, tf)
 BARS_MIN_REFETCH_S = 3.0     # forced-refetch rate cap
 
-#: platform symbol -> default broker symbol (refined by Market Watch discovery)
-DEFAULT_MAP = {"XAUUSD": "XAUUSDm", "BTCUSD": "BTCUSDm"}
+#: platform symbol -> default broker symbol (refined by Market Watch discovery).
+#: D-076 — USOIL/USTEC join the watched set (user directive: "আরও দুইটি
+#: পেয়ার অ্যাড করবেন সেটি হলো USOIL ও USTEC"). Spelling is refined by
+#: discovery (exact -> shortest prefix match), so both the plain and the
+#: suffixed Exness variants resolve to the account's real symbol.
+DEFAULT_MAP = {"XAUUSD": "XAUUSDm", "BTCUSD": "BTCUSDm",
+               "USOIL": "USOIL", "USTEC": "USTEC"}
 #: chart-history period names per platform timeframe
 PERIODS = {"M1": "M1", "M5": "M5", "M15": "M15", "M30": "M30",
            "H1": "H1", "H4": "H4", "D1": "D1"}
@@ -93,7 +98,7 @@ class McpMarketFeed:
         workers: int | None = None,
     ) -> None:
         self._client = client
-        self._watch = list(watch or ["XAUUSD", "BTCUSD"])
+        self._watch = list(watch or ["XAUUSD", "BTCUSD", "USOIL", "USTEC"])
         self._poll_s = float(poll_s)
         self._fresh_s = float(fresh_s)
         self._on_tick = on_tick

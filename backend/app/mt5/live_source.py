@@ -104,6 +104,16 @@ BTC_SYMBOL_INFO = SymbolInfo(
     name="BTCUSD", point=0.01, contract_size=1.0,
     volume_min=0.01, volume_max=100.0, volume_step=0.01,
 )
+#: D-076 — USOIL (WTI, 1 lot = 1000 bbl) + USTEC (US Tech 100, the user's
+#: Exness "USTEC ×100" spelling: 1 lot = 100 index units).
+OIL_SYMBOL_INFO = SymbolInfo(
+    name="USOIL", point=0.01, contract_size=1000.0,
+    volume_min=0.01, volume_max=100.0, volume_step=0.01,
+)
+TEC_SYMBOL_INFO = SymbolInfo(
+    name="USTEC", point=0.1, contract_size=100.0,
+    volume_min=0.01, volume_max=100.0, volume_step=0.01,
+)
 
 DEMO_START_BALANCE = 10_000.0
 
@@ -321,6 +331,11 @@ class SymbolFeedCore:
     def _resolve_venues(self) -> Any:
         from app.mt5.tick_feed import BTC_VENUES, VENUES
 
+        # D-076 — "NONE": markets with NO crypto venue (USOIL/USTEC — oil
+        # and equity indices have no spot token on the exchanges). An empty
+        # venue tuple means no aggregator, never a wrong gold composite.
+        if self.spec.ws_venues == "NONE":
+            return ()
         base = BTC_VENUES if self.spec.ws_venues == "BTC" else VENUES
         if self._ws_venue_names is None:
             return base
@@ -481,6 +496,24 @@ class SymbolFeedCore:
         if self._mt5_fresh():
             return True
         ws = self._ws_healthy()
+        # D-076 — composite-less markets (USOIL/USTEC): the terminal MCP is
+        # their ONLY real-time provider; when it is idle there is no
+        # composite to fall back to — report honestly and keep polling.
+        if not self.spec.binance_symbol and not ws:
+            if self.tick is not None:
+                self.provider = "mt5"
+                self.provider_detail = (
+                    f"MetaTrader 5 · {self.spec.key} market closed — "
+                    "broker history still served (no composite for this market)"
+                )
+                return True
+            self.provider = "degraded"
+            self.provider_detail = (
+                f"{self.spec.key} streams only through the MetaTrader 5 "
+                "terminal (no crypto composite exists for this market) — "
+                "waiting for the broker feed"
+            )
+            return False
         try:
             await self._poll_binance()
             return True
@@ -777,8 +810,9 @@ class MarketFeed:
     tests + callers); multi-symbol callers use `feed_for()` / `ensure_tf_sym()`.
     """
 
-    #: platform symbols served (D-035: XAUUSD + the new BTCUSD pair)
-    SYMBOLS = ("XAUUSD", "BTCUSD")
+    #: platform symbols served (D-035 XAUUSD/BTCUSD; D-076 + USOIL/USTEC —
+    #: user directive: "আরও দুইটি পেয়ার অ্যাড করবেন ... USOIL ও USTEC")
+    SYMBOLS = ("XAUUSD", "BTCUSD", "USOIL", "USTEC")
 
     def __init__(
         self,
@@ -813,6 +847,19 @@ class MarketFeed:
             key="BTCUSD", binance_symbol="BTCUSDT", ws_venues="BTC",
             goldapi=False, yahoo_specs=YAHOO_BTC, yahoo_symbol="BTC-USD",
         )
+        # D-076 — terminal-only markets: NO crypto venue exists for oil or
+        # the US Tech 100 index, so their quotes/bars come exclusively from
+        # the REAL Exness terminal overlay (McpMarketFeed). binance_symbol=""
+        # + ws_venues="NONE" guarantees the composite chain never tries to
+        # substitute a gold price for them (D-033: no wrong-market data, ever).
+        oil_spec = SymbolSpec(
+            key="USOIL", binance_symbol="", ws_venues="NONE",
+            goldapi=False, yahoo_specs=None, yahoo_symbol="",
+        )
+        tec_spec = SymbolSpec(
+            key="USTEC", binance_symbol="", ws_venues="NONE",
+            goldapi=False, yahoo_specs=None, yahoo_symbol="",
+        )
         self.feeds: dict[str, SymbolFeedCore] = {
             spec.key: SymbolFeedCore(
                 spec=spec,
@@ -825,7 +872,7 @@ class MarketFeed:
                 mt5=self.mcp,
                 mt5_only=mt5_only,
             )
-            for spec in (GOLD_SPEC, btc_spec)
+            for spec in (GOLD_SPEC, btc_spec, oil_spec, tec_spec)
         }
 
     def _route_mt5_tick(self, key: str, bid: float, ask: float, ts: float) -> None:
@@ -836,11 +883,24 @@ class MarketFeed:
     # ------------------------------------------------------ symbol routing
 
     def feed_for(self, symbol: str | None) -> SymbolFeedCore:
-        """Resolve a (possibly broker-suffixed) symbol to its feed core."""
+        """Resolve a (possibly broker-suffixed) symbol to its feed core.
+
+        D-076 — market_key-first (handles the 5-char USOIL/USTEC bases the
+        old rstrip hack missed); unknown symbols keep the legacy probes and
+        fall back to gold (the historical default).
+        """
+        from app.mt5.base import market_key
+
         if symbol:
+            mk = market_key(symbol)
+            feed = self.feeds.get(mk)
+            if feed is not None and mk != symbol:
+                return feed  # broker spelling (XAUUSDm / USOILm / USTECm)
             if symbol in self.feeds:
                 return self.feeds[symbol]
-            base = symbol.rstrip("m.")  # XAUUSDm / BTCUSDm broker suffixes
+            if mk in self.feeds and mk == symbol:
+                return self.feeds[mk]
+            base = symbol.rstrip("m.")  # legacy broker suffixes
             if base in self.feeds:
                 return self.feeds[base]
             for key in self.feeds:
@@ -934,16 +994,21 @@ class MarketFeed:
         return self.feeds["XAUUSD"].data_age_s
 
     async def poll_once(self) -> bool:
-        """One provider cycle for every symbol; returns the GOLD verdict."""
+        """One provider cycle for every symbol; returns the GOLD verdict.
+
+        D-076 — loops ALL feeds (oil/tec included); a failure in any non-gold
+        market never breaks the gold verdict (D-035 semantics preserved).
+        """
         gold = True
-        try:
-            gold = await self.feeds["XAUUSD"].poll_once()
-        except Exception:  # noqa: BLE001
-            gold = False
-        try:
-            await self.feeds["BTCUSD"].poll_once()
-        except Exception:  # noqa: BLE001 — BTC failure never breaks gold
-            logger.debug("btc poll cycle failed", exc_info=True)
+        for key, feed in self.feeds.items():
+            try:
+                ok = await feed.poll_once()
+                if key == "XAUUSD":
+                    gold = ok
+            except Exception:  # noqa: BLE001 — one market never breaks gold
+                if key == "XAUUSD":
+                    gold = False
+                logger.debug("%s poll cycle failed", key, exc_info=True)
         return gold
 
     async def ensure_tf(self, tf: str, min_count: int) -> tuple[list[dict], dict | None]:
@@ -1005,14 +1070,18 @@ class LiveDataSource(PaperPlaneMixin, DataSource):
     """REAL-TIME market + paper account (DATA_SOURCE=live).
 
     MT5 terminal first (real broker prices, D-035), crypto composite 24/7
-    fallback; XAUUSD + BTCUSD pairs. Shares one `MarketFeed` with its
-    siblings so per-user demo planes price orders off the identical public
-    market (agent architecture, Phase 4).
+    fallback; XAUUSD + BTCUSD pairs (D-076: + USOIL/USTEC — terminal-only
+    markets). Shares one `MarketFeed` with its siblings so per-user demo
+    planes price orders off the identical public market (agent
+    architecture, Phase 4).
     """
 
     SYMBOL = "XAUUSD"
-    SYMBOLS = ("XAUUSD", "BTCUSD")
-    SYMBOL_INFOS = {"XAUUSD": GOLD_SYMBOL_INFO, "BTCUSD": BTC_SYMBOL_INFO}
+    SYMBOLS = ("XAUUSD", "BTCUSD", "USOIL", "USTEC")
+    SYMBOL_INFOS = {
+        "XAUUSD": GOLD_SYMBOL_INFO, "BTCUSD": BTC_SYMBOL_INFO,
+        "USOIL": OIL_SYMBOL_INFO, "USTEC": TEC_SYMBOL_INFO,
+    }
 
     def __init__(
         self,
@@ -1217,7 +1286,9 @@ class LiveDataSource(PaperPlaneMixin, DataSource):
         return self.market.feed_for(symbol).tick_stream()
 
     def discover_symbols(self, pattern: str = "*XAUUSD*") -> list[str]:
-        return [self.SYMBOL]
+        """D-076 — every market this source streams (ConnectionManager
+        starts one engine per signal_symbols market available here)."""
+        return list(self.SYMBOLS)
 
     def symbol_info(self, symbol: str) -> SymbolInfo:
         feed = self.market.feed_for(symbol)

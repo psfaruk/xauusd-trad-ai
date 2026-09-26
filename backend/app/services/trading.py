@@ -80,6 +80,10 @@ USER_SETTING_FIELDS = (
     "daily_max_loss_pct", "max_trades_per_day", "rr", "min_sl_atr",
     "max_spread_points", "daily_loss_usd", "daily_profit_usd",
     "day_start_balance",
+    # D-076 — per-market lot map (dict, NOT an EngineConfig field):
+    # "XAUUSD": 0.02, "USOIL": 0.1, ... — each pair its own lot size
+    # (user directive: "প্রত্যেক পেয়ার এর জন্য আলাদা করে লট সাইজ")
+    "symbol_lots",
 )
 
 #: D-046 — upsert of the user's settings row. NOTE: the jsonb cast MUST be
@@ -349,7 +353,15 @@ class UserTradingManager:
 
     def _discover(self, source: Any) -> str:
         try:
+            import fnmatch
+
             candidates = source.discover_symbols("*XAUUSD*") or []
+            # D-076 — the source now lists every market (4 pairs); the
+            # pattern decides the plane's own trading symbol (gold),
+            # never min(len) — which would pick USOIL/USTEC.
+            gold = [c for c in candidates if fnmatch.fnmatch(c.upper(), "*XAUUSD*")]
+            if gold:
+                candidates = gold
             return min(candidates, key=len) if candidates else "XAUUSDm"
         except Exception:  # noqa: BLE001
             return "XAUUSDm"
@@ -691,6 +703,10 @@ class UserTradingManager:
         if settings:
             data = cfg.model_dump()
             for k in USER_SETTING_FIELDS:
+                # D-076 — symbol_lots is a dict, not an EngineConfig field;
+                # it reaches the executor via set_symbol_lots, never here.
+                if k == "symbol_lots":
+                    continue
                 if k in settings and settings[k] is not None:
                     data[k] = settings[k]
             try:
@@ -705,6 +721,7 @@ class UserTradingManager:
         account = await self._load_account(owner)
         settings = (account or {}).get("settings") or {}
         out = {k: settings.get(k, getattr(cfg, k, None)) for k in USER_SETTING_FIELDS}
+        out["symbol_lots"] = settings.get("symbol_lots") or {}
         out["balance"] = (account or {}).get("balance", DEMO_START_BALANCE)
         out["currency"] = (account or {}).get("currency", "USD")
         return out
@@ -732,6 +749,26 @@ class UserTradingManager:
                 if str(v) not in ("percent", "fixed"):
                     raise ValueError("risk_mode must be 'percent' or 'fixed'")
                 clean[k] = str(v)
+                continue
+            if k == "symbol_lots":
+                # D-076 — per-market lot map: {"XAUUSD": 0.02, ...}. Every
+                # value must be a positive lot within the volume bounds.
+                if not isinstance(v, dict):
+                    raise ValueError("symbol_lots must be an object")
+                lots: dict[str, float] = {}
+                for sym, lot in v.items():
+                    try:
+                        num = float(lot)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"symbol_lots[{sym}] must be a number"
+                        ) from exc
+                    if not 0.01 <= num <= 100.0:
+                        raise ValueError(
+                            f"symbol_lots[{sym}] out of range (0.01..100.0)"
+                        )
+                    lots[str(sym).upper()] = num
+                clean[k] = lots
                 continue
             try:
                 num = float(v)
@@ -766,6 +803,8 @@ class UserTradingManager:
         plane = self._planes.get(owner)
         if plane is not None:
             await plane.executor.apply_config(await self._user_cfg(owner))
+            # D-076 — the per-market lot map rides along
+            plane.executor.set_symbol_lots(clean.get("symbol_lots") or {})
         return clean
 
     async def reset_practice_account(self, owner: str) -> dict:
@@ -1116,6 +1155,9 @@ class UserTradingManager:
         for plane in self._planes.values():
             try:
                 await plane.executor.apply_config(await self._user_cfg(plane.owner))
+                # D-076 — the user's per-market lot map rides along
+                settings = (await self._load_account(plane.owner) or {}).get("settings") or {}
+                plane.executor.set_symbol_lots(settings.get("symbol_lots") or {})
             except Exception:  # noqa: BLE001 — one plane must not block others
                 logger.exception(
                     "plane config apply failed for %s", plane.owner[:8]

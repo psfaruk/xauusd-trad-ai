@@ -35,19 +35,125 @@ def market_key(symbol: str) -> str:
     """D-051 — normalize any broker symbol spelling to a market key.
 
     "XAUUSDm" / "XAUUSDm.x" / "XAUUSD.pro" / "XAUUSD" -> "XAUUSD";
-    "BTCUSDm" -> "BTCUSD". Used to compare the executor's auto-trade
-    market list against the symbol a signal was generated for (broker
-    suffixes must never hide an enabled market).
+    "BTCUSDm" -> "BTCUSD"; D-076: "USOILm"/"USTECm" -> "USOIL"/"USTEC".
+    Used to compare the executor's auto-trade market list against the
+    symbol a signal was generated for (broker suffixes must never hide
+    an enabled market).
+
+    D-076 — the legacy suffix rule required >= 6 chars BEFORE the suffix,
+    which silently broke the new 5-char bases (USOILm -> "USOILM" never
+    matched anything). Known markets now match by PREFIX first (longest
+    base wins); unknown symbols keep the legacy rule.
     """
     s = (symbol or "").strip().upper()
     if not s:
         return ""
     s = s.split(".")[0]
+    for m in _MARKET_KEYS_BY_LENGTH:
+        if s.startswith(m):
+            return m
     for suffix in ("MICRO", "PRO", "M"):
         if s.endswith(suffix) and len(s) - len(suffix) >= 6:
             s = s[: len(s) - len(suffix)]
             break
     return s
+
+
+@dataclass(frozen=True)
+class MarketSpec:
+    """D-076 — per-market trading metadata (the one home for scale factors).
+
+    Every market the platform streams lives here; engine floors calibrated
+    in XAUUSD USD get scaled by `usd_scale` (price ratio) so they never
+    misfire on cheaper (oil) or pricier (index) markets; the spread-points
+    budget scales by `spread_scale` (per-market typical spread width, since
+    spread/price is NOT linear in price — BTCUSD ~13 USD wide would
+    otherwise always fail the gold-tuned 45-point cap, the D-051-era
+    'no BTC signals' root cause). Mock tape parameters keep the demo stack
+    multi-market.
+    """
+
+    key: str
+    label: str                     # UI badge ("XAU / Gold")
+    broker_name: str               # Exness default spelling (discovery refines)
+    point: float                   # price increment
+    digits: int                    # display decimals
+    contract_size: float           # 1 lot -> units of the underlying
+    usd_scale: float               # XAUUSD-USD-window multiplier (price ratio)
+    spread_scale: float            # max_spread_points multiplier
+    volume_min: float = 0.01
+    volume_max: float = 100.0
+    volume_step: float = 0.01
+    # mock-tape parameters (DATA_SOURCE=mock / tests)
+    mock_base_price: float = 2650.0
+    mock_sigma: float = 0.35       # per-M1-bar return sigma (price units)
+    mock_spread: float = 0.20
+    mock_seed: int = 42
+    #: true when the market trades 24/7 (BTC) vs forex sessions
+    always_open: bool = False
+
+
+#: D-076 — the platform's markets. USOIL/USTEC added by user directive
+#: ("আরও দুইটি পেয়ার ... USOIL ও USTEC"). Exness contract sizes: oil
+#: 1 lot = 1000 barrels, USTEC 1 lot = 100 index units (the ×100 spelling
+#: in the user's Exness app screenshot); terminal discovery overrides the
+#: broker_name with the account's real spelling.
+MARKETS: dict[str, MarketSpec] = {
+    "XAUUSD": MarketSpec(
+        key="XAUUSD", label="XAU / Gold", broker_name="XAUUSDm",
+        point=0.01, digits=2, contract_size=100.0,
+        usd_scale=1.0, spread_scale=1.0,
+        mock_base_price=2650.0, mock_sigma=0.35, mock_spread=0.20,
+        mock_seed=42,
+    ),
+    "BTCUSD": MarketSpec(
+        key="BTCUSD", label="BTC / Bitcoin", broker_name="BTCUSDm",
+        point=0.01, digits=2, contract_size=1.0,
+        usd_scale=24.5, spread_scale=35.0,
+        mock_base_price=65000.0, mock_sigma=60.0, mock_spread=12.0,
+        mock_seed=43, always_open=True,
+    ),
+    "USOIL": MarketSpec(
+        key="USOIL", label="WTI / Crude Oil", broker_name="USOIL",
+        point=0.01, digits=2, contract_size=1000.0,
+        usd_scale=0.026, spread_scale=0.30,
+        mock_base_price=70.0, mock_sigma=0.09, mock_spread=0.03,
+        mock_seed=44,
+    ),
+    "USTEC": MarketSpec(
+        key="USTEC", label="US100 / Tech 100", broker_name="USTEC",
+        point=0.1, digits=1, contract_size=100.0,
+        usd_scale=6.8, spread_scale=1.0,
+        mock_base_price=18000.0, mock_sigma=16.0, mock_spread=1.2,
+        mock_seed=45,
+    ),
+}
+
+_MARKET_KEYS_BY_LENGTH = tuple(sorted(MARKETS, key=len, reverse=True))
+
+
+def market_spec(symbol: str) -> MarketSpec:
+    """The MarketSpec for any broker spelling of a known market.
+
+    Unknown symbols fall back to gold (the historical default) — callers
+    treat it as a last-resort, never a silent guess for a NEW market.
+    """
+    return MARKETS.get(market_key(symbol), MARKETS["XAUUSD"])
+
+
+def market_scale(symbol: str) -> float:
+    """D-076 — USD-window scale for a market (XAUUSD = 1.0)."""
+    return MARKETS.get(market_key(symbol), MARKETS["XAUUSD"]).usd_scale
+
+
+def market_spread_scale(symbol: str) -> float:
+    """D-076 — spread-points budget scale for a market (XAUUSD = 1.0)."""
+    return MARKETS.get(market_key(symbol), MARKETS["XAUUSD"]).spread_scale
+
+
+def market_digits(symbol: str) -> int:
+    """D-076 — display decimals for a market's price labels."""
+    return MARKETS.get(market_key(symbol), MARKETS["XAUUSD"]).digits
 
 
 @dataclass(frozen=True)

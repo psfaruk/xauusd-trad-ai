@@ -86,7 +86,13 @@ def db_url():
     except ImportError:
         yield None
         return
-    server = pgserver.get_server(str(PGSERVER_DATA_DIR))
+    try:
+        server = pgserver.get_server(str(PGSERVER_DATA_DIR))
+    except Exception:  # noqa: BLE001 — sandbox may lack shared mem/ipc perms
+        # D-076 — a failed pgserver start (e.g. restricted sandbox) must
+        # degrade to "no DB" (tests skip) instead of erroring the session.
+        yield None
+        return
     url = f"postgresql+asyncpg://postgres@/postgres?host={PGSERVER_DATA_DIR}"
     try:
         yield url if _reachable(url) else None

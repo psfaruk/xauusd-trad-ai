@@ -131,10 +131,21 @@ class ConnectionManager:
             self.state.account = info
             self.state.connected_at = time_mod.monotonic()
 
-            # C3 — symbol discovery (prefer the shortest XAUUSD-ish name)
+            # C3 — symbol discovery (prefer the shortest XAUUSD-ish name).
+            # D-076 — discover_symbols now returns EVERY market (4 pairs);
+            # the pattern must be respected so the PRIMARY stays gold —
+            # min(len) over the full list would pick USOIL/USTEC instead.
             symbol = creds.get("symbol")
             if not symbol:
+                import fnmatch
+
                 candidates = self._source.discover_symbols("*XAUUSD*") or []
+                gold = [
+                    c for c in candidates
+                    if fnmatch.fnmatch(c.upper(), "*XAUUSD*")
+                ]
+                if gold:
+                    candidates = gold
                 if not candidates:
                     await self._disconnect_quiet()
                     raise ValueError("no XAUUSD symbol found on this account/server")

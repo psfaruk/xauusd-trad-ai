@@ -92,6 +92,40 @@ class BrokerConnectionService:
         self._connections: dict[str, BrokerConnection] = {}
         self._lock = asyncio.Lock()
 
+    # --------------------------------------------------------------- db
+    async def _run_db(self, fn):
+        """Run one DB operation `fn(conn) -> T` inside a transaction.
+
+        D-076 — THE D-075 REGRESSION, root-caused live: restore/_persist/
+        disconnect used `with self._db.begin()` inside asyncio.to_thread,
+        which only works on a SYNC engine (what tests pass). Production
+        passes the ASYNC engine from app.state — a sync `with` on it raises
+        TypeError ('_AsyncGeneratorContextManager' object does not support
+        the context manager protocol'), so the broker-link RESTORE silently
+        returned 0 rows on every Railway boot and the connect flow's
+        persist 500ed. On the async engine the operation runs through
+        AsyncConnection.run_sync (fn receives the REAL sync Connection in
+        the greenlet context, transaction commits on exit); sync engines
+        keep the thread hop (test path unchanged).
+        """
+        if self._db is None:
+            return None
+        try:
+            from sqlalchemy.ext.asyncio import AsyncEngine
+
+            is_async = isinstance(self._db, AsyncEngine)
+        except ImportError:  # pragma: no cover — greenlet guaranteed in prod
+            is_async = False
+        if is_async:
+            async with self._db.begin() as acx:
+                return await acx.run_sync(fn)
+
+        def _sync() -> Any:
+            with self._db.begin() as cx:  # type: ignore[union-attr]
+                return fn(cx)
+
+        return await asyncio.to_thread(_sync)
+
     # ------------------------------------------------------------ restore
     async def restore(self) -> int:
         """D-075 — rebuild the in-memory broker links from the DB at boot.
@@ -114,19 +148,18 @@ class BrokerConnectionService:
         if self._db is None:
             return 0
 
-        def _run() -> list[dict]:
+        def _run(cx) -> list[dict]:
             import sqlalchemy as sa  # local: tests run without it
 
-            with self._db.begin() as cx:
-                rows = cx.execute(sa.text(
-                    "select owner, server, login, broker_admin "
-                    "from mt5_connections "
-                    "where status in ('connected', 'linked')"
-                )).mappings().all()
-                return [dict(r) for r in rows]
+            rows = cx.execute(sa.text(
+                "select owner, server, login, broker_admin "
+                "from mt5_connections "
+                "where status in ('connected', 'linked')"
+            )).mappings().all()
+            return [dict(r) for r in rows]
 
         try:
-            rows = await asyncio.to_thread(_run)
+            rows = await self._run_db(_run)
         except Exception as exc:  # noqa: BLE001 — restore is best-effort
             logger.warning("broker link restore read failed: %s", exc)
             return 0
@@ -307,39 +340,38 @@ class BrokerConnectionService:
             )
             return
 
-        def _run() -> None:
+        def _run(cx) -> None:
             import sqlalchemy as sa  # local: tests run without it
 
             hb = datetime.now(UTC)  # bound in Python — portable across PG/sqlite
-            with self._db.begin() as cx:
-                cx.execute(
-                    sa.text(
-                        "delete from mt5_connections where owner = :owner"
-                    ),
-                    {"owner": conn.user_id},
-                )
-                cx.execute(
-                    sa.text(
-                        "insert into mt5_connections "
-                        "(owner, server, login, enc_password, mode, status, "
-                        " last_heartbeat, broker_admin) values "
-                        "(:owner, :server, :login, :enc, 'live', 'connected', "
-                        " :hb, :admin)"
-                    ),
-                    {
-                        "owner": conn.user_id,
-                        "server": conn.server,
-                        "login": conn.login,
-                        "enc": enc,
-                        "hb": hb,
-                        # D-075 — restore() reads this back: admin-verified
-                        # binds probe the terminal, public links never do
-                        "admin": conn.admin_verified,
-                    },
-                )
+            cx.execute(
+                sa.text(
+                    "delete from mt5_connections where owner = :owner"
+                ),
+                {"owner": conn.user_id},
+            )
+            cx.execute(
+                sa.text(
+                    "insert into mt5_connections "
+                    "(owner, server, login, enc_password, mode, status, "
+                    " last_heartbeat, broker_admin) values "
+                    "(:owner, :server, :login, :enc, 'live', 'connected', "
+                    " :hb, :admin)"
+                ),
+                {
+                    "owner": conn.user_id,
+                    "server": conn.server,
+                    "login": conn.login,
+                    "enc": enc,
+                    "hb": hb,
+                    # D-075 — restore() reads this back: admin-verified
+                    # binds probe the terminal, public links never do
+                    "admin": conn.admin_verified,
+                },
+            )
 
         try:
-            await asyncio.to_thread(_run)
+            await self._run_db(_run)
         except Exception as exc:  # noqa: BLE001 — persistence is best-effort
             logger.warning("broker connection persist failed: %s", exc)
 
@@ -351,17 +383,16 @@ class BrokerConnectionService:
             try:
                 import sqlalchemy as sa
 
-                def _run() -> None:
-                    with self._db.begin() as cx:
-                        cx.execute(
-                            sa.text(
-                                "update mt5_connections set status = "
-                                "'disconnected' where owner = :owner"
-                            ),
-                            {"owner": user_id},
-                        )
+                def _run(cx) -> None:
+                    cx.execute(
+                        sa.text(
+                            "update mt5_connections set status = "
+                            "'disconnected' where owner = :owner"
+                        ),
+                        {"owner": user_id},
+                    )
 
-                await asyncio.to_thread(_run)
+                await self._run_db(_run)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("broker disconnect persist failed: %s", exc)
         return {"status": "disconnected"}

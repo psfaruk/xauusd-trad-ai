@@ -298,7 +298,10 @@ def _auto_trader(request: Request):
 
 def _markets_snapshot(request: Request) -> dict:
     """Per-symbol broker-market state from the institution feed (public
-    info: market open/closed — no account details)."""
+    info: market open/closed — no account details).
+
+    D-076 — every configured signal market reports (oil/index join the
+    forex session clock; BTC stays 24/7)."""
     trader = getattr(request.app.state, "mt5_auto", None)
     if trader is None:
         return {}
@@ -306,13 +309,19 @@ def _markets_snapshot(request: Request) -> dict:
         state = trader._market_state  # noqa: SLF001 — route glue
     except AttributeError:
         return {}
+    cfg = getattr(trader, "_cfg", None)
+    watch = list(getattr(cfg, "signal_symbols", None) or (
+        "XAUUSD", "BTCUSD", "USOIL", "USTEC"
+    ))
     out: dict = {}
-    for sym in ("XAUUSD", "BTCUSD"):
+    for sym in watch:
         try:
             open_, detail = state(sym)
         except Exception:  # noqa: BLE001
             open_, detail = True, "market state unknown"
-        out[sym] = {"open": bool(open_), "detail": detail}
+        from app.mt5.base import market_key
+
+        out[market_key(sym)] = {"open": bool(open_), "detail": detail}
     return out
 
 
@@ -384,8 +393,8 @@ async def _user_auto_status(request: Request, user: CurrentUser) -> dict:
             ),
         }
     elif (
-        markets.get("XAUUSD", {}).get("open") is False
-        and markets.get("BTCUSD", {}).get("open") is False
+        markets
+        and all(m.get("open") is False for m in markets.values())
     ):
         why = {
             "code": "market_closed",

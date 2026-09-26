@@ -245,20 +245,29 @@ class _Ev:
 
 async def test_platform_symbols_and_contract_sizes():
     src = LiveDataSource(enable_ws=False)
-    assert src.platform_symbols == ["XAUUSD", "BTCUSD"]
+    assert src.platform_symbols == ["XAUUSD", "BTCUSD", "USOIL", "USTEC"]
     assert src.symbol_info("XAUUSD").contract_size == 100.0
     assert src.symbol_info("BTCUSDm").contract_size == 1.0  # broker suffix routed
+    assert src.symbol_info("USOIL").contract_size == 1000.0  # D-076 oil
+    assert src.symbol_info("USTECm").point == 0.1  # D-076 index
     assert src.point_size("BTCUSD") == 0.01
+    assert src.point_size("USTEC") == 0.1
     assert GOLD_SYMBOL_INFO.name == "XAUUSD"
     assert BTC_SYMBOL_INFO.name == "BTCUSD"
 
 
 async def test_btc_market_feed_created_without_mt5():
     feed = MarketFeed(enable_ws=False)
-    assert set(feed.feeds.keys()) == {"XAUUSD", "BTCUSD"}
+    assert set(feed.feeds.keys()) == {"XAUUSD", "BTCUSD", "USOIL", "USTEC"}
     assert feed.feeds["BTCUSD"].spec.binance_symbol == "BTCUSDT"
+    # D-076 — terminal-only markets: no composite providers, ever
+    assert feed.feeds["USOIL"].spec.binance_symbol == ""
+    assert feed.feeds["USTEC"].spec.ws_venues == "NONE"
+    assert feed.feeds["USOIL"]._resolve_venues() == ()  # type: ignore[attr-defined]
     assert feed.feed_for("XAUUSDm").spec.key == "XAUUSD"
     assert feed.feed_for("BTCUSDm").spec.key == "BTCUSD"
+    assert feed.feed_for("USOILm").spec.key == "USOIL"  # 5-char broker suffix
+    assert feed.feed_for("USTECmicro").spec.key == "USTEC"
     assert feed.feed_for(None).spec.key == "XAUUSD"
 
 
@@ -267,7 +276,7 @@ async def test_feed_status_reports_symbols_and_weekend_note():
     mcp.status_val = {"XAUUSD": {"ok": False}, "BTCUSD": {"ok": False}}
     src = LiveDataSource(enable_ws=False, mcp_market=mcp)
     st = src.feed_status()
-    assert set(st["symbols"].keys()) == {"XAUUSD", "BTCUSD"}
+    assert set(st["symbols"].keys()) == {"XAUUSD", "BTCUSD", "USOIL", "USTEC"}
     assert st["symbols"]["XAUUSD"]["mt5"] is False
     assert "note" in st  # honest weekend/terminal-down badge text
 

@@ -13,8 +13,10 @@ const FRONTEND = join(process.cwd(), "frontend");
 const tmp = mkdtempSync(join(tmpdir(), "livesetup-"));
 const out = join(tmp, "liveSetup.mjs");
 
+// D-076 — liveSetup re-exports marketKey from ./markets (the shared
+// market-key rule); bundle BOTH modules so the temp-dir import resolves.
 execSync(
-  `npx esbuild src/lib/liveSetup.ts --format=esm --outfile=${out}`,
+  `npx esbuild src/lib/liveSetup.ts --format=esm --outfile=${out} --bundle`,
   { cwd: FRONTEND, stdio: "pipe" },
 );
 
@@ -172,6 +174,12 @@ eq("marketKey strips dot suffix", marketKey("XAUUSD.x"), "XAUUSD");
 eq("marketKey strips pro suffix", marketKey("XAUUSD.PRO"), "XAUUSD");
 eq("marketKey keeps platform name", marketKey("xauusd"), "XAUUSD");
 eq("marketKey empty", marketKey(null), "");
+// D-076 — the 5-char bases: the legacy >=6-char suffix rule broke these
+eq("marketKey USOILm prefix rule", marketKey("USOILm"), "USOIL");
+eq("marketKey USTECmicro prefix rule", marketKey("USTECmicro"), "USTEC");
+eq("marketKey USOIL plain", marketKey("usoil"), "USOIL");
+eq("marketKey USTEC dot broker", marketKey("USTEC.x"), "USTEC");
+eq("marketKey XAUUSDm never collapses to USOIL", marketKey("XAUUSDm"), "XAUUSD");
 eq("sameMarket suffix match", sameMarket("XAUUSDm", "XAUUSD"), true);
 eq("sameMarket exact match", sameMarket("XAUUSD", "XAUUSD"), true);
 eq("sameMarket different markets", sameMarket("BTCUSDm", "XAUUSD"), false);

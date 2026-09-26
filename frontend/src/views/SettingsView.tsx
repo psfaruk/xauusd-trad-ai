@@ -160,8 +160,10 @@ const ENGINE_NUM_FIELDS: { key: keyof EngineConfig; label: string; hint?: string
   { key: "expiry_bars", label: "Pending Order Expiry (bars)", hint: "unfilled orders cancel after this many bars", step: "1" },
 ];
 
-/** D-051 — the markets on offer (broker suffixes normalize server-side). */
-const MARKETS = ["XAUUSD", "BTCUSD"];
+/** D-051/D-076 — the markets on offer (broker suffixes normalize
+ * server-side). Kept in sync with lib/markets.ts (the single home is the
+ * backend's MARKETS registry; the Auto Trade tab is the primary UI now). */
+const MARKETS = ["XAUUSD", "BTCUSD", "USOIL", "USTEC"];
 
 function MarketToggles({
   label, hint, options, value, onChange, disabled,

@@ -967,6 +967,9 @@ export interface UserSettings {
   daily_profit_usd?: number;
   /** D-052 — today's trading balance (the USD-window anchor) */
   day_start_balance?: number;
+  /** D-076 — per-market lot sizes (fixed-lot mode): market key -> lot.
+   * Markets without an entry fall back to fixed_lot. */
+  symbol_lots?: Record<string, number>;
   balance?: number;
   currency?: string;
 }
@@ -1032,8 +1035,9 @@ export interface CotBlock {
   note?: string;
 }
 
-/** D-039: app-level navigation tabs (mobile bottom bar / desktop ⋮ menu). */
-export type AppTab = "home" | "charts" | "ai" | "settings";
+/** D-039/D-076: app-level navigation tabs (mobile bottom bar / desktop
+ * ⋮ menu). "autotrade" — the per-pair Auto Trading control room. */
+export type AppTab = "home" | "charts" | "ai" | "autotrade" | "settings";
 
 /* ------------------------------------------------ D-042: ICT/SMC analysis */
 

@@ -190,6 +190,13 @@ class SettingsBody(BaseModel):
         default=None, ge=0.0,
         description="today's trading balance — the USD-window anchor",
     )
+    # ------------------------------------------------ D-076 per-pair lots
+    symbol_lots: dict[str, float] | None = Field(
+        default=None,
+        description="per-market lot sizes (fixed-lot mode) — "
+                    "{'XAUUSD': 0.02, 'USOIL': 0.1, 'USTEC': 0.05, ...}; "
+                    "markets without an entry fall back to fixed_lot",
+    )
 
 
 @router.get("/settings")

@@ -339,6 +339,7 @@ def run_backtest(
     cfg: EngineConfig | None = None,
     spread_points: float = 0.0,
     news: NewsState | None = None,
+    point_size: float = 0.01,  # D-076 — the market's point (spread cost)
 ) -> BacktestResult:
     """Replay the base-TF series through the live evaluate() pipeline.
 
@@ -458,7 +459,7 @@ def run_backtest(
     # the bid — that cost is not in the levels. Unfilled pendings never
     # traded — no cost (XAUUSD point = 0.01).
     if spread_points and spread_points > 0:
-        cost = spread_points * 0.01
+        cost = spread_points * point_size  # D-076 — market point, not 0.01
         for s in result.signals:
             risk = abs(s.entry - s.sl)
             if (
@@ -473,14 +474,23 @@ def run_backtest(
 # ------------------------------------------------------------------ data load
 
 
-def load_mock_history(bars: int = 5000, seed: int = 42) -> pd.DataFrame:
-    """Deterministic mock history pulled through MockDataSource (M1 base)."""
+def load_mock_history(
+    bars: int = 5000, seed: int = 42, symbol: str = "XAUUSD"
+) -> pd.DataFrame:
+    """Deterministic mock history pulled through MockDataSource (M1 base).
+
+    D-076 — `symbol` routes to the market's tape (XAUUSD/BTCUSD/USOIL/
+    USTEC) so every market can be backtested on its own price level and
+    volatility.
+    """
+
     from app.mt5.mock_source import MockDataSource
 
     src = MockDataSource(seed=seed, time_scale=0.0)
+    tape = src._tape_for(symbol)  # noqa: SLF001 — test harness access
     # freeze clock at the end of the 30-day window
     src.advance_minutes(src.HISTORY_DAYS * 24 * 60 - 1)
-    df = src._rates_sync("M1", bars)  # noqa: SLF001 — test harness access
+    df = src._rates_sync("M1", bars, tape=tape)  # noqa: SLF001 — harness
     return df.reset_index(drop=True)
 
 
@@ -745,9 +755,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="risk simulation starting equity (USD)")
     p.add_argument("--spread", type=float, default=0.0,
                    help="spread in points charged as entry cost (e.g. 20)")
+    p.add_argument("--symbol", type=str, default="XAUUSD",
+                   help="D-076 — the market to backtest (XAUUSD/BTCUSD/USOIL/"
+                        "USTEC): its own mock tape, scaled engine windows, "
+                        "real spread and contract size)")
     p.add_argument("--json", type=str, default=None, help="write stats+signals JSON here")
     p.add_argument("--csv-out", type=str, default=None, help="write signals CSV here")
     args = p.parse_args(argv)
+
+    # D-076 — market specs (per-symbol backtests)
+    from app.mt5.base import MARKETS, market_key, market_scale, market_spread_scale
 
     cfg = EngineConfig()
     if args.tf:
@@ -759,8 +776,26 @@ def main(argv: list[str] | None = None) -> int:
         base = load_csv(args.csv)
         label = f"CSV {args.csv}"
     else:
-        base = load_mock_history(args.bars, seed=args.seed)
-        label = f"mock seed={args.seed} bars={len(base)}"
+        base = load_mock_history(args.bars, seed=args.seed, symbol=args.symbol)
+        label = f"mock {args.symbol} seed={args.seed} bars={len(base)}"
+        # D-076 — the per-market config view (exactly the live engine's
+        # _market_cfg math): USD windows scaled to the price level, spread
+        # budget to the market's spread width; XAUUSD = 1.0x (unchanged).
+        mk = market_key(args.symbol)
+        spec = MARKETS.get(mk, MARKETS["XAUUSD"])
+        if mk != "XAUUSD":
+            cfg = cfg.model_copy(
+                update={
+                    "entry_min_usd": cfg.entry_min_usd * market_scale(mk),
+                    "pending_target_usd": cfg.pending_target_usd * market_scale(mk),
+                    "pending_max_usd": cfg.pending_max_usd * market_scale(mk),
+                    "max_spread_points": cfg.max_spread_points * market_spread_scale(mk),
+                }
+            )
+        # the market's real mock spread in POINTS when --spread is unset
+        if args.spread == 0.0 and spec.mock_spread > 0:
+            args.spread = spec.mock_spread / spec.point
+        label += f" spread={args.spread:.0f}pts contract={spec.contract_size:g}"
         # D-050 — the mock generates M1; the engine TF may be M5/M15 —
         # resample the base series up-front so the replay is honest.
         tf_min = TIMEFRAME_MINUTES[cfg.timeframe]
@@ -772,9 +807,18 @@ def main(argv: list[str] | None = None) -> int:
         label += f" +injected-sweep-every-{args.inject_every}"
 
     label += f" entry={cfg.entry_mode}"
-    res = run_backtest(base, cfg=cfg, spread_points=args.spread)
+    res = run_backtest(
+        base, cfg=cfg, spread_points=args.spread,
+        point_size=(MARKETS.get(market_key(args.symbol), MARKETS["XAUUSD"]).point),
+    )
     print(format_report(res, label))
-    risk = simulate_risk(res, start_equity=args.start_equity)
+    spec = MARKETS.get(market_key(args.symbol), MARKETS["XAUUSD"])
+    risk = simulate_risk(
+        res, start_equity=args.start_equity,
+        contract_size=spec.contract_size,
+        volume_min=spec.volume_min, volume_max=spec.volume_max,
+        volume_step=spec.volume_step,
+    )
     print(format_risk_report(risk))
 
     if args.json:

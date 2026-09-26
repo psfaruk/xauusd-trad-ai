@@ -122,7 +122,10 @@ async def test_subscribe_ticks_yields() -> None:
 
 async def test_connect_orders_positions_lifecycle() -> None:
     m = make_mock(2)
-    assert m.discover_symbols() == ["XAUUSDm"]
+    # D-076 — market-key platform contract: the default (gold) pattern
+    # discovery returns the gold MARKET KEY; platform_symbols carries all 4.
+    assert m.discover_symbols() == ["XAUUSD"]
+    assert m.platform_symbols == ["XAUUSD", "BTCUSD", "USOIL", "USTEC"]
     assert not await m.is_connected()
     info = await m.connect({"server": "Exness-MT5Trial", "login": "12345"})
     assert info["server"] == "Exness-MT5Trial"

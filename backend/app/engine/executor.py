@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.engine.config import EngineConfig
-from app.mt5.base import DataSource, Order, OrderResult, SymbolInfo
+from app.mt5.base import DataSource, Order, OrderResult, SymbolInfo, market_key
 
 logger = logging.getLogger("xauusd.executor")
 
@@ -46,11 +46,15 @@ def size_lot(
     equity: float,
     sl_distance: float,
     info: SymbolInfo | None = None,
+    symbol_lot: float | None = None,
 ) -> LotDecision:
     """`lots = risk_amount / (sl_distance x contract_size)`, floored to
     volume_step, clamped to [volume_min, volume_max] (SPEC §9).
 
     Unit-tested math — the executor and the backtest share this function.
+    D-076 — `symbol_lot`: the PER-MARKET lot override (fixed-lot mode
+    only; percent risk keeps its formula) — "প্রত্যেক পেয়ার এর জন্য আলাদা
+    করে লট সাইজ" (each pair its own lot size).
     """
     info = info or SymbolInfo(name="XAUUSD")
     contract = info.contract_size or DEFAULT_CONTRACT_SIZE
@@ -60,7 +64,11 @@ def size_lot(
         else None
     )
     if risk_amount is None:  # fixed-lot mode
-        lots = cfg.fixed_lot
+        lots = (
+            float(symbol_lot)
+            if symbol_lot is not None and symbol_lot > 0
+            else cfg.fixed_lot
+        )
         return LotDecision(
             lots=min(max(lots, info.volume_min), info.volume_max),
             risk_amount=0.0,
@@ -371,9 +379,26 @@ class OrderExecutor:
         # the app). Resets at the UTC day rollover.
         self._day_key: str | None = None
         self._day_trades = 0
+        # D-076 — per-market lot overrides (set_symbol_lots)
+        self._symbol_lots: dict[str, float] = {}
 
     async def apply_config(self, cfg: EngineConfig) -> None:
         self._cfg = cfg
+
+    def set_symbol_lots(self, lots: dict[str, float] | None) -> None:
+        """D-076 — the per-MARKET lot overrides (fixed-lot mode).
+
+        User directive: "ইউজার চাইলে প্রত্যেক পেয়ার এর জন্য আলাদা করে লট
+        সাইজ ও অন্যান্য বিষয়গুলো সেটাপ করতে পারবে" — each pair its own lot
+        size. execute_signal consults this map per order; markets without
+        an entry fall back to cfg.fixed_lot. Percent-risk mode ignores
+        the map (its lot is computed from equity/SL distance).
+        """
+        self._symbol_lots = {
+            str(k).upper(): float(v)
+            for k, v in (lots or {}).items()
+            if isinstance(v, (int, float)) and float(v) > 0
+        }
 
     def arm(self, enabled: bool, day_start_equity: float | None = None) -> None:
         self.auto_trade = enabled
@@ -431,8 +456,6 @@ class OrderExecutor:
             # D-051 — per-market auto-trade gate (user directive: users
             # activate WHICH markets auto-trading executes on; signals
             # still generate for every signal_symbols market).
-            from app.mt5.base import market_key
-
             traded = signal.get("symbol") or symbol
             enabled = {market_key(m) for m in self._cfg.auto_trade_symbols}
             if market_key(traded) not in enabled:
@@ -501,7 +524,10 @@ class OrderExecutor:
             if asyncio.iscoroutine(sym_info):
                 sym_info = await sym_info
             sl_distance = abs(signal["entry"] - signal["sl"])
-            lot = size_lot(self._cfg, equity, sl_distance, sym_info)
+            lot = size_lot(
+                self._cfg, equity, sl_distance, sym_info,
+                symbol_lot=self._symbol_lots.get(market_key(symbol)),
+            )
 
             # D-050 — pending limit orders: a signal carrying entry_type
             # "limit" (POI zone entry) becomes a real BUY/SELL LIMIT at the

@@ -32,6 +32,7 @@ import type {
 import {
   Badge, Btn, Card, EmptyState, Field, NumberField, SectionTitle, Stat, inputCls,
 } from "../components/ui";
+import { MARKET_KEYS } from "../lib/markets";
 import { fmtTime } from "../components/SignalDetail";
 import StrategyRadar from "../components/StrategyRadar";
 
@@ -1149,7 +1150,8 @@ export default function AiView({
   const [tick, setTick] = useState(0);
   const bump = useCallback(() => setTick((t) => t + 1), []);
   const symbols = useMemo(() => {
-    const s = [symbol, "XAUUSD", "BTCUSD"];
+    // D-076 — every market (was the hardcoded gold/btc pair)
+    const s = [symbol, ...MARKET_KEYS];
     return [...new Set(s.filter(Boolean))];
   }, [symbol]);
   const activeSignals = signals.filter((s) => s.status === "active");

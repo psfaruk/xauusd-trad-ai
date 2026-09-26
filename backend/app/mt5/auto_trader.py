@@ -34,6 +34,7 @@ from typing import Any
 
 from app.engine.config import EngineConfig
 from app.engine.executor import OrderExecutor, TradeRepo
+from app.mt5.base import market_key
 from app.mt5.mcp_source import McpTradingSource
 
 logger = logging.getLogger("xauusd.autolive")
@@ -143,6 +144,11 @@ class McpAutoTrader:
         the admin's typed limits never reached the executor that actually
         trades. This merges the admin's window over the global cfg and
         re-anchors the day on the terminal's real equity.
+
+        D-076 — `symbol_lots` rides along: a per-market lot map
+        ("প্রত্যেক পেয়ার এর জন্য আলাদা করে লট সাইজ") that the executor
+        consults per signal; markets without an entry fall back to the
+        window's fixed_lot.
         """
         window = {
             k: settings[k]
@@ -153,19 +159,34 @@ class McpAutoTrader:
             )
             if settings.get(k) is not None
         }
+        lots = settings.get("symbol_lots")
+        if isinstance(lots, dict) and lots:
+            window["symbol_lots"] = {
+                str(k).upper(): float(v)
+                for k, v in lots.items()
+                if isinstance(v, (int, float)) and float(v) > 0
+            }
         self._money_window = window or None
         await self._apply_window_to_executor()
 
     async def _apply_window_to_executor(self) -> None:
         if self._money_window:
             data = self._cfg.model_dump()
-            data.update(self._money_window)
+            # D-076 — symbol_lots is NOT an EngineConfig field (per-market
+            # lot map); it goes to the executor directly, never the merge.
+            symbol_lots = dict(self._money_window.get("symbol_lots") or {})
+            window = {
+                k: v for k, v in self._money_window.items()
+                if k != "symbol_lots"
+            }
+            data.update(window)
             try:
                 cfg = EngineConfig(**data)
             except Exception as exc:  # noqa: BLE001 — bad values: keep global
                 logger.warning("admin money window invalid: %s", exc)
                 return
             await self._executor.apply_config(cfg)
+            self._executor.set_symbol_lots(symbol_lots)
             # re-anchor the day on real equity (fallback: typed balance)
             info = await self._source.account_info()
             equity = float((info or {}).get("equity", 0.0))
@@ -362,15 +383,20 @@ class McpAutoTrader:
         except Exception:  # noqa: BLE001 — visibility must never break status
             pending = []
 
-        # D-039: per-symbol broker market state (forex weekend/holiday logic)
+        # D-039: per-symbol broker market state (forex weekend/holiday logic).
+        # D-076 — every configured signal market reports its state (oil and
+        # the index share the forex session clock; BTC stays 24/7).
         markets: dict[str, dict] = {}
         if self._market_state is not None:
-            for sym in ("XAUUSD", "BTCUSD"):
+            watch = list(getattr(self._cfg, "signal_symbols", None) or (
+                "XAUUSD", "BTCUSD", "USOIL", "USTEC"
+            ))
+            for sym in watch:
                 try:
                     open_, detail = self._market_state(sym)
                 except Exception:  # noqa: BLE001
                     open_, detail = True, "market state unknown"
-                markets[sym] = {"open": bool(open_), "detail": detail}
+                markets[market_key(sym)] = {"open": bool(open_), "detail": detail}
 
         # D-039: one-line honest diagnosis — WHY is the AI not trading right
         # now? Surfaced in the AI Trading tab so the answer is never a guess.
@@ -402,9 +428,9 @@ class McpAutoTrader:
                     "before AI orders can execute."
                 ),
             }
-        elif markets.get("XAUUSD", {}).get("open") is False and markets.get(
-            "BTCUSD", {}
-        ).get("open") is False:
+        elif markets and all(
+            m.get("open") is False for m in markets.values()
+        ):
             why = {
                 "code": "market_closed",
                 "text": (

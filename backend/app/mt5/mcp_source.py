@@ -54,6 +54,17 @@ FALLBACK_SPECS: dict[str, SymbolInfo] = {
         name="BTCUSDm", point=0.01, contract_size=1.0,
         volume_min=0.01, volume_max=200.0, volume_step=0.01,
     ),
+    # D-076 — new markets: wrong contract sizes would mis-size lots by
+    # 10x (oil, 1000 bbl) or 100x (index, 100 units), so the fallbacks
+    # must be explicit. Market Watch discovery refines the real specs.
+    "USOIL": SymbolInfo(
+        name="USOIL", point=0.01, contract_size=1000.0,
+        volume_min=0.01, volume_max=100.0, volume_step=0.01,
+    ),
+    "USTEC": SymbolInfo(
+        name="USTEC", point=0.1, contract_size=100.0,
+        volume_min=0.01, volume_max=100.0, volume_step=0.01,
+    ),
 }
 
 SYMBOLS_TTL_S = 600.0  # Market Watch discovery cache

@@ -409,7 +409,7 @@ def test_config_d048_defaults() -> None:
     assert DEFAULT_CONFIG.pending_target_usd == 4.5
     assert DEFAULT_CONFIG.pending_max_usd == 3.0
     assert DEFAULT_CONFIG.trusted_min_votes == 2.0
-    assert DEFAULT_CONFIG.signal_symbols == ["XAUUSD", "BTCUSD"]
+    assert DEFAULT_CONFIG.signal_symbols == ["XAUUSD", "BTCUSD", "USOIL", "USTEC"]
     assert DEFAULT_CONFIG.pending_max_atr == 15.0  # USD cap binds first
     assert DEFAULT_CONFIG.pending_expiry_bars == 30  # D-070 scalp recycle
     assert DEFAULT_CONFIG.max_pending_signals == 12  # D-070 scalp budget

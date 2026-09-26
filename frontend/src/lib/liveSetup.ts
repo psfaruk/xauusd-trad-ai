@@ -37,24 +37,19 @@ export function signalTsMs(s: Signal): number {
  * backend normalizes at the signal identity + repo read; this is the
  * frontend's defensive mirror of the same rule — a suffixed row from
  * any legacy path must never hide a live signal from the chart again).
+ *
+ * D-076 — the legacy suffix-strip required ≥6 base chars, which broke the
+ * new 5-char bases (USOILm -> "USOILM" matched nothing). Known-market
+ * PREFIX matching (longest first) fixes it; delegated to the shared
+ * markets module so every surface uses the identical rule.
  */
-export function marketKey(symbol: string | null | undefined): string {
-  let s = (symbol ?? "").toString().trim().toUpperCase();
-  if (!s) return "";
-  s = s.split(".")[0];
-  for (const suffix of ["MICRO", "PRO", "M"]) {
-    if (s.endsWith(suffix) && s.length - suffix.length >= 6) {
-      s = s.slice(0, s.length - suffix.length);
-      break;
-    }
-  }
-  return s;
-}
+export { marketKey } from "./markets";
+import { marketKey as marketKeyLocal } from "./markets";
 
 /** do these two symbol spellings name the same market? */
 export function sameMarket(a: string | null | undefined, b: string | null | undefined): boolean {
-  const ka = marketKey(a);
-  const kb = marketKey(b);
+  const ka = marketKeyLocal(a);
+  const kb = marketKeyLocal(b);
   return ka !== "" && ka === kb;
 }
 

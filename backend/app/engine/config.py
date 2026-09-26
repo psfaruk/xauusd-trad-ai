@@ -711,11 +711,12 @@ class EngineConfig(BaseModel):
     )
     # -------------------------------------------------- D-051 multi-market block
     signal_symbols: list[str] = Field(
-        default_factory=lambda: ["XAUUSD", "BTCUSD"],
-        description="D-051 — markets the SIGNAL ENGINES run on (user "
-                    "directive: 'বিটকয়েনের উপর কোন সিগন্যাল ... হচ্ছে না'): "
-                    "one engine per market; signals are ALWAYS generated "
-                    "for every listed market regardless of auto-trade",
+        default_factory=lambda: ["XAUUSD", "BTCUSD", "USOIL", "USTEC"],
+        description="D-051/D-076 — markets the SIGNAL ENGINES run on (user "
+                    "directive: 'বিটকয়েনের উপর কোন সিগন্যাল ... হচ্ছে না' + "
+                    "'আরও দুইটি পেয়ার ... USOIL ও USTEC'): one engine per "
+                    "market; signals are ALWAYS generated for every listed "
+                    "market regardless of auto-trade",
     )
     auto_trade_symbols: list[str] = Field(
         default_factory=lambda: ["XAUUSD"],
@@ -1126,6 +1127,31 @@ def upgrade_legacy_sessions(raw: dict) -> tuple[dict, bool]:
     return out, True
 
 
+def upgrade_legacy_d076(raw: dict) -> tuple[dict, list[str]]:
+    """D-076 — extend untouched D-051-default market lists to 4 markets.
+
+    User directive: "আরও দুইটি পেয়ার অ্যাড করবেন সেটি হলো USOIL ও USTEC … এই
+    পেয়ার গুলো ও ঠিক অন্য পেয়ার এর মতো অটো সিগন্যাল চার্ট ড্রয়িং, সব কিছু হবে।"
+    A stored row whose signal_symbols is still the EXACT D-051 shipped
+    default ["XAUUSD", "BTCUSD"] was never hand-edited (admin-config
+    field), so USOIL + USTEC are APPENDED — one engine each starts at the
+    next boot/apply_config. A user-customized list stays untouched
+    forever (same rule as every legacy upgrade since D-047); the Settings
+    market toggles remain the way to add them by hand.
+    """
+    if not isinstance(raw, dict):
+        return raw, []
+    moved: list[str] = []
+    out = dict(raw)
+    syms = out.get("signal_symbols")
+    if isinstance(syms, list) and [str(s).upper() for s in syms] == [
+        "XAUUSD", "BTCUSD",
+    ]:
+        out["signal_symbols"] = ["XAUUSD", "BTCUSD", "USOIL", "USTEC"]
+        moved.append("signal_symbols:+USOIL+USTEC")
+    return out, moved
+
+
 DEFAULT_CONFIG = EngineConfig()
 
 
@@ -1176,10 +1202,12 @@ class ConfigRepo:
             raw, upgraded_d051 = upgrade_legacy_d051(raw)
             raw, moved_d070 = upgrade_legacy_d070(raw)
             raw, moved_d073 = upgrade_legacy_d073(raw)
+            raw, moved_d076 = upgrade_legacy_d076(raw)
             upgraded = (
                 upgraded_strategy or upgraded_sessions
                 or upgraded_confluence or bool(moved_d049) or upgraded_d050
                 or upgraded_d051 or bool(moved_d070) or bool(moved_d073)
+                or bool(moved_d076)
             )
             cfg = EngineConfig.model_validate(raw)
             if upgraded:
@@ -1200,6 +1228,8 @@ class ConfigRepo:
                     why.append("d070:scalp:" + "+".join(moved_d070))
                 if moved_d073:
                     why.append("d073:chart-parity:" + "+".join(moved_d073))
+                if moved_d076:
+                    why.append("d076:markets:" + "+".join(moved_d076))
                 logger.info(
                     "engine config upgraded (%s) — persisting",
                     "+".join(why) or "strategy",

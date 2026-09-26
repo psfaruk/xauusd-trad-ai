@@ -11,6 +11,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useTick } from "../state/feed";
 import { getAnalysis } from "../lib/api";
 import { sameMarket } from "../lib/liveSetup";
+import { marketMeta } from "../lib/markets";
+import SymbolSelect from "../components/SymbolSelect";
 import ErrorBoundary from "../components/ErrorBoundary";
 import PriceChart from "../components/PriceChart";
 import {
@@ -66,6 +68,8 @@ function PriceHero({
 }) {
   const loading = tick === null;
   const spread = tick ? tick.ask - tick.bid : null;
+  const meta = marketMeta(symbol);
+  const digits = meta.digits;
   return (
     <Card className="relative overflow-hidden">
       <div
@@ -78,7 +82,7 @@ function PriceHero({
             <h1 className="truncate text-lg font-bold tracking-tight text-zinc-100">
               {symbol}
             </h1>
-            <Badge tone="gold">XAU / Gold</Badge>
+            <Badge tone="gold">{meta.label}</Badge>
           </div>
           <p className="mt-0.5 text-[10px] text-zinc-500">
             Institutional market feed{tick?.tps != null && ` · ${tick.tps.toFixed(1)} ticks/s`}
@@ -94,7 +98,7 @@ function PriceHero({
           <Skeleton className="h-11 w-44" />
         ) : (
           <p className="truncate font-mono text-[40px] font-bold leading-none tabular-nums text-zinc-50">
-            {tick!.bid.toFixed(2)}
+            {tick!.bid.toFixed(digits)}
           </p>
         )}
         <div className="mt-2 flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1 text-[11px]">
@@ -103,13 +107,13 @@ function PriceHero({
           ) : (
             <>
               <span className="font-mono tabular-nums text-zinc-400">
-                bid <span className="text-zinc-200">{tick!.bid.toFixed(2)}</span>
+                bid <span className="text-zinc-200">{tick!.bid.toFixed(digits)}</span>
                 <span className="mx-1.5 text-zinc-600">/</span>
-                ask <span className="text-zinc-200">{tick!.ask.toFixed(2)}</span>
+                ask <span className="text-zinc-200">{tick!.ask.toFixed(digits)}</span>
               </span>
               {spread != null && (
                 <span className="font-mono tabular-nums text-zinc-500">
-                  spread <span className="text-zinc-300">{spread.toFixed(2)}</span>
+                  spread <span className="text-zinc-300">{spread.toFixed(digits)}</span>
                 </span>
               )}
             </>
@@ -248,7 +252,14 @@ export default function HomeView({
   const tick = useTick(symbol);
   const market = mt5?.feed?.symbols?.[symbol]?.market ?? "unknown";
   const feedProvider = mt5?.feed?.symbols?.[symbol];
-  const latest = signals[0] ?? null;
+  // D-076 — the Latest Signal card is PER-MARKET: on the USOIL home it must
+  // never show a gold-priced XAUUSD contract (the e2e VLM catch — the card
+  // sat next to the oil chart reading "BUY 2708.52"). Falls to null when
+  // the selected market has no signal yet (the card's honest empty state).
+  const latest = useMemo(
+    () => signals.find((s) => sameMarket(s.symbol, symbol)) ?? null,
+    [signals, symbol],
+  );
   const account = tradingAccount?.account ?? null;
   const brokerLinked = broker?.status === "connected" || broker?.status === "linked";
   const winRate = stats?.win_rate;
@@ -284,25 +295,20 @@ export default function HomeView({
 
   return (
     <div className="flex min-w-0 flex-col gap-3">
-      {/* symbol pills */}
-      {symbols.length > 1 && (
-        <div className="flex min-w-0 gap-2 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-          {symbols.map((s) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => onSymbolChange(s)}
-              className={`shrink-0 rounded-full border px-4 py-1.5 text-xs font-semibold transition-colors ${
-                s === symbol
-                  ? "border-gold/60 bg-gold/15 text-gold"
-                  : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200"
-              }`}
-            >
-              {s}
-            </button>
-          ))}
-        </div>
-      )}
+      {/* D-076 — the pair dropdown (user directive: "আর সব পেয়ার গুলো একটি
+       *  ড্রপ ডাউন বক্সে থাকবে ... জায়গা বাঁচবে") — every pair in ONE
+       *  dropdown; the old symbol-pill row is retired. */}
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <SymbolSelect
+          symbol={symbol}
+          symbols={symbols}
+          onChange={onSymbolChange}
+          quote={null}
+        />
+        <span className="truncate text-[10px] text-cream-300/50">
+          {marketMeta(symbol).name}
+        </span>
+      </div>
 
       {/* D-058 — the desktop split: the chart takes the WHOLE main
        *  column (no gutters, no empty space), the intel cards stack in

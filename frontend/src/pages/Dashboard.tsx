@@ -6,8 +6,10 @@ import ErrorBoundary from "../components/ErrorBoundary";
 import HomeView from "../views/HomeView";
 import ChartsView from "../views/ChartsView";
 import AiView from "../views/AiView";
+import AutoTradeView from "../views/AutoTradeView";
 import SettingsView from "../views/SettingsView";
 import { useAuth } from "../lib/auth";
+import { allSymbols } from "../lib/markets";
 import {
   getCandles, getMt5Status, getSignals, getStats, getHealth, getMe,
   getMt5AutoTrade, getTradingStatus,
@@ -96,8 +98,10 @@ export default function Dashboard() {
   });
 
   const symbols = useMemo(() => {
-    const list = mt5?.symbols?.length ? mt5.symbols : ["XAUUSD"];
-    return [...new Set(list)];
+    // D-076 — the backend's live symbol list (mt5.status.symbols, driven by
+    // signal_symbols) UNION the full market list — the dropdown always offers
+    // every pair even before the backend connects (feeds arrive async).
+    return allSymbols(mt5?.symbols);
   }, [mt5?.symbols]);
 
   /* --------------------------------------------------- stable ws handling */
@@ -221,8 +225,13 @@ export default function Dashboard() {
 
   // feed reset on symbol switch
   const onSymbolChange = useCallback((s: string) => {
-    feed.clearSymbol(s === "XAUUSD" ? "BTCUSD" : "XAUUSD");
-    setSymbol(s);
+    // D-076 — clear the PREVIOUS symbol's fast state (the old two-pair
+    // hack cleared a hardcoded "other" symbol and left stale bars with
+    // four markets in play).
+    setSymbol((prev) => {
+      if (prev !== s) feed.clearSymbol(prev);
+      return s;
+    });
   }, []);
 
   const onDesync = useCallback(() => {
@@ -387,6 +396,18 @@ export default function Dashboard() {
                   autoEvents={autoEvents}
                   refreshKey={aiRefreshKey}
                   signals={signals}
+                  onArmChanged={refreshSlow}
+                />
+              </div>
+            )}
+            {activeTab === "autotrade" && (
+              <div className="mx-auto w-full max-w-5xl">
+                <AutoTradeView
+                  token={token ?? ""}
+                  symbols={symbols}
+                  autoStatus={autoStatus}
+                  isAdmin={isAdmin}
+                  tradingAccount={tradingAccount}
                   onArmChanged={refreshSlow}
                 />
               </div>
