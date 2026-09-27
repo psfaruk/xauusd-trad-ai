@@ -21,6 +21,7 @@ import {
   mt5AccountInfo,
   mt5OpenPositions,
   sourceHealth,
+  mcpKeyInfo,
 } from "./providers";
 import { planes, planeFor, DEFAULT_SETTINGS } from "./trading";
 
@@ -312,6 +313,7 @@ function tradingOrder(token: string, body: Record<string, unknown>): Record<stri
 
 const routes: Record<string, Handler> = {
   "GET /api/health": (_req, res) => {
+    const liveMarkets = MARKET_SPECS.filter((s) => engine.tapes[s.key]).length;
     json(res, 200, {
       status: "ok",
       version: "3.0.0",
@@ -320,8 +322,12 @@ const routes: Record<string, Handler> = {
       detail: "MetaTrader 5 terminal (Exness-MT5Trial6 / 414350770) — every pair streams from the broker; no other source exists",
       ready: engine.ready,
       degraded: MARKET_SPECS.some((s) => !engine.tapes[s.key]),
-      db: false,
+      // truthful: "db" = at least one market is streaming REAL MT5 data
+      db: liveMarkets > 0,
       tps: Number((MARKET_SPECS.reduce((a, s) => a + engine.tickMeter[s.key].tps, 0)).toFixed(1)),
+      // self-heal visibility (never exposes the key itself)
+      mcp_key: mcpKeyInfo(),
+      terminal_connected: engine.mt5Account?.terminal?.server_connected === true,
     });
   },
 

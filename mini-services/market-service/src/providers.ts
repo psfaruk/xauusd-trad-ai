@@ -93,24 +93,78 @@ export function mt5Source(spec: MarketSpec): Mt5SourceSpec {
 
 /* ------------------------------------------------------------- MCP client */
 
-const MCP_URL = "http://127.0.0.1:22346/mcp";
-const MCP_KEY_FILE = "/home/z/mt5-stack/mcp_key.txt";
+const MCP_URL = process.env.MT5_MCP_URL ?? "http://127.0.0.1:22346/mcp";
+const MCP_KEY_FILE = process.env.MT5_MCP_KEY_FILE ?? "/home/z/mt5-stack/mcp_key.txt";
 const PROTOCOL = "2025-06-18";
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 
 let mcpKey = "";
-try { mcpKey = readFileSync(MCP_KEY_FILE, "utf8").trim(); } catch { /* reported via health */ }
+let mcpKeyMtimeMs = -1;
+try {
+  mcpKey = readFileSync(MCP_KEY_FILE, "utf8").trim();
+  mcpKeyMtimeMs = statSync(MCP_KEY_FILE).mtimeMs;
+} catch { /* reported via health */ }
+
+/**
+ * Cached-mtime key read: picks up a key that appears or changes on disk
+ * WITHOUT a service restart. Called on every rpc() so a rotated key heals
+ * within one round trip.
+ */
+function getMcpKey(): string {
+  try {
+    const mtimeMs = statSync(MCP_KEY_FILE).mtimeMs;
+    if (mtimeMs !== mcpKeyMtimeMs) {
+      mcpKey = readFileSync(MCP_KEY_FILE, "utf8").trim();
+      mcpKeyMtimeMs = mtimeMs;
+      console.warn(`[providers] mcp key (re)loaded from ${MCP_KEY_FILE}`);
+    }
+  } catch { /* missing/unreadable — keep the last known key */ }
+  return mcpKey;
+}
+
+/** Force a re-read (used when the MCP server rejects our auth). Logs only
+ *  when the key content actually changes or the read fails (throttled —
+ *  the quote poll retries every second during an outage). */
+function reloadMcpKey(): void {
+  try {
+    const next = readFileSync(MCP_KEY_FILE, "utf8").trim();
+    mcpKeyMtimeMs = statSync(MCP_KEY_FILE).mtimeMs;
+    if (next !== mcpKey) {
+      mcpKey = next;
+      console.warn(`[providers] mcp key (re)loaded from ${MCP_KEY_FILE}`);
+    }
+  } catch (err) {
+    if (Date.now() - lastReloadErrAt > 15_000) {
+      lastReloadErrAt = Date.now();
+      console.error(`[providers] mcp key reload failed (${MCP_KEY_FILE}): ${
+        err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
+/** Key status for /api/health — NEVER exposes the key itself. */
+export function mcpKeyInfo(): { present: boolean; length: number; source: string } {
+  const key = getMcpKey();
+  return { present: key.length > 0, length: key.length, source: MCP_KEY_FILE };
+}
 
 let sessionId: string | null = null;
 let rpcId = 1;
+let lastAuthWarnAt = 0;   // throttles 401/403 logging (quote poll runs 1/s)
+let lastReloadErrAt = 0;  // throttles key-reload error logging
 
 /** one JSON-RPC POST; keeps the MCP session warm. */
-async function rpc(method: string, params?: unknown, timeoutMs = 25_000): Promise<unknown> {
+async function rpc(
+  method: string,
+  params?: unknown,
+  timeoutMs = 25_000,
+  authRetried = false,
+): Promise<unknown> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
-    Authorization: `Bearer ${mcpKey}`,
+    Authorization: `Bearer ${getMcpKey()}`,
   };
   if (sessionId) headers["Mcp-Session-Id"] = sessionId;
   // JSON-RPC notifications carry NO id and NO params — the MT5 MCP server
@@ -131,6 +185,17 @@ async function rpc(method: string, params?: unknown, timeoutMs = 25_000): Promis
     });
     const sid = res.headers.get("mcp-session-id");
     if (sid) sessionId = sid;
+    if ((res.status === 401 || res.status === 403) && !authRetried) {
+      // auth rejected — the key on disk may be new/rotated: re-read it once
+      // and retry the request once (self-heal, no restart needed)
+      if (Date.now() - lastAuthWarnAt > 15_000) {
+        lastAuthWarnAt = Date.now();
+        console.warn(`[providers] MCP HTTP ${res.status} — re-reading ${MCP_KEY_FILE} and retrying once`);
+      }
+      reloadMcpKey();
+      sessionId = null;
+      return rpc(method, params, timeoutMs, true);
+    }
     if (!res.ok) throw new Error(`MCP HTTP ${res.status}`);
     let body = await res.text();
     if (body.startsWith("event:") || body.startsWith("data:")) {
@@ -156,25 +221,37 @@ async function ensureSession(): Promise<void> {
   try { await rpc("notifications/initialized", undefined, 8_000); } catch { /* notification */ }
 }
 
+/** Tool-level error from the MCP server (result.isError) — thrown so every
+ *  caller takes its REAL failure path (markFail + engine retry) instead of
+ *  silently returning empty data (the invisible-outage bug). */
+class Mt5ToolError extends Error {}
+
+interface McpToolResult {
+  content?: Array<{ type?: string; text?: string }>;
+  isError?: boolean;
+}
+
+function parseToolResult<T>(name: string, result: McpToolResult): T {
+  const text = result?.content?.[0]?.text ?? "";
+  if (result?.isError) {
+    throw new Mt5ToolError(`MT5 tool error: ${name} — ${text.slice(0, 300) || "no content"}`);
+  }
+  try { return JSON.parse(text) as T; } catch { return text as unknown as T; }
+}
+
 /** call an MCP tool; transparently re-initializes a dead session once. */
 export async function mcpTool<T = unknown>(name: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!sessionId) await ensureSession();
   try {
-    const result = await rpc("tools/call", { name, arguments: args }) as {
-      content?: Array<{ type?: string; text?: string }>;
-      isError?: boolean;
-    };
-    const text = result?.content?.[0]?.text ?? "";
-    try { return JSON.parse(text) as T; } catch { return text as unknown as T; }
+    const result = await rpc("tools/call", { name, arguments: args }) as McpToolResult;
+    return parseToolResult<T>(name, result);
   } catch (err) {
+    if (err instanceof Mt5ToolError) throw err; // tool-level failure: retrying the session cannot fix it
     // session probably expired — one fresh handshake + retry
     sessionId = null;
     await ensureSession();
-    const result = await rpc("tools/call", { name, arguments: args }) as {
-      content?: Array<{ type?: string; text?: string }>;
-    };
-    const text = result?.content?.[0]?.text ?? "";
-    try { return JSON.parse(text) as T; } catch { return text as unknown as T; }
+    const result = await rpc("tools/call", { name, arguments: args }) as McpToolResult;
+    return parseToolResult<T>(name, result);
   }
 }
 
@@ -397,6 +474,50 @@ export async function loadMarketHistory(spec: MarketSpec): Promise<MarketHistory
   const total = Object.values(series).reduce((a, s) => a + s.length, 0);
   if (total < 50) throw new Error(`MT5 history too thin for ${spec.mt5} (${total} bars)`);
   return { spec, source: mt5Source(spec), series };
+}
+
+/* ------------------------------------------------- market watch symbols */
+
+/** every Exness symbol the platform needs in the terminal's Market Watch. */
+export const MT5_WATCH_SYMBOLS: string[] = [
+  "XAUUSDm", "BTCUSDm", "USOILm", "USTECm",
+  "EURUSDm", "USDJPYm", "GBPUSDm", "USDCADm", "USDSEKm", "USDCHFm",
+];
+
+export interface EnsureSymbolsResult {
+  added: number;    // add_marketwatch_symbol reported success
+  already: number;  // duplicate / "already exists" responses
+  present: number;  // confirmed present in Market Watch afterwards
+  failed: string[]; // per-symbol failures (never fatal)
+}
+
+/**
+ * Make sure every platform symbol is in the terminal's Market Watch — a
+ * fresh terminal starts with an empty watch and quotes/history fail until
+ * the symbols are added. Idempotent: safe to call on every boot AND every
+ * engine retry cycle.
+ */
+export async function mt5EnsureSymbols(): Promise<EnsureSymbolsResult> {
+  let added = 0;
+  let already = 0;
+  const failed: string[] = [];
+  for (const symbol of MT5_WATCH_SYMBOLS) {
+    try {
+      await mcpTool("add_marketwatch_symbol", { symbol });
+      added += 1;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/already|exist|duplicate/i.test(msg)) already += 1;
+      else failed.push(`${symbol}: ${msg.slice(0, 120)}`);
+    }
+  }
+  let present = 0;
+  try {
+    const watch = await mcpTool<{ symbols?: Array<{ symbol?: string }> }>("get_marketwatch_symbols");
+    const names = new Set((watch?.symbols ?? []).map((s) => String(s.symbol ?? "")));
+    present = MT5_WATCH_SYMBOLS.filter((s) => names.has(s)).length;
+  } catch { /* presence check is best-effort */ }
+  return { added, already, present, failed };
 }
 
 /* ------------------------------------------------------- open positions */

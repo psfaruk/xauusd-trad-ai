@@ -51,5 +51,18 @@ test
 prompt
 
 server.log
+# sandbox tool artifacts
+tool-results/
+
+# mt5-linux local state (credentials + watchdog runtime) — never commit
+mt5-linux/mt5.env
+mt5-linux/stack.log
+mt5-linux/launch.log
+mt5-linux/terminal.pid
+mt5-linux/*.pid
+mt5-linux/.keycheck
+mt5-linux/.watchdog.pid
+mt5-linux/.watchdog.lock
+
 # Skills directory
 /skills/

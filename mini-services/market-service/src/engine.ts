@@ -24,6 +24,8 @@ import {
   mt5History,
   mt5AccountInfo,
   loadMarketHistory,
+  mt5EnsureSymbols,
+  MT5_WATCH_SYMBOLS,
   type Candle,
   type MarketSpec,
   type Mt5SourceSpec,
@@ -246,6 +248,19 @@ export class Engine {
   private async boot(): Promise<void> {
     const t0 = Date.now();
     this.log("info", "engine", "boot: loading REAL MetaTrader 5 history (8d M1 + H1/H4/D1)…");
+    console.log("[engine] boot: loading REAL MetaTrader 5 history (8d M1 + H1/H4/D1)");
+    // a fresh terminal starts with an EMPTY Market Watch — ensure every
+    // platform symbol is present BEFORE history loads, or quotes/history
+    // fail silently (isError ⇒ now loud) on every call
+    try {
+      const ensured = await mt5EnsureSymbols();
+      console.log(`[engine] market watch symbols ensured: ${ensured.present}/${MT5_WATCH_SYMBOLS.length} present (${ensured.added} added, ${ensured.failed.length} failed)`);
+      this.log("info", "engine",
+        `market watch symbols ensured: ${ensured.present}/${MT5_WATCH_SYMBOLS.length} present, ${ensured.added} added` +
+        (ensured.failed.length ? `, failed: ${ensured.failed.join("; ").slice(0, 200)}` : ""));
+    } catch (err) {
+      console.error(`[engine] market watch symbol ensure failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     const results = await Promise.allSettled(MARKET_SPECS.map((s) => loadMarketHistory(s)));
     let loaded = 0;
     for (let i = 0; i < results.length; i++) {
@@ -267,6 +282,7 @@ export class Engine {
     this.log("info", "engine",
       `boot complete in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${loaded}/${MARKET_SPECS.length} markets live, ` +
       `${total} real M1 bars, ${this.signals.length} backtested signals from real history`);
+    console.log(`[engine] boot complete in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${loaded}/${MARKET_SPECS.length} markets live, ${total} real M1 bars, ${this.signals.length} backtested signals from real history`);
   }
 
   private installTape(spec: MarketSpec, source: Mt5SourceSpec, series: Record<string, Candle[]>): void {
@@ -283,15 +299,28 @@ export class Engine {
     if (this.ready === false) return;
     const pending = MARKET_SPECS.filter((s) => !this.tapes[s.key]);
     if (!pending.length) return;
+    // a restarted/fresh terminal can lose Market Watch symbols — re-ensure
+    // them (idempotent, one round trip per symbol) before reloading history
+    try {
+      const ensured = await mt5EnsureSymbols();
+      console.log(`[engine] retry: market watch symbols ensured: ${ensured.present}/${MT5_WATCH_SYMBOLS.length} present`);
+    } catch (err) {
+      console.error(`[engine] retry: market watch symbol ensure failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     for (const spec of pending) {
+      const lastErr = this.bootErrors[spec.key] ?? this.poll[spec.key].lastErr ?? "no history yet";
+      // the outage must never be silent again — every retry hits stdout
+      console.warn(`[engine] retry ${spec.key}: ${lastErr}`);
       try {
         const h = await loadMarketHistory(spec);
         this.installTape(h.spec, h.source, h.series);
         this.seedMarketSignals(spec.key);
+        this.log("info", "engine", `${spec.key}: retry succeeded — REAL MT5 feed restored`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.bootErrors[spec.key] = msg;
         this.poll[spec.key].lastErr = msg;
+        this.log("error", "engine", `${spec.key}: retry failed — ${msg} (next retry in 60s)`);
       }
     }
   }
@@ -1104,6 +1133,10 @@ export class Engine {
   log(level: string, source: string, message: string, meta: unknown = null): void {
     this.logs.unshift({ ts: new Date().toISOString(), level, source, message, meta });
     if (this.logs.length > 400) this.logs.length = 400;
+    // NEVER silent again: error/warn levels mirror to stderr/stdout so an
+    // outage is visible in service.log even when nobody polls the API
+    if (level === "error") console.error(`[engine] ${source}: ${message}`);
+    else if (level === "warn") console.warn(`[engine] ${source}: ${message}`);
     this.broadcast("msg", { type: "engine_log", level, message });
   }
 

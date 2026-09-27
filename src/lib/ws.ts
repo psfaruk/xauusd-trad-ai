@@ -10,12 +10,19 @@
  * - socket.io's built-in reconnection replaces the manual backoff
  * - the server emits every frame on the "msg" event with a `type` field,
  *   exactly like the original WebSocket JSON protocol
+ * - cloud deployments can point the socket at an externally tunnelled
+ *   market-service via NEXT_PUBLIC_MARKET_WS_URL; otherwise the sandbox
+ *   gateway path (/?XTransformPort=3003) is used
  */
 
 import { io, type Socket } from "socket.io-client";
 import type { WsMessage } from "../types";
 
 const SERVICE_PORT = 3003;
+
+/** Optional external market-service origin (e.g. https://mt5.example.com) —
+ *  inlined at build time by Next.js (NEXT_PUBLIC_*). */
+const MARKET_WS_URL = process.env.NEXT_PUBLIC_MARKET_WS_URL;
 
 type Handler = (msg: WsMessage) => void;
 type StatusHandler = (status: "connecting" | "open" | "closed") => void;
@@ -55,7 +62,7 @@ export class WSClient {
   connect(): void {
     this.closedByUser = false;
     this.emitStatus("connecting");
-    const socket = io(`/?XTransformPort=${SERVICE_PORT}`, {
+    const socket = io(MARKET_WS_URL ?? `/?XTransformPort=${SERVICE_PORT}`, {
       auth: { token: this.token },
       transports: ["websocket", "polling"],
       reconnection: true,

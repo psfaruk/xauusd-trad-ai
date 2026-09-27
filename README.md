@@ -78,6 +78,42 @@ bun install
 bun run dev            # port 3000
 ```
 
+## Cloud Deployment (Railway)
+
+The repo deploys to [Railway](https://railway.app) as **one service running both
+processes**: the Next.js frontend (UI + the `/api/*` REST proxy) on the
+Railway-injected `$PORT`, and `market-service` (bun + socket.io) on `:3003`
+behind it — supervised by `railway-start.sh` (`railway.json` is the Railway v2
+config, Nixpacks builder, healthcheck on `/`).
+
+**The honest data dependency:** live market data requires the MetaTrader 5
+terminal's MCP bridge reachable at `MT5_MCP_URL`. Railway containers **cannot**
+run the Wine/MT5 stack — run the `mt5-linux/` stack on any Linux VPS instead,
+tunnel its MCP port (e.g. `https://mt5.example.com`), and point the deployment
+at it, or host `market-service` next to the terminal and expose it directly.
+Everything else (UI, charts, auth, practice plane) runs fine in the cloud.
+
+Deploy steps:
+
+1. Fork this repo.
+2. Railway → **New Project** → deploy the repo (railway.json is picked up
+   automatically).
+3. Set service variables **before the first build**:
+   - `MT5_MCP_URL` — the tunnelled MCP bridge of your VPS terminal
+   - `MT5_MCP_KEY` or `MT5_MCP_KEY_FILE` — the bridge bearer key
+   - `MT5_PASSWORD` — terminal login secret (never commit it)
+   - `NEXT_PUBLIC_MARKET_WS_URL` (optional) — a tunnelled market-service
+     origin for the websocket; without it the frontend uses the same host
+     it was served from. `NEXT_PUBLIC_*` values are **inlined at build
+     time** — change them, then redeploy.
+4. Deploy and verify `GET /api/health` on the Railway domain.
+
+Without a reachable MT5 terminal the app still boots and honestly reports
+"terminal unreachable / degraded" in its status endpoints and bridge
+diagnostics — **no price is ever fabricated** (see the data-source mandate
+above). Local/dev stays one command (`bun run dev`) in the sandbox where the
+terminal, market-service and gateway auto-start.
+
 ## Backtest on REAL broker history
 
 ```bash
