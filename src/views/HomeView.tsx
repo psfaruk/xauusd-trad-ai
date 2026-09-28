@@ -29,7 +29,7 @@ import {
 } from "../types";
 import { Badge, Btn, Card, Dot, SectionTitle, Skeleton, Stat } from "../components/ui";
 import { LatestSignalCard } from "../components/SignalDetail";
-import { CandlePulseCard } from "../components/StrategyRadar";
+import { CandleScopeCard } from "../components/CandleScope";
 import type { TickSnapshot } from "../state/feed";
 
 interface Props {
@@ -278,21 +278,38 @@ export default function HomeView({
   const adminTerminalUp =
     mt5?.status === "connected" || broker?.status === "connected";
   const adminAcct = isAdmin ? mt5?.account ?? null : null;
+  /* D-081 — the account card must NEVER show "—" placeholders when real
+   * money-like data exists: in web-live mode (institution terminal
+   * offline) the admin's card falls back to the practice plane numbers
+   * with honest labeling — the "নিচের দিকে স্ক্রল করে দেখো যাচ্ছে না"
+   * report was exactly this: an empty balance/equity card at the bottom
+   * of the home tab while the feed was fully live. */
+  const adminTerminalAcct =
+    adminAcct?.balance != null
+      ? adminAcct
+      : broker?.account?.balance != null
+        ? broker.account
+        : null;
+  const adminFallbackPractice = isAdmin && adminTerminalAcct == null;
   const shownBalance = isAdmin
-    ? adminAcct?.balance ?? broker?.account?.balance ?? null
+    ? adminTerminalAcct?.balance ?? account?.balance ?? null
     : account?.balance ?? null;
   const shownEquity = isAdmin
-    ? adminAcct?.equity ?? broker?.account?.equity ?? null
+    ? adminTerminalAcct?.equity ?? account?.equity ?? null
     : account?.equity ?? null;
   const shownCurrency = isAdmin
-    ? adminAcct?.currency ?? broker?.account?.currency ?? "USD"
+    ? adminTerminalAcct?.currency ?? account?.currency ?? "USD"
     : account?.currency ?? "USD";
-  const acctConnected = isAdmin ? adminTerminalUp : tradingAccount?.connected;
+  const acctConnected = isAdmin
+    ? adminTerminalUp || shownBalance != null
+    : tradingAccount?.connected;
   const acctFootnote = isAdmin
     ? brokerLinked
       ? `Exness terminal · ${broker?.login_masked ?? broker?.login ?? adminAcct?.login ?? "—"} @ ${broker?.server ?? adminAcct?.server ?? "—"}`
       : webLive
-        ? "Live market data · Binance + NYMEX/CME exchanges (MT5 terminal offline here)"
+        ? adminFallbackPractice
+          ? `Practice plane live · Binance + NYMEX/CME exchange feed (Exness terminal offline — auto-upgrades when it returns)`
+          : "Live market data · Binance + NYMEX/CME exchanges (MT5 terminal offline here)"
         : "Institution terminal · link your Exness account in Settings"
     : brokerLinked
       ? `Broker linked · ${broker?.login_masked ?? broker?.server ?? "—"}`
@@ -342,8 +359,12 @@ export default function HomeView({
         <div className="flex w-full min-w-0 flex-col gap-3 xl:w-[340px] 2xl:w-[380px] xl:shrink-0">
           <PriceHero symbol={symbol} tick={tick} market={market} />
 
-          {/* D-051 — live per-candle buyer/seller dominance (tick-driven) */}
-          <CandlePulseCard symbol={symbol} />
+          {/* D-082 — the RUNNING CANDLE MICROSCOPE: every tick inside the
+           * forming candle classified buyer/seller (tick rule), cumulative
+           * delta footprint, live O/H/L/C, direction lean + the flowing
+           * tape — re-renders per tick + a 100ms heartbeat (user directive:
+           * "একটি ক্যান্ডেল কি ঘটছে, মিলি সেকেন্ড এ আপডেট হবে"). */}
+          <CandleScopeCard symbol={symbol} />
 
           {/* AI auto trading */}
           <Card>
@@ -398,7 +419,7 @@ export default function HomeView({
               right={
                 acctConnected ? (
                   <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400">
-                    <Dot tone="green" /> {webLive ? "live exchange feed" : isAdmin ? "exness connected" : "active"}
+                    <Dot tone="green" /> {webLive ? (adminFallbackPractice ? "practice live" : "live exchange feed") : isAdmin ? "exness connected" : "active"}
                   </span>
                 ) : (
                   <span className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-400">
@@ -409,15 +430,15 @@ export default function HomeView({
             />
             <div className="grid grid-cols-2 gap-2">
               <Stat
-                label="Balance"
+                label={adminFallbackPractice ? "Balance (practice)" : "Balance"}
                 value={shownBalance != null ? shownBalance.toFixed(2) : "—"}
-                loading={tradingAccount === null && !isAdmin}
+                loading={shownBalance == null}
                 hint={shownCurrency}
               />
               <Stat
-                label="Equity"
+                label={adminFallbackPractice ? "Equity (practice)" : "Equity"}
                 value={shownEquity != null ? shownEquity.toFixed(2) : "—"}
-                loading={tradingAccount === null && !isAdmin}
+                loading={shownEquity == null}
                 tone={
                   shownBalance != null && shownEquity != null
                     ? shownEquity >= shownBalance ? "up" : "down"

@@ -496,9 +496,11 @@ async function pollYahoo(): Promise<void> {
        * PRODUCING data (price or venue-time moved), not "timestamp recent".
        * When the market closes, updates stop and so do the ticks. */
       const lastBar = bars.length ? bars[bars.length - 1] : null;
-      const price = Number.isFinite(meta?.regularMarketPrice ?? NaN)
-        ? meta!.regularMarketPrice
-        : lastBar?.c ?? null;
+      const price = (
+        Number.isFinite(meta?.regularMarketPrice ?? NaN)
+          ? meta!.regularMarketPrice
+          : lastBar?.c
+      ) ?? null;
       const venueTs = meta?.regularMarketTime ?? lastBar?.t ?? 0;
       const prev = yahooPrev[spec.key];
       const active = prev == null || price !== prev.price || venueTs !== prev.ts;

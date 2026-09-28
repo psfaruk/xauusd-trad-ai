@@ -89,6 +89,9 @@ export default function Dashboard() {
     enabled: !!token,
     queryFn: () => getSignals(token!, 150),
     refetchOnWindowFocus: false,
+    // D-082 — self-healing: a transient failure right after login must not
+    // leave the signal cards on "—" for the whole session
+    refetchInterval: 60_000,
   });
 
   const statsQuery = useQuery({
@@ -96,6 +99,7 @@ export default function Dashboard() {
     enabled: !!token,
     queryFn: () => getStats(token!, 30),
     refetchOnWindowFocus: false,
+    refetchInterval: 60_000,
   });
 
   const symbols = useMemo(() => {

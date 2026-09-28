@@ -7,6 +7,9 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
+  /* D-082 — engine.io polls "/socket.io/" (trailing slash): match the
+   * app-route proxy as-is instead of 308-redirecting every long-poll. */
+  skipTrailingSlashRedirect: true,
 };
 
 export default nextConfig;

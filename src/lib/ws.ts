@@ -64,7 +64,13 @@ export class WSClient {
     this.emitStatus("connecting");
     const socket = io(MARKET_WS_URL ?? `/?XTransformPort=${SERVICE_PORT}`, {
       auth: { token: this.token },
-      transports: ["websocket", "polling"],
+      /* D-082 — polling-first handshake, websocket upgrade after: through
+       * the gateway both transports work (ends on true websocket); on a
+       * direct :3000 page the upgrade silently fails and the session stays
+       * on long-polling (proxied by the app route) — either way the feed
+       * connects instead of hanging on a websocket that can never open. */
+      transports: ["polling", "websocket"],
+      upgrade: true,
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,

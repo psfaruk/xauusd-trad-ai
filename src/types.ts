@@ -491,6 +491,8 @@ export interface WsTickMsg {
   /** D-033: real market events batched into this frame + trailing rate. */
   n?: number;
   tps?: number;
+  /** D-082: venue-side epoch ms — true inter-tick gaps for the tape. */
+  ms?: number;
 }
 
 export interface WsBarMsg {

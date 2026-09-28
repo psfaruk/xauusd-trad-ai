@@ -646,9 +646,12 @@ export class Engine {
       meter.lastCalib = now;
     }
     this.ticks[spec.key] = { bid, ask, ts: tsSec };
+    // D-082 — ms-stamped tick frames: the running-candle microscope needs
+    // true inter-tick gaps in milliseconds (venue-side clock, not client).
     this.broadcast("msg", {
       type: "tick", symbol: spec.key, bid, ask, ts: tsSec,
       n: st.tickN, tps: Number(meter.tps.toFixed(1)),
+      ms: now,
     });
     this.updateFormingFromTick(spec, (bid + ask) / 2, bid, ask);
     this.emitFormingFrames(spec);
