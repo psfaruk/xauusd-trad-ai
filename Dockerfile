@@ -24,7 +24,7 @@ FROM node:22-bookworm-slim AS build
 WORKDIR /app
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates \
+ && apt-get install -y --no-install-recommends curl ca-certificates unzip \
  && rm -rf /var/lib/apt/lists/*
 
 # bun — runs the installs and market-service at runtime
