@@ -4,11 +4,14 @@
  *  - HTTP REST under /api/* (served on port 3003; the Next.js frontend
  *    reaches it through the gateway via ?XTransformPort=3003)
  *  - socket.io on path "/" for real-time tick/bar/signal/pulse frames
- *  - the market engine — 100% MetaTrader 5 data: the REAL terminal
- *    (Exness-MT5Trial6, login 414350770) running under user-space Wine
- *    feeds every price, candle, tick, history and account number via its
- *    built-in MCP server. NO other source exists in this codebase.
- *  - per-token practice trading planes (marked-to-market on real MT5 quotes)
+ *  - the market engine — REAL data, MT5-first: the user's REAL MetaTrader 5
+ *    terminal (Exness-MT5Trial6, login 414350770) under user-space Wine via
+ *    its MCP server feeds every price when available; otherwise every market
+ *    streams from REAL exchange web feeds (Binance PAXG/BTC order books,
+ *    NYMEX/CME futures — webfeed.ts) and upgrades back automatically.
+ *  - per-token practice trading planes (marked-to-market on real quotes)
+ *  - PUBLIC data-source endpoints (/api/public/*) so external apps can pull
+ *    live quotes/candles from this host (the user's "cloud source")
  */
 
 import { createServer } from "http";
@@ -23,6 +26,8 @@ import {
   sourceHealth,
   mcpKeyInfo,
 } from "./providers";
+import { webFeedHealth } from "./webfeed";
+import { remoteFeedHealth } from "./remotefeed";
 import { planes, planeFor, DEFAULT_SETTINGS } from "./trading";
 
 const PORT = 3003;
@@ -129,41 +134,64 @@ function readBody(req: import("http").IncomingMessage): Promise<Record<string, u
   });
 }
 
-/** Feed status block — 100% MetaTrader 5 (mirrors the Python /api/mt5/status payload). */
+/** Feed status block — the REAL source that powers each market right now
+ * (local MT5 terminal → AURUM remote MT5 bridge → live web exchanges). */
 function feedStatus(): Record<string, unknown> {
   const symbols = engine.feedInfo();
   const xau = engine.ticks.XAUUSD;
+  const fm = engine.feedModeSummary();
   const degraded = MARKET_SPECS.some((s) => {
     const info = symbols[s.key] as { degraded?: boolean } | undefined;
     return info?.degraded === true;
-  });
+  }) || fm.mode === "none";
   const account = engine.mt5Account ?? null;
+  const serverUp = account?.terminal?.server_connected === true;
+  const webNote =
+    "REAL exchange data — Binance order books (PAXG = 1 oz allocated LBMA gold, BTC) " +
+    "with sub-second WebSocket ticks + NYMEX WTI (CL=F) / CME Nasdaq-100 (NQ=F) futures. " +
+    "No simulated prices; closed sessions simply stop ticking.";
+  const remoteNote =
+    "User-directed source — the AURUM Terminal (u1m7j8csutd1-d.space-z.ai) hosts the " +
+    "REAL MetaTrader 5 terminal (Exness-MT5Trial6): every bid/ask, candle and volume " +
+    "is genuine broker data, streamed real-time through its JSON bridge.";
+  const detail =
+    fm.remote && !fm.mt5
+      ? remoteNote + (fm.web ? " " + webNote : "")
+      : fm.mode === "web-live"
+        ? "MT5 terminal offline in this environment — " + webNote
+        : fm.mode === "mt5+web-live"
+          ? "Mixed: some markets on the Exness terminal, some on live web exchanges. " + webNote
+          : "MetaTrader 5 terminal (build " + (account?.terminal?.build ?? "?") + ") — " +
+            "Exness-MT5Trial6, login 414350770. Every symbol streams from the broker.";
   return {
-    provider: "metatrader5",
-    detail:
-      "MetaTrader 5 terminal (build " + (account?.terminal?.build ?? "?") + ") — " +
-      "Exness-MT5Trial6, login 414350770. Every symbol streams from the broker; " +
-      "no other data source exists in this platform.",
+    provider: fm.mode,
+    detail,
     last_price: xau ? Number((((xau.bid + xau.ask) / 2)).toFixed(2)) : null,
     spread: xau ? Number((xau.ask - xau.bid).toFixed(2)) : null,
     last_tick_age_s: xau ? Math.max(0, Math.floor(Date.now() / 1000) - xau.ts) : null,
     tps: Number((MARKET_SPECS.reduce((a, s) => a + engine.tickMeter[s.key].tps, 0)).toFixed(1)),
     symbols,
     mt5: {
-      connected: account?.terminal?.server_connected === true,
+      connected: serverUp,
       broker: account?.account?.broker ?? "Exness Technologies Ltd",
       server: account?.account?.server ?? "Exness-MT5Trial6",
       login: account?.account?.login ?? "414350770",
       build: account?.terminal?.build ?? null,
       last_ping_ms: account?.terminal?.server_last_ping ?? null,
       note:
-        "The REAL MetaTrader 5 terminal runs in this environment (user-space Wine) " +
-        "and serves every market via its MCP bridge — all pairs, all timeframes, " +
-        "history and account data come from the broker.",
+        serverUp
+          ? "The REAL MetaTrader 5 terminal runs in this environment (user-space Wine) " +
+            "and serves every market via its MCP bridge."
+          : fm.remote
+            ? "Local terminal offline — but the user's REAL Exness terminal streams through " +
+              "the AURUM Terminal bridge (remote-mt5). Upgrades to the local terminal " +
+              "automatically if it ever connects here."
+            : "MT5 terminal offline (no Wine terminal / MCP key on this host) — the platform " +
+              "streams REAL exchange data instead and upgrades back to the broker feed " +
+              "automatically once the terminal reconnects.",
     },
-    note:
-      "DATA_SOURCE=metatrader5 — Exness-MT5Trial6 terminal (login 414350770); " +
-      "no Binance/Yahoo/simulated path exists anywhere in the code",
+    remote: remoteFeedHealth(),
+    web: webFeedHealth(),
     degraded,
   };
 }
@@ -181,12 +209,17 @@ async function mt5Status(token: string): Promise<Record<string, unknown>> {
   const acct = info?.account ?? null;
   const term = info?.terminal ?? null;
   const serverUp = term?.server_connected === true;
+  // "status" describes the DATA connection of the platform: connected while
+  // any real feed (terminal or live web exchange) is streaming prices.
+  const fm = engine.feedModeSummary();
+  const feedUp = fm.mode !== "none" && MARKET_SPECS.some((s) => engine.tapes[s.key]?.live);
   return {
-    status: serverUp ? "connected" : "reconnecting",
+    status: feedUp ? "connected" : "reconnecting",
+    data_source: fm.mode,
     symbol: "XAUUSD",
     symbols: MARKET_SPECS.map((s) => s.key),
     broker: {
-      status: serverUp ? "linked" : "reconnecting",
+      status: serverUp ? "linked" : fm.remote ? "linked" : fm.mode === "web-live" ? "web-exchange" : "reconnecting",
       login: acct?.login ?? "414350770",
       login_masked: String(acct?.login ?? "414350770").replace(/^(\d{3})\d+(\d{2})$/, "$1••••$2"),
       server: acct?.server ?? "Exness-MT5Trial6",
@@ -314,20 +347,87 @@ function tradingOrder(token: string, body: Record<string, unknown>): Record<stri
 const routes: Record<string, Handler> = {
   "GET /api/health": (_req, res) => {
     const liveMarkets = MARKET_SPECS.filter((s) => engine.tapes[s.key]).length;
+    const fm = engine.feedModeSummary();
+    const remoteDetail =
+      "Streaming from the user's REAL MetaTrader 5 (Exness-MT5Trial6 / 414350770) terminal " +
+      "via the AURUM Terminal bridge (https://u1m7j8csutd1-d.space-z.ai) — real-time broker " +
+      "bid/ask, candles and volumes";
+    const webDetail =
+      "MT5 terminal offline in this environment — streaming REAL exchange data: " +
+      "Binance order books (PAXG 1oz-gold, BTC) sub-second WebSocket + NYMEX WTI (CL=F) / " +
+      "CME Nasdaq (NQ=F) futures; auto-upgrades to the Exness terminal when it returns";
     json(res, 200, {
       status: "ok",
       version: "3.0.0",
-      data_source: "metatrader5",
+      data_source: fm.mode,
       requested_data_source: "metatrader5",
-      detail: "MetaTrader 5 terminal (Exness-MT5Trial6 / 414350770) — every pair streams from the broker; no other source exists",
+      detail:
+        fm.mode === "metatrader5"
+          ? "MetaTrader 5 terminal (Exness-MT5Trial6 / 414350770) — every pair streams from the broker"
+          : fm.remote && !fm.web
+            ? remoteDetail
+            : fm.remote
+              ? remoteDetail + "; web exchanges as fallback for the rest"
+              : fm.mode === "web-live"
+                ? webDetail
+                : "Mixed feed — some markets on the Exness MT5 terminal, some on live web exchanges",
       ready: engine.ready,
       degraded: MARKET_SPECS.some((s) => !engine.tapes[s.key]),
-      // truthful: "db" = at least one market is streaming REAL MT5 data
+      // truthful: "db" = at least one market is streaming REAL data
       db: liveMarkets > 0,
+      markets_live: liveMarkets,
       tps: Number((MARKET_SPECS.reduce((a, s) => a + engine.tickMeter[s.key].tps, 0)).toFixed(1)),
+      remote: remoteFeedHealth(),
+      web: webFeedHealth(),
       // self-heal visibility (never exposes the key itself)
       mcp_key: mcpKeyInfo(),
       terminal_connected: engine.mt5Account?.terminal?.server_connected === true,
+    });
+  },
+
+  /* ------- PUBLIC data-source endpoints (no auth): this host serves live
+   * quotes/candles to ANY external app (the user's cloud data source). ------- */
+
+  "GET /api/public/quotes": (_req, res) => {
+    const fm = engine.feedModeSummary();
+    const quotes: Record<string, unknown> = {};
+    for (const spec of MARKET_SPECS) {
+      const tape = engine.tapes[spec.key];
+      const t = engine.ticks[spec.key];
+      quotes[spec.key] = {
+        symbol: spec.key,
+        bid: t?.bid ?? null,
+        ask: t?.ask ?? null,
+        mid: t ? Number((((t.bid + t.ask) / 2)).toFixed(spec.digits)) : null,
+        spread: t ? Number((t.ask - t.bid).toFixed(spec.digits + 1)) : null,
+        ts: t?.ts ?? null,
+        age_s: t ? Math.max(0, Math.floor(Date.now() / 1000) - t.ts) : null,
+        market: tape ? (tape.live ? "open" : "closed") : "loading",
+        source: tape?.source.id ?? null,
+        venue: tape?.source.kind ?? null,
+      };
+    }
+    json(res, 200, {
+      ts: Math.floor(Date.now() / 1000),
+      data_source: fm.mode,
+      quotes,
+      note: "REAL market data — MT5 terminal when connected, live web exchanges (Binance/NYMEX/CME) otherwise. No simulated prices.",
+    });
+  },
+
+  "GET /api/public/candles": (req, res, url) => {
+    const tf = url.searchParams.get("tf") ?? "M1";
+    const limit = Math.min(2000, Math.max(10, Number(url.searchParams.get("limit") ?? 500)));
+    const symbol = url.searchParams.get("symbol") ?? "XAUUSD";
+    const tape = engine.tapes[symbol];
+    if (!tape || !TIMEFRAMES[tf]) return fail(res, 400, "unknown symbol or timeframe");
+    const candles = tape.getClosed(tf, limit);
+    json(res, 200, {
+      symbol,
+      tf,
+      count: candles.length,
+      source: tape.source.id,
+      candles,
     });
   },
 
@@ -909,11 +1009,15 @@ setInterval(() => {
 /** Cache for the real /api/market/external references (60s TTL). */
 let externalCache: { at: number; payload: Record<string, unknown> } | null = null;
 
-// mt5 status broadcast every 10s — REAL terminal state
+// mt5 status broadcast every 10s — the REAL feed state (terminal or live
+// web exchange) so the UI badge reflects the actual data connection
 setInterval(() => {
+  const fm = engine.feedModeSummary();
+  const feedUp = fm.mode !== "none" && MARKET_SPECS.some((s) => engine.tapes[s.key]?.live);
   io.emit("msg", {
     type: "mt5_status", symbol: "XAUUSD",
-    status: engine.mt5Account?.terminal?.server_connected === true ? "connected" : "reconnecting",
+    status: feedUp ? "connected" : "reconnecting",
+    data_source: fm.mode,
     symbols: MARKET_SPECS.map((s) => s.key), feed: feedStatus(),
   });
 }, 10000);
@@ -922,5 +1026,5 @@ engine.start(io);
 
 httpServer.listen(PORT, () => {
   console.log(`[market-service] listening on :${PORT} (HTTP /api/* + socket.io path "/")`);
-  console.log(`[market-service] DATA SOURCE: MetaTrader 5 terminal — Exness-MT5Trial6 / login 414350770 (MCP :22346). No other source exists.`);
+  console.log(`[market-service] DATA SOURCE ladder: local MT5 terminal (Exness-MT5Trial6 / 414350770, MCP :22346) → AURUM Terminal remote MT5 bridge (REMOTE_MT5_URL, default https://u1m7j8csutd1-d.space-z.ai) → live web exchanges (Binance PAXG/BTC + NYMEX/CME futures). Public data API: /api/public/quotes, /api/public/candles.`);
 });

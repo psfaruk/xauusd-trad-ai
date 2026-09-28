@@ -1,9 +1,11 @@
 /**
- * Real market tape — candle store backed EXCLUSIVELY by MetaTrader 5 data
- * (see providers.ts). Bars arrive from the MT5 terminal's MCP server
- * (Exness broker feed), get merged into every timeframe, and the forming bar
- * tracks the broker's own partial candle. Nothing here is generated — when
- * the market is closed (weekend FX/metals), the tape simply stops advancing.
+ * Real market tape — candle store backed by REAL market data (see
+ * providers.ts / webfeed.ts). Bars arrive from the MT5 terminal's MCP server
+ * (Exness broker feed) or from the live web exchange feed (Binance order
+ * books / NYMEX-CME futures), get merged into every timeframe, and the
+ * forming bar tracks the venue's own partial candle. Nothing here is
+ * generated — when the market is closed (weekend FX/metals), the tape
+ * simply stops advancing.
  */
 
 import {
@@ -11,7 +13,7 @@ import {
   TIMEFRAMES,
   type Candle,
   type MarketSpec,
-  type Mt5SourceSpec,
+  type SourceSpec,
 } from "./providers";
 
 export {
@@ -31,7 +33,7 @@ export interface IngestResult {
 
 export class Tape {
   readonly spec: MarketSpec;
-  readonly source: Mt5SourceSpec;
+  readonly source: SourceSpec;
   /** epoch seconds of the first closed M1 bar */
   readonly originSec: number;
   /** closed candles per timeframe (ascending) */
@@ -41,7 +43,7 @@ export class Tape {
   /** last time real data touched this tape (ms) */
   lastDataMs = 0;
 
-  constructor(spec: MarketSpec, source: Mt5SourceSpec, history: Record<string, Candle[]>) {
+  constructor(spec: MarketSpec, source: SourceSpec, history: Record<string, Candle[]>) {
     this.spec = spec;
     this.source = source;
     this.series.M1 = history.M1 ?? [];

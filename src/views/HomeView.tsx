@@ -264,6 +264,7 @@ export default function HomeView({
   );
   const account = tradingAccount?.account ?? null;
   const brokerLinked = broker?.status === "connected" || broker?.status === "linked";
+  const webLive = mt5?.data_source === "web-live";
   const winRate = stats?.win_rate;
   const expectancy = stats?.expectancy;
 
@@ -290,7 +291,9 @@ export default function HomeView({
   const acctFootnote = isAdmin
     ? brokerLinked
       ? `Exness terminal · ${broker?.login_masked ?? broker?.login ?? adminAcct?.login ?? "—"} @ ${broker?.server ?? adminAcct?.server ?? "—"}`
-      : "Institution terminal · link your Exness account in Settings"
+      : webLive
+        ? "Live market data · Binance + NYMEX/CME exchanges (MT5 terminal offline here)"
+        : "Institution terminal · link your Exness account in Settings"
     : brokerLinked
       ? `Broker linked · ${broker?.login_masked ?? broker?.server ?? "—"}`
       : "Practice account · link your broker in Settings";
@@ -395,7 +398,7 @@ export default function HomeView({
               right={
                 acctConnected ? (
                   <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-400">
-                    <Dot tone="green" /> {isAdmin ? "exness connected" : "active"}
+                    <Dot tone="green" /> {webLive ? "live exchange feed" : isAdmin ? "exness connected" : "active"}
                   </span>
                 ) : (
                   <span className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-400">

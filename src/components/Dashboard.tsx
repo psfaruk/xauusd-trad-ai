@@ -134,6 +134,7 @@ export default function Dashboard() {
               ? {
                   ...prev,
                   status: msg.status,
+                  data_source: msg.data_source ?? prev.data_source,
                   symbol: msg.symbol ?? prev.symbol,
                   symbols: msg.symbols ?? prev.symbols,
                   feed: msg.feed ?? prev.feed,

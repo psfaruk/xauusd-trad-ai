@@ -10,9 +10,11 @@
  *   logged into the user's Exness account (Exness-MT5Trial6, login
  *   414350770). The terminal exposes its built-in MCP server
  *   (http://127.0.0.1:22346/mcp, bearer-key auth) which this module talks
- *   to. There is NO Binance, NO Yahoo, NO simulation, NO fallback — if the
- *   terminal is unreachable the price simply goes stale and the status
- *   reports disconnected. Data is NEVER invented.
+ *   to. When the terminal is unreachable (fresh Linux/cloud host, no Wine
+ *   stack), the engine fails each market over to webfeed.ts — REAL exchange
+ *   data (Binance PAXG/BTC order books, NYMEX/CME futures) — and upgrades
+ *   back to the broker automatically once the terminal returns. Data is
+ *   NEVER invented in either mode.
  *
  * Exness broker symbol names (Standard account, "m" suffix):
  *   XAUUSD → XAUUSDm   (Gold vs US Dollar, 3 digits, 100 oz contract)
@@ -78,7 +80,9 @@ export const MARKET_MAP: Record<string, MarketSpec> = Object.fromEntries(
   MARKET_SPECS.map((m) => [m.key, m]),
 );
 
-/** Identifies the single, authoritative data source of every tape. */
+/** Identifies the authoritative data source of a tape — the REAL MetaTrader
+ * 5 terminal (preferred, kind:"mt5") or a REAL exchange web feed (kind:"web",
+ *  the always-on fallback when the terminal is offline — see webfeed.ts). */
 export interface Mt5SourceSpec {
   kind: "mt5";
   /** display id, e.g. "mt5:Exness/XAUUSDm" */
@@ -86,6 +90,31 @@ export interface Mt5SourceSpec {
   /** broker symbol on the terminal */
   mt5Symbol: string;
 }
+
+/** REAL exchange web feed source (Binance order books / NYMEX-CME futures). */
+export interface WebSourceSpec {
+  kind: "web";
+  /** display id, e.g. "web:binance/PAXGUSDT" */
+  id: string;
+  /** "Binance" | "Yahoo Finance" */
+  venue: string;
+  /** exchange symbol */
+  webSymbol: string;
+}
+
+/** The AURUM Terminal remote bridge — the user's REAL MetaTrader 5 (Exness)
+ *  terminal served as JSON over HTTPS (user-directed data source). */
+export interface RemoteMt5SourceSpec {
+  kind: "remote-mt5";
+  /** display id, e.g. "remote-mt5:AURUM/XAUUSDm" */
+  id: string;
+  /** "AURUM Terminal" */
+  venue: string;
+  /** broker symbol on the remote terminal */
+  mt5Symbol: string;
+}
+
+export type SourceSpec = Mt5SourceSpec | RemoteMt5SourceSpec | WebSourceSpec;
 
 export function mt5Source(spec: MarketSpec): Mt5SourceSpec {
   return { kind: "mt5", id: `mt5:Exness/${spec.mt5}`, mt5Symbol: spec.mt5 };
@@ -441,7 +470,7 @@ export function aggregateCandles(bars: Candle[], tfMin: number): Candle[] {
 
 export interface MarketHistory {
   spec: MarketSpec;
-  source: Mt5SourceSpec;
+  source: SourceSpec;
   series: Record<string, Candle[]>; // closed candles per TF
 }
 

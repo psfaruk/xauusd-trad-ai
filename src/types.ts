@@ -19,9 +19,11 @@ export type SignalStatus =
 export interface HealthInfo {
   status: string;
   version: string;
-  data_source: "mock" | "mt5" | "live";
+  /** Active REAL data source: "metatrader5" | "web-live" (live web
+   * exchanges when the MT5 terminal is offline) | "mt5+web-live". */
+  data_source: string;
   /** D-032: what the env requested (differs from data_source only on degrade). */
-  requested_data_source?: "mock" | "mt5" | "live";
+  requested_data_source?: string;
   degraded?: boolean;
   db: boolean;
 }
@@ -255,6 +257,8 @@ export interface BrokerConnection {
 
 export interface Mt5Status {
   status: "connected" | "disconnected" | "reconnecting";
+  /** Active REAL data source: "metatrader5" | "web-live" | "mt5+web-live". */
+  data_source?: string;
   symbol: string | null;
   /** D-035: every chartable symbol (XAUUSD + BTCUSD). */
   symbols?: string[];
@@ -531,6 +535,7 @@ export interface WsAccountMsg {
 export interface WsMt5StatusMsg {
   type: "mt5_status";
   status: Mt5Status["status"];
+  data_source?: string;
   symbol: string | null;
   /** D-035: every chartable symbol (XAUUSD + BTCUSD). */
   symbols?: string[];

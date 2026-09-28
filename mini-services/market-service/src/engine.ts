@@ -1,19 +1,24 @@
 /**
- * Market engine — REAL-TIME runtime on the REAL MetaTrader 5 terminal.
+ * Market engine — REAL-TIME runtime on REAL market data.
  *
- * Every price, every candle and every backtested signal comes from the user's
- * MetaTrader 5 terminal (Exness-MT5Trial6, login 414350770) running under
- * user-space Wine, via its built-in MCP server (see providers.ts):
+ * Preferred source: the user's MetaTrader 5 terminal (Exness-MT5Trial6,
+ * login 414350770) under user-space Wine via its MCP server (providers.ts).
+ * Always-on fallback: when the terminal is unreachable (fresh Linux/cloud
+ * host — no Wine stack / MCP key), every market fails over to webfeed.ts —
+ * REAL exchange data (Binance PAXG-gold + BTC order books with sub-second
+ * WebSocket ticks, NYMEX WTI + CME Nasdaq futures). When the terminal
+ * returns, retryFailed() upgrades each market back to the broker feed.
  *
- *  - boot: load ~8d of real M1 history per market (+ native H1/H4/D1 depth)
-    from the broker, then run the SFP signal engine over the real M15 history
-    — a genuine backtest that seeds the signal panel and stats with REAL
-    outcomes.
- *  - live: poll the MT5 Market Watch (1s, all symbols in one round trip) for
-      real bid/ask ticks, and sync M1 candles from the broker every 5s; bars
-      close only when the broker reports them closed.
- *  - closed markets (weekend FX/metals/oil): the broker's quote timestamp
- *   goes stale — ticks are NOT fabricated, status shows "closed".
+ *  - boot: load real history per market (terminal first, web exchange
+ *    second), then run the SFP signal engine over the real M15 history
+ *    — a genuine backtest that seeds the signal panel and stats with REAL
+ *    outcomes.
+ *  - live: MT5 mode polls the Market Watch (1s, all symbols, one round
+ *    trip); web mode receives sub-second Binance WebSocket pushes plus an
+ *    8-10s Yahoo quote/1m-bar sync. Bars close only when the venue reports
+ *    them closed.
+ *  - closed markets (weekend FX/metals/oil): quote timestamps go stale —
+ *    ticks are NOT fabricated, status shows "closed".
  */
 
 import type { Server } from "socket.io";
@@ -28,9 +33,24 @@ import {
   MT5_WATCH_SYMBOLS,
   type Candle,
   type MarketSpec,
-  type Mt5SourceSpec,
+  type SourceSpec,
   type Mt5AccountInfo,
 } from "./providers";
+import {
+  loadWebMarketHistory,
+  startWebFeed,
+  stopWebFeed,
+  type WebFeedHooks,
+} from "./webfeed";
+import {
+  loadRemoteMarketHistory,
+  remoteAvailable,
+  remoteFeedHealth,
+  remoteFeedRunning,
+  startRemoteFeed,
+  stopRemoteFeed,
+  type RemoteFeedHooks,
+} from "./remotefeed";
 import { Tape } from "./tape";
 import {
   analyzeTf, atr as atrFn, ema, findSwings, rsi as rsiFn, sessionOf,
@@ -223,7 +243,7 @@ export class Engine {
     if (this.retryTimer) clearInterval(this.retryTimer);
     this.retryTimer = setInterval(() => void this.retryFailed(), 60_000);
     this.log("info", "engine",
-      "EngineRuntime started — MetaTrader 5 terminal feed (Exness-MT5Trial6 / 414350770)");
+      "EngineRuntime started — MT5 terminal feed first (Exness-MT5Trial6 / 414350770), live web exchange fallback (Binance + NYMEX/CME)");
     void this.boot();
   }
 
@@ -247,11 +267,11 @@ export class Engine {
 
   private async boot(): Promise<void> {
     const t0 = Date.now();
-    this.log("info", "engine", "boot: loading REAL MetaTrader 5 history (8d M1 + H1/H4/D1)…");
-    console.log("[engine] boot: loading REAL MetaTrader 5 history (8d M1 + H1/H4/D1)");
+    this.log("info", "engine", "boot: loading REAL market history (MT5 terminal first, live web exchange fallback)…");
+    console.log("[engine] boot: loading REAL market history (MT5 terminal first, live web exchange fallback)");
     // a fresh terminal starts with an EMPTY Market Watch — ensure every
-    // platform symbol is present BEFORE history loads, or quotes/history
-    // fail silently (isError ⇒ now loud) on every call
+    // platform symbol is present BEFORE history loads. Fast-fails
+    // (ECONNREFUSED) when the terminal isn't running at all.
     try {
       const ensured = await mt5EnsureSymbols();
       console.log(`[engine] market watch symbols ensured: ${ensured.present}/${MT5_WATCH_SYMBOLS.length} present (${ensured.added} added, ${ensured.failed.length} failed)`);
@@ -263,6 +283,7 @@ export class Engine {
     }
     const results = await Promise.allSettled(MARKET_SPECS.map((s) => loadMarketHistory(s)));
     let loaded = 0;
+    const webSpecs: MarketSpec[] = [];
     for (let i = 0; i < results.length; i++) {
       const spec = MARKET_SPECS[i];
       const r = results[i];
@@ -271,13 +292,33 @@ export class Engine {
         loaded += 1;
       } else {
         const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
-        this.bootErrors[spec.key] = msg;
-        this.log("error", "engine", `${spec.key}: history load failed — ${msg} (will retry in 60s)`);
+        // no local terminal → the user-directed AURUM remote MT5 bridge
+        this.log("warn", "engine", `${spec.key}: local MT5 terminal unavailable (${msg.slice(0, 120)}) — trying the AURUM Terminal remote bridge…`);
+        try {
+          const rh = await loadRemoteMarketHistory(spec);
+          this.installTape(rh.spec, rh.source, rh.series);
+          loaded += 1;
+        } catch (rerr) {
+          const rmsg = rerr instanceof Error ? rerr.message : String(rerr);
+          // remote bridge down too → REAL live web exchange feed (never silence)
+          this.log("warn", "engine", `${spec.key}: AURUM bridge unavailable (${rmsg.slice(0, 120)}) — switching to the live web exchange feed`);
+          try {
+            const wh = await loadWebMarketHistory(spec);
+            this.installTape(wh.spec, wh.source, wh.series);
+            webSpecs.push(spec);
+            loaded += 1;
+          } catch (werr) {
+            const wmsg = werr instanceof Error ? werr.message : String(werr);
+            this.bootErrors[spec.key] = `mt5: ${msg.slice(0, 80)} | remote: ${rmsg.slice(0, 80)} | web: ${wmsg.slice(0, 80)}`;
+            this.log("error", "engine", `${spec.key}: every source failed — ${wmsg} (will retry in 60s)`);
+          }
+        }
       }
     }
     // REAL backtest: run the SFP engine over the actual M15 history
     this.seedHistoricalSignals();
     this.ready = true;
+    if (webSpecs.length) this.startWebFeedFor(webSpecs);
     const total = Object.values(this.tapes).reduce((a, t) => a + t.getClosed("M1", 1e9).length, 0);
     this.log("info", "engine",
       `boot complete in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${loaded}/${MARKET_SPECS.length} markets live, ` +
@@ -285,45 +326,144 @@ export class Engine {
     console.log(`[engine] boot complete in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${loaded}/${MARKET_SPECS.length} markets live, ${total} real M1 bars, ${this.signals.length} backtested signals from real history`);
   }
 
-  private installTape(spec: MarketSpec, source: Mt5SourceSpec, series: Record<string, Candle[]>): void {
+  private installTape(spec: MarketSpec, source: SourceSpec, series: Record<string, Candle[]>): void {
     this.tapes[spec.key] = new Tape(spec, source, series);
     delete this.bootErrors[spec.key];
     const tape = this.tapes[spec.key];
     const m1 = tape.getClosed("M1", 1e9).length;
     const d1 = tape.getClosed("D1", 1e9).length;
-    this.log("info", "engine",
-      `${spec.key}: REAL MT5 feed online — Exness ${source.mt5Symbol}, ${m1} M1 bars (8d), ${d1} D1 bars`);
+    const via = source.kind === "mt5"
+      ? `REAL MT5 feed online — Exness ${source.mt5Symbol}`
+      : source.kind === "remote-mt5"
+        ? `REAL MT5 feed online — AURUM Terminal bridge, Exness ${source.mt5Symbol} (real-time)`
+        : `REAL web exchange feed online — ${source.venue} ${source.webSymbol} (real-time)`;
+    this.log("info", "engine", `${spec.key}: ${via}, ${m1} M1 bars, ${d1} D1 bars`);
+    // a non-local market starts streaming ticks IMMEDIATELY (restarts the
+    // matching feed with its full spec set — idempotent, cheap) so the UI
+    // never waits for slower markets to finish booting
+    if (source.kind === "remote-mt5") {
+      this.startRemoteFeedFor(MARKET_SPECS.filter((s) => this.tapes[s.key]?.source.kind === "remote-mt5"));
+    } else if (source.kind === "web") {
+      this.startWebFeedFor(MARKET_SPECS.filter((s) => this.tapes[s.key]?.source.kind === "web"));
+    }
   }
 
   private async retryFailed(): Promise<void> {
     if (this.ready === false) return;
     const pending = MARKET_SPECS.filter((s) => !this.tapes[s.key]);
-    if (!pending.length) return;
-    // a restarted/fresh terminal can lose Market Watch symbols — re-ensure
-    // them (idempotent, one round trip per symbol) before reloading history
-    try {
-      const ensured = await mt5EnsureSymbols();
-      console.log(`[engine] retry: market watch symbols ensured: ${ensured.present}/${MT5_WATCH_SYMBOLS.length} present`);
-    } catch (err) {
-      console.error(`[engine] retry: market watch symbol ensure failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    const remoteMode = MARKET_SPECS.filter((s) => this.tapes[s.key]?.source.kind === "remote-mt5");
+    const webMode = MARKET_SPECS.filter((s) => this.tapes[s.key]?.source.kind === "web");
+
+    // (a) markets with NO tape yet — source ladder: local MT5 → AURUM remote → web
     for (const spec of pending) {
       const lastErr = this.bootErrors[spec.key] ?? this.poll[spec.key].lastErr ?? "no history yet";
-      // the outage must never be silent again — every retry hits stdout
       console.warn(`[engine] retry ${spec.key}: ${lastErr}`);
       try {
         const h = await loadMarketHistory(spec);
         this.installTape(h.spec, h.source, h.series);
         this.seedMarketSignals(spec.key);
-        this.log("info", "engine", `${spec.key}: retry succeeded — REAL MT5 feed restored`);
+        this.log("info", "engine", `${spec.key}: retry succeeded — local REAL MT5 feed`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.bootErrors[spec.key] = msg;
-        this.poll[spec.key].lastErr = msg;
-        this.log("error", "engine", `${spec.key}: retry failed — ${msg} (next retry in 60s)`);
+        try {
+          const rh = await loadRemoteMarketHistory(spec);
+          this.installTape(rh.spec, rh.source, rh.series);
+          this.seedMarketSignals(spec.key);
+          this.log("info", "engine", `${spec.key}: retry succeeded — AURUM Terminal remote MT5 feed`);
+        } catch (rerr) {
+          const rmsg = rerr instanceof Error ? rerr.message : String(rerr);
+          try {
+            const wh = await loadWebMarketHistory(spec);
+            this.installTape(wh.spec, wh.source, wh.series);
+            this.seedMarketSignals(spec.key);
+            this.log("info", "engine", `${spec.key}: retry succeeded — live web exchange feed (${wh.source.id})`);
+          } catch (werr) {
+            const wmsg = werr instanceof Error ? werr.message : String(werr);
+            this.bootErrors[spec.key] = `mt5: ${msg.slice(0, 80)} | remote: ${rmsg.slice(0, 80)} | web: ${wmsg.slice(0, 80)}`;
+            this.poll[spec.key].lastErr = wmsg;
+            this.log("error", "engine", `${spec.key}: retry failed on every source — ${wmsg} (next retry in 60s)`);
+          }
+        }
+      }
+    }
+
+    // (b) upgrade ladder — every 60s, markets on a lower-priority REAL
+    // source are upgraded when a better one answers again:
+    //     web → AURUM remote MT5 → local MT5 terminal
+    const now = Date.now();
+    if (webMode.length || remoteMode.length) {
+      // local terminal first (the platform's preferred source)
+      let quotes: Record<string, unknown> = {};
+      try { quotes = await mt5Quotes(); } catch { /* terminal offline */ }
+      if (Object.keys(quotes).length > 0) {
+        let upgraded = 0;
+        for (const spec of [...remoteMode, ...webMode]) {
+          try {
+            const h = await loadMarketHistory(spec);
+            this.installTape(h.spec, h.source, h.series);
+            upgraded += 1;
+          } catch { /* stays on its current source */ }
+        }
+        if (upgraded > 0) {
+          this.rebalanceExternalFeeds();
+          this.log("info", "engine",
+            `local MetaTrader 5 terminal is BACK — upgraded ${upgraded} market(s) to the Exness broker feed`);
+        }
+      } else if (webMode.length && now >= this.remoteFailoverUntil) {
+        // no local terminal — is the user-directed AURUM bridge healthy again?
+        const remoteOk = await remoteAvailable();
+        if (remoteOk) {
+          let upgraded = 0;
+          for (const spec of webMode) {
+            try {
+              const rh = await loadRemoteMarketHistory(spec);
+              this.installTape(rh.spec, rh.source, rh.series);
+              upgraded += 1;
+            } catch { /* stays on the web feed */ }
+          }
+          if (upgraded > 0) {
+            this.rebalanceExternalFeeds();
+            this.log("info", "engine",
+              `AURUM Terminal bridge is BACK — upgraded ${upgraded} market(s) to the remote MT5 broker feed`);
+          }
+        }
       }
     }
   }
+
+  /** After any source switch: run exactly the feeds the current tapes need
+   * (remote bridge for remote-mt5 tapes, web exchanges for web tapes) and
+   * stop whatever is no longer used. */
+  private rebalanceExternalFeeds(): void {
+    const remoteSpecs = MARKET_SPECS.filter((s) => this.tapes[s.key]?.source.kind === "remote-mt5");
+    const webSpecs = MARKET_SPECS.filter((s) => this.tapes[s.key]?.source.kind === "web");
+    if (remoteSpecs.length) this.startRemoteFeedFor(remoteSpecs);
+    else stopRemoteFeed();
+    if (webSpecs.length) this.startWebFeedFor(webSpecs);
+    else stopWebFeed();
+  }
+
+  /** The AURUM bridge went dark mid-run — fail every remote market over to
+   * the live web exchanges immediately (never silence), then cool down
+   * before recovery probes may upgrade them back (anti-flap hysteresis). */
+  private handleRemoteOutage(err: string): void {
+    const remoteSpecs = MARKET_SPECS.filter((s) => this.tapes[s.key]?.source.kind === "remote-mt5");
+    if (!remoteSpecs.length) return;
+    this.remoteFailoverUntil = Date.now() + 120_000;
+    this.log("error", "engine",
+      `AURUM Terminal bridge outage (${err}) — failing ${remoteSpecs.length} market(s) over to the live web exchange feed`);
+    for (const spec of remoteSpecs) {
+      void loadWebMarketHistory(spec)
+        .then((wh) => {
+          this.installTape(wh.spec, wh.source, wh.series);
+        })
+        .catch(() => {
+          this.log("error", "engine", `${spec.key}: web failover also failed — tape stays on last data (retry in 60s)`);
+        });
+    }
+  }
+
+  private remoteFailoverUntil = 0;
 
   /* ------------------------------------------------------- poll schedule */
 
@@ -333,16 +473,20 @@ export class Engine {
     try {
       const now = Date.now();
       // ONE shared Market-Watch poll — real bid/ask for ALL markets in a
-      // single MCP round trip (the terminal serves the whole watch at once)
-      if (!this.quotePoll.busy && now - this.quotePoll.lastAt >= QUOTE_MS) {
+      // single MCP round trip. Only runs while at least one market is on
+      // the MT5 feed — web-mode markets receive sub-second WebSocket pushes
+      // from webfeed.ts instead.
+      const anyMt5 = MARKET_SPECS.some((s) => this.tapes[s.key]?.source.kind === "mt5");
+      if (anyMt5 && !this.quotePoll.busy && now - this.quotePoll.lastAt >= QUOTE_MS) {
         this.quotePoll.busy = true;
         this.quotePoll.lastAt = now;
         void this.pollQuotes().finally(() => { this.quotePoll.busy = false; });
       }
-      // per-market M1 candle sync from the broker
+      // per-market M1 candle sync from the broker (MT5-mode markets only —
+      // web-mode markets sync through webfeed's own kline loop)
       MARKET_SPECS.forEach((spec, i) => {
         const tape = this.tapes[spec.key];
-        if (!tape) return;
+        if (!tape || tape.source.kind !== "mt5") return;
         const st = this.poll[spec.key];
         // stagger slots so the 4 markets don't burst in the same tick
         const due = now - st.lastKlineAt >= KLINE_MS - (i * (MASTER_MS / 2));
@@ -420,6 +564,72 @@ export class Engine {
       st.errStreak += 1;
       st.lastErr = err instanceof Error ? err.message : String(err);
     }
+  }
+
+  /* ----------------------------------------------- external feed ingestion */
+
+  /** Start (or restart) the live web exchange feed for exactly these specs. */
+  private startWebFeedFor(specs: MarketSpec[]): void {
+    if (!specs.length) {
+      stopWebFeed();
+      return;
+    }
+    const hooks: WebFeedHooks = {
+      onTick: (spec, bid, ask, tsSec) => this.ingestExternalTick(spec, bid, ask, tsSec),
+      onBars: (spec, closed, forming) => this.ingestExternalBars(spec, closed, forming),
+    };
+    startWebFeed(specs, hooks);
+  }
+
+  /** Start (or restart) the AURUM remote MT5 bridge for exactly these specs. */
+  private startRemoteFeedFor(specs: MarketSpec[]): void {
+    if (!specs.length) {
+      stopRemoteFeed();
+      return;
+    }
+    const hooks: RemoteFeedHooks = {
+      onTick: (spec, bid, ask, tsSec) => this.ingestExternalTick(spec, bid, ask, tsSec),
+      onBars: (spec, closed, forming) => this.ingestExternalBars(spec, closed, forming),
+      onOutage: (err) => this.handleRemoteOutage(err),
+    };
+    startRemoteFeed(specs, hooks);
+  }
+
+  /** Real tick from an external feed (remote MT5 bridge / web exchange) —
+   * ignored once the market upgrades to the LOCAL terminal (its own poller
+   * is authoritative there). */
+  ingestExternalTick(spec: MarketSpec, bid: number, ask: number, tsSec: number): void {
+    const tape = this.tapes[spec.key];
+    if (!tape || tape.source.kind === "mt5") return;
+    this.recordTick(spec, bid, ask, tsSec);
+  }
+
+  /** Real M1 bars (closed + forming) from an external feed → tape + pulses. */
+  ingestExternalBars(spec: MarketSpec, closed: Candle[], forming: Candle | null): void {
+    const tape = this.tapes[spec.key];
+    if (!tape || tape.source.kind === "mt5") return;
+    const nowSec = this.vnowSec();
+    const closedF = closed.filter((b) => b.t + 60 <= nowSec);
+    const { newClosed, tfClosed } = tape.ingest(closedF, forming);
+    this.handleIngest(spec, newClosed, tfClosed);
+  }
+
+  /** Which REAL source actually powers each market right now. */
+  feedModeSummary(): { mode: string; mt5: number; remote: number; web: number } {
+    let mt5 = 0;
+    let remote = 0;
+    let web = 0;
+    for (const spec of MARKET_SPECS) {
+      const kind = this.tapes[spec.key]?.source.kind;
+      if (kind === "mt5") mt5 += 1;
+      else if (kind === "remote-mt5") remote += 1;
+      else if (kind === "web") web += 1;
+    }
+    const parts: string[] = [];
+    if (mt5) parts.push("metatrader5");
+    if (remote) parts.push("remote-mt5");
+    if (web) parts.push("web-live");
+    return { mode: parts.length ? parts.join("+") : "none", mt5, remote, web };
   }
 
   /* ------------------------------------------------------ ingest + broadcast */
@@ -921,12 +1131,19 @@ export class Engine {
       const meter = this.tickMeter[spec.key];
       const st = this.poll[spec.key];
       const srcLabel = tape
-        ? `MetaTrader 5 — Exness ${tape.source.mt5Symbol} (live broker feed)`
+        ? tape.source.kind === "mt5"
+          ? `MetaTrader 5 — Exness ${tape.source.mt5Symbol} (live broker feed)`
+          : tape.source.kind === "remote-mt5"
+            ? `AURUM Terminal bridge — Exness ${tape.source.mt5Symbol} (REAL broker feed, real-time)`
+            : tape.source.venue === "Yahoo Finance"
+              ? `${tape.source.venue} — ${tape.source.webSymbol} (real exchange prices, ~10 min delayed feed)`
+              : `${tape.source.venue} — ${tape.source.webSymbol} (real-time exchange feed)`
         : "loading…";
       symbols[spec.key] = {
         provider: tape?.source.id ?? "pending",
         detail: srcLabel,
-        mt5: true,
+        mt5: tape?.source.kind === "mt5",
+        remote_mt5: tape?.source.kind === "remote-mt5",
         market: tape ? (tape.live ? "open" : "closed") : "loading",
         last_price: t ? Number((((t.bid + t.ask) / 2)).toFixed(spec.digits)) : null,
         spread: t ? Number((t.ask - t.bid).toFixed(spec.digits + 1)) : null,

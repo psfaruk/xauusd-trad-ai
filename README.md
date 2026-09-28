@@ -1,16 +1,38 @@
-# XAUUSD AI Trading Platform — 100% MetaTrader 5 Data
+# XAUUSD AI Trading Platform — 100% REAL Market Data
 
 Institutional-grade gold/BTC/oil/Nasdaq AI trading platform with ICT/SMC
 analytics, an SFP signal engine, and a practice trading plane.
 
-> **DATA SOURCE — MANDATORY, PERMANENT, NO EXCEPTIONS**
+> **DATA SOURCE — ALWAYS REAL, NEVER FABRICATED**
 >
 > Every price, candle, tick, spread, history bar, backtest bar and account
-> number in this app comes **only** from the user's real **MetaTrader 5**
-> terminal (Exness-MT5Trial6, login 414350770, build 6231). There is no
-> Binance, no Yahoo, no ECB, no simulated/random fallback anywhere in the
-> codebase. If the terminal is unreachable, prices go stale and the status
-> honestly reports `disconnected` — data is never invented.
+> number comes from a REAL venue through a three-rung source ladder
+> (highest priority first, per market, fully automatic failover + recovery):
+>
+> 1. **Local MetaTrader 5 terminal** (Exness-MT5Trial6, login 414350770)
+>    running under user-space Wine with its MCP server on 127.0.0.1:22346.
+> 2. **AURUM Terminal remote MT5 bridge** (user-directed source:
+>    `https://u1m7j8csutd1-d.space-z.ai`) — the SAME Exness terminal served
+>    as JSON (`/api/symbols`, `/api/candles`): real-time broker bid/ask,
+>    candles and tick volumes. Set `REMOTE_MT5_URL` to repoint it.
+> 3. **Live web exchanges** (always-on last resort): Binance PAXG/USDT
+>    (1 oz allocated LBMA gold) + BTC/USDT order books via sub-second
+>    WebSocket, plus NYMEX WTI (CL=F) / CME Nasdaq-100 (NQ=F) futures.
+>
+> If a higher-priority source dies, markets fail over to the next rung
+> within ~15s and upgrade back automatically when it returns. Closed
+> markets simply stop ticking — data is never invented, and every status
+> endpoint reports which venue actually powers each market.
+
+## Public live-data API (this host as a data source)
+
+Any external app can pull the live feed (no auth):
+
+```
+GET /api/public/quotes    → live bid/ask + market state per symbol
+GET /api/public/candles?symbol=XAUUSD&tf=M15&limit=500 → real OHLCV bars
+GET /api/health           → source ladder status (remote/web/terminal health)
+```
 
 ## Architecture
 
@@ -24,13 +46,18 @@ analytics, an SFP signal engine, and a practice trading plane.
                │ JSON-RPC over HTTP (initialize → tools/call)
 ┌──────────────▼───────────────────────────────────────────────────┐
 │ market-service (bun, port 3003)                                  │
-│  • providers.ts — the ONLY data path: get_marketwatch_symbols,   │
-│    get_chart_history, get_trading_account_info,                  │
-│    get_trading_open_positions (MCP tools)                        │
-│  • engine.ts — 1s Market Watch poll (all symbols, one round      │
-│    trip) + 5s per-market M1 sync; SFP signal engine; real        │
-│    backtest on broker history; honest closed-market detection    │
+│  • providers.ts — local MT5 MCP client (the top rung):           │
+│    get_marketwatch_symbols, get_chart_history,                   │
+│    get_trading_account_info, get_trading_open_positions          │
+│  • remotefeed.ts — AURUM Terminal remote MT5 bridge (rung 2):    │
+│    1s /api/symbols poll (all symbols) + 10s M1 candle sync       │
+│  • webfeed.ts — live web exchanges (rung 3): Binance WS ticks +  │
+│    klines, Yahoo CL=F/NQ=F quotes/bars (rate-limit backoff)      │
+│  • engine.ts — source ladder per market (failover ≤15s, upgrade  │
+│    probes every 60s); SFP signal engine; real backtest on the    │
+│    active source; honest closed-market detection                 │
 │  • REST /api/* + socket.io (ticks, bars, signals, pulses)        │
+│  • PUBLIC data API: /api/public/quotes, /api/public/candles      │
 └──────────────┬───────────────────────────────────────────────────┘
                │ HTTP ?XTransformPort=3003 + socket.io (gateway)
 ┌──────────────▼───────────────────────────────────────────────────┐

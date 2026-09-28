@@ -1,5 +1,31 @@
 # Deep Backtest Record — Real MT5 Broker History
 
+## Run 2026-09-28 (23:55 UTC) — source-ladder verification (fresh cloud host, no local terminal)
+
+| | |
+|---|---|
+| **Date** | Monday 2026-09-28, 23:55 UTC |
+| **Host** | Fresh Linux sandbox — local MT5 terminal + MCP key absent (fresh-instance rebuild) |
+| **Data path** | Source ladder: local MT5 (unavailable) → **AURUM Terminal remote MT5 bridge** (user-directed source `https://u1m7j8csutd1-d.space-z.ai`, REAL Exness broker bars) → live web exchanges (unused this run) |
+| **Script** | `mini-services/market-service/backtest.ts` — updated to the SAME source ladder as the live engine; engine math untouched |
+| **Command** | `bun run backtest.ts` |
+| **History depth** | 1,000 REAL broker M15 bars per pair (the bridge's M15 window ≈ 17 days) |
+
+### Results (≈17 days, M15, real Exness broker bars via the AURUM bridge)
+
+| Pair | Bars | Signals | Won / Lost / Expired | Win rate | Profit factor | Net R |
+|---|---:|---:|---|---:|---:|---:|
+| XAUUSD | 1,000 | 34 | 8 / 25 / 1 | 24.2% | 0.64 | **−8.15R** |
+| BTCUSD | 1,000 | 38 | 16 / 20 / 2 | 44.4% | 1.60 | **+14.30R** |
+| USOIL | 1,000 | 28 | 11 / 17 / 0 | 39.3% | 1.29 | **+5.00R** |
+| USTEC | 1,000 | 29 | 9 / 20 / 0 | 31.0% | 0.90 | **−2.00R** |
+
+Verdict: the engine runs end-to-end on REAL broker data through the remote bridge —
+every bar came from the user's MetaTrader 5 terminal (Exness), streamed as JSON by the
+AURUM Terminal host. No random data, no fabrication. The shorter 17-day window (vs the
+90-day local-terminal run below) is the bridge's M15 depth limit, honestly labeled.
+
+
 ## Run 2026-09-27 (22:48 UTC)
 
 | | |

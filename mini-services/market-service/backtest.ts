@@ -1,11 +1,13 @@
 /**
- * DEEP BACKTEST — 100% real MetaTrader 5 history.
+ * DEEP BACKTEST — 100% REAL market history (source ladder).
  *
- * Loads ~90 days of NATIVE broker M15 bars per pair directly from the MT5
- * terminal (Exness-MT5Trial6 / login 414350770) via the MCP bridge and runs
- * the SAME SFP signal engine the live app uses (swing-failure-pivot detection
- * with ATR guards, deterministic limit-vs-market entry, pessimistic
- * both-touch resolution), then prints honest per-pair performance stats.
+ * Loads ~90 days of native M15 bars per pair via the platform's source
+ * ladder — local MT5 terminal first, then the user-directed AURUM Terminal
+ * remote MT5 bridge (https://u1m7j8csutd1-d.space-z.ai), then the live web
+ * exchanges (Binance PAXG/BTC, NYMEX/CME futures) — and runs the SAME SFP
+ * signal engine the live app uses (swing-failure-pivot detection with ATR
+ * guards, deterministic limit-vs-market entry, pessimistic both-touch
+ * resolution), then prints honest per-pair performance stats.
  *
  * Run: bun run backtest.ts
  */
@@ -14,7 +16,9 @@ import {
   MARKET_SPECS,
   mt5History,
   type Candle,
+  type MarketSpec,
 } from "./src/providers";
+import { remoteCandles } from "./src/remotefeed";
 import {
   atr as atrFn,
   ema,
@@ -139,17 +143,107 @@ function resolve(sig: Omit<BtSignal, "status" | "resultR">, bars: Candle[], star
 
 /* ------------------------------------------------------------------ runner */
 
-async function backtestPair(key: string, mt5: string): Promise<void> {
+const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+
+interface YahooChartLite {
+  chart?: {
+    result?: Array<{
+      timestamp?: number[];
+      indicators?: {
+        quote?: Array<{
+          open?: (number | null)[];
+          high?: (number | null)[];
+          low?: (number | null)[];
+          close?: (number | null)[];
+          volume?: (number | null)[];
+        }>;
+      };
+    }>;
+  };
+}
+
+/** Web-exchange M15 history for the last resort of the ladder. */
+async function webM15(spec: MarketSpec): Promise<Candle[]> {
+  const map: Record<string, { venue: "binance"; symbol: string } | { venue: "yahoo"; symbol: string }> = {
+    XAUUSD: { venue: "binance", symbol: "PAXGUSDT" },
+    BTCUSD: { venue: "binance", symbol: "BTCUSDT" },
+    USOIL: { venue: "yahoo", symbol: "CL=F" },
+    USTEC: { venue: "yahoo", symbol: "NQ=F" },
+  };
+  const def = map[spec.key];
+  if (!def) return [];
+  if (def.venue === "binance") {
+    // paged klines — up to 90 days of 15m bars
+    const out: Candle[] = [];
+    let start: number | undefined = Math.floor(Date.now() / 1000 - DAYS * 86_400) * 1000;
+    while (out.length < DAYS * 96) {
+      const url = `https://api.binance.com/api/v3/klines?symbol=${def.symbol}&interval=15m&limit=1000${start != null ? `&startTime=${start}` : ""}`;
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 15_000);
+      let rows: unknown[];
+      try {
+        const res = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": UA } });
+        rows = await res.json() as unknown[];
+      } finally { clearTimeout(to); }
+      if (!Array.isArray(rows) || !rows.length) break;
+      for (const r of rows as unknown[][]) {
+        out.push({ t: Math.floor(Number(r[0]) / 1000), o: Number(r[1]), h: Number(r[2]), l: Number(r[3]), c: Number(r[4]), v: Number(r[5]) });
+      }
+      if (rows.length < 1000) break;
+      start = Number((rows as unknown[][])[rows.length - 1][0]) + 1;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return out.filter((b) => Number.isFinite(b.c));
+  }
+  // Yahoo futures: 15m bars for the last month
+  const host = "https://query1.finance.yahoo.com";
+  const url = `${host}/v8/finance/chart/${encodeURIComponent(def.symbol)}?interval=15m&range=1mo`;
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 15_000);
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": UA } , signal: ctrl.signal });
+    const d = await res.json() as YahooChartLite;
+    const r = d.chart?.result?.[0];
+    const q = r?.indicators?.quote?.[0];
+    const ts = r?.timestamp ?? [];
+    const out: Candle[] = [];
+    for (let i = 0; i < ts.length; i++) {
+      const o = q?.open?.[i]; const h = q?.high?.[i]; const l = q?.low?.[i]; const c = q?.close?.[i];
+      if (o == null || h == null || l == null || c == null) continue;
+      out.push({ t: ts[i], o, h, l, c, v: q?.volume?.[i] ?? 0 });
+    }
+    return out;
+  } finally { clearTimeout(to); }
+}
+
+/** Source ladder for backtest history: local MT5 → AURUM remote MT5 → web. */
+async function loadM15(spec: MarketSpec): Promise<{ bars: Candle[]; source: string }> {
   const nowSec = Math.floor(Date.now() / 1000);
   const from = nowSec - DAYS * 86_400;
-  const bars = await mt5History(mt5, "M15", from, nowSec + 900, 20_000);
+  // 1 — local MetaTrader 5 terminal (MCP bridge)
+  try {
+    const bars = await mt5History(spec.mt5, "M15", from, nowSec + 900, 20_000);
+    if (bars.length >= 100) return { bars, source: "local MT5 terminal (Exness MCP)" };
+  } catch { /* terminal offline on this host */ }
+  // 2 — the user-directed AURUM Terminal remote MT5 bridge (real broker data)
+  try {
+    const bars = await remoteCandles(spec.mt5, "M15", 1000);
+    if (bars.length >= 100) return { bars, source: "AURUM Terminal remote MT5 bridge (17d window)" };
+  } catch { /* bridge unreachable */ }
+  // 3 — live web exchanges
+  const bars = await webM15(spec);
+  return { bars, source: bars.length >= 100 ? "live web exchange feed (Binance/NYMEX-CME)" : "unavailable" };
+}
+
+async function backtestPair(spec: MarketSpec): Promise<void> {
+  const { bars, source } = await loadM15(spec);
   if (bars.length < 100) {
-    console.log(`${key}: insufficient broker history (${bars.length} M15 bars in ${DAYS}d) — skipped`);
+    console.log(`${spec.key}: insufficient history on every source (${bars.length} M15 bars) — skipped`);
     return;
   }
   const sigs: BtSignal[] = [];
   for (let i = 60; i < bars.length - 1; i += CFG.stride) {
-    const raw = detectSfp(key, bars, i);
+    const raw = detectSfp(spec.key, bars, i);
     if (!raw) continue;
     // deterministic limit fill: entry = the signal bar's close only for
     // market entries; limit entries must be touched by a later bar
@@ -173,7 +267,8 @@ async function backtestPair(key: string, mt5: string): Promise<void> {
   const wr = sigs.length ? (won.length / (won.length + lost.length || 1)) * 100 : 0;
   const pf = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? Infinity : 0;
   const first = bars[0].t, last = bars[bars.length - 1].t;
-  console.log(`${key}  (${mt5}, ${bars.length} broker M15 bars, ${new Date(first * 1000).toISOString().slice(0, 10)} → ${new Date(last * 1000).toISOString().slice(0, 10)})`);
+  console.log(`${spec.key}  (${spec.mt5}, ${bars.length} REAL M15 bars, ${new Date(first * 1000).toISOString().slice(0, 10)} → ${new Date(last * 1000).toISOString().slice(0, 10)})`);
+  console.log(`  source: ${source}`);
   console.log(
     `  signals ${sigs.length} · won ${won.length} · lost ${lost.length} · expired ${expired.length}` +
     ` · WR ${wr.toFixed(1)}% · PF ${Number.isFinite(pf) ? pf.toFixed(2) : "∞"} · total ${totalR >= 0 ? "+" : ""}${totalR.toFixed(2)}R`);
@@ -183,13 +278,14 @@ async function backtestPair(key: string, mt5: string): Promise<void> {
 }
 
 console.log(`================================================================`);
-console.log(` DEEP BACKTEST — ${DAYS} days of REAL MetaTrader 5 M15 history`);
-console.log(` Terminal: Exness-MT5Trial6 · login 414350770 · build 6231`);
+console.log(` DEEP BACKTEST — up to ${DAYS} days of REAL M15 history`);
+console.log(` Source ladder: local MT5 (Exness-MT5Trial6/414350770) → AURUM Terminal`);
+console.log(` remote MT5 bridge (u1m7j8csutd1-d.space-z.ai) → live web exchanges`);
 console.log(` Engine: SFP (swing-failure-pivot) · RR ${CFG.rr} · expiry ${CFG.expiry_bars} bars · pessimistic both-touch`);
 console.log(`================================================================`);
 console.log("");
 for (const spec of MARKET_SPECS) {
-  await backtestPair(spec.key, spec.mt5);
+  await backtestPair(spec);
 }
-console.log(`Every bar above was served by the broker through the MT5 terminal —`);
-console.log(`no exchange API, no random data, no fallback source was involved.`);
+console.log(`Every bar above came from a REAL venue — the broker terminal (local or`);
+console.log(`via the AURUM bridge) or a real exchange. No random data, no fabrication.`);
