@@ -110,36 +110,57 @@ bun run dev            # port 3000
 The repo deploys to [Railway](https://railway.app) as **one service running both
 processes**: the Next.js frontend (UI + the `/api/*` REST proxy) on the
 Railway-injected `$PORT`, and `market-service` (bun + socket.io) on `:3003`
-behind it — supervised by `railway-start.sh` (`railway.json` is the Railway v2
-config, Nixpacks builder, healthcheck on `/`).
+behind it — supervised by `railway-start.sh`. A **`Dockerfile`** is included
+(Railway auto-detects it) for a deterministic build environment; `railway.json`
+remains as the Nixpacks fallback config (healthcheck on `/`, ON_FAILURE
+restarts).
 
-**The honest data dependency:** live market data requires the MetaTrader 5
-terminal's MCP bridge reachable at `MT5_MCP_URL`. Railway containers **cannot**
-run the Wine/MT5 stack — run the `mt5-linux/` stack on any Linux VPS instead,
-tunnel its MCP port (e.g. `https://mt5.example.com`), and point the deployment
-at it, or host `market-service` next to the terminal and expose it directly.
-Everything else (UI, charts, auth, practice plane) runs fine in the cloud.
+> **⚠️ RAM requirement — the #1 cause of "deploy fail":**
+> `next build` peaks at **~0.7–0.8 GB RSS** for this app (webpack profile with
+> memory optimizations; Turbopack would need ~1.1 GB). On a **512 MB** plan the
+> build step itself is **OOM-killed and the deploy fails before the app ever
+> boots**. Set the service to **at least 1 GB — 2 GB recommended** (Railway →
+> service Settings → Memory) *before* deploying. Runtime idles well under that
+> (Next standalone ~150 MB + market-service ~100–200 MB).
+
+**Real-time data on the cloud — always on, never fabricated.** The
+market-service walks a data-source ladder per market, so no Wine/MT5 terminal
+is required in the container:
+
+1. local MT5 MCP bridge (`MT5_MCP_URL`, default `127.0.0.1:22346` — absent on
+   cloud, skipped automatically);
+2. the **AURUM remote MT5 bridge** (`REMOTE_MT5_URL`, default
+   `https://u1m7j8csutd1-d.space-z.ai`) — real Exness broker ticks;
+3. **live web exchanges** — Binance order-book WebSocket (PAXG 1oz-gold, BTC,
+   sub-second) + NYMEX WTI / CME Nasdaq futures.
+
+It auto-upgrades back up the ladder whenever a higher rung recovers, and the
+public JSON API (`/api/public/quotes`, `/api/public/candles`) is served from
+whatever rung is live.
 
 Deploy steps:
 
-1. Fork this repo.
-2. Railway → **New Project** → deploy the repo (railway.json is picked up
-   automatically).
-3. Set service variables **before the first build**:
-   - `MT5_MCP_URL` — the tunnelled MCP bridge of your VPS terminal
-   - `MT5_MCP_KEY` or `MT5_MCP_KEY_FILE` — the bridge bearer key
-   - `MT5_PASSWORD` — terminal login secret (never commit it)
-   - `NEXT_PUBLIC_MARKET_WS_URL` (optional) — a tunnelled market-service
-     origin for the websocket; without it the frontend uses the same host
-     it was served from. `NEXT_PUBLIC_*` values are **inlined at build
-     time** — change them, then redeploy.
-4. Deploy and verify `GET /api/health` on the Railway domain.
+1. Push this repo to GitHub (main branch).
+2. Railway → **New Project** → deploy the repo (Dockerfile is picked up
+   automatically; `railway.json` is used if the builder is pinned to Nixpacks).
+3. **Set service memory to ≥1 GB (2 GB recommended) — see the warning above.**
+4. Service variables — **all optional**, the defaults already stream live data:
+   - `REMOTE_MT5_URL` / `REMOTE_MT5_PORT` — the remote MT5 bridge to prefer
+     over web exchanges (default: the AURUM terminal).
+   - `MT5_MCP_URL` + `MT5_MCP_KEY` — only if you run your own MT5 terminal on
+     a VPS and tunnel its MCP bridge.
+   - `NEXT_PUBLIC_MARKET_WS_URL` — only if you host market-service separately;
+     without it the frontend uses the same origin it was served from.
+     `NEXT_PUBLIC_*` values are **inlined at build time** — change them, then
+     redeploy.
+5. Deploy and verify `GET /api/health` on the Railway domain — it reports the
+   active `data_source` (e.g. `remote-mt5` or `web-live`) honestly.
 
-Without a reachable MT5 terminal the app still boots and honestly reports
-"terminal unreachable / degraded" in its status endpoints and bridge
-diagnostics — **no price is ever fabricated** (see the data-source mandate
-above). Local/dev stays one command (`bun run dev`) in the sandbox where the
-terminal, market-service and gateway auto-start.
+If the terminal-side rungs are unreachable the app still boots and honestly
+reports the state in its status endpoints and bridge diagnostics — **no price
+is ever fabricated** (see the data-source mandate above). Local/dev stays one
+command (`bun run dev`) in the sandbox where the terminal, market-service and
+gateway auto-start.
 
 ## Backtest on REAL broker history
 

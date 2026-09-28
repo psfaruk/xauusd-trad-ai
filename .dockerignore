@@ -1,0 +1,35 @@
+# build context hygiene — keep the image build small and deterministic
+.git
+.gitignore
+**/node_modules
+.next
+out
+build
+coverage
+db
+*.log
+dev.log
+server.log
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.vercel
+.DS_Store
+.claude
+.z-ai-config
+tool-results
+upload
+skills
+examples
+tests
+download
+.zscripts
+# local runtime state of the MT5 watchdog (never needed on cloud)
+mt5-linux/mt5.env
+mt5-linux/*.pid
+mt5-linux/.watchdog.pid
+mt5-linux/.watchdog.lock
+mt5-linux/.keycheck
+mt5-linux/stack.log
+mt5-linux/launch.log

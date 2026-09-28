@@ -60,6 +60,12 @@ WD_PID_FILE="$SCRIPT_DIR/.watchdog.pid"
 # flock is authoritative. A plain `pgrep -f ensure-stack` check is NOT: session
 # wrappers (`bash -c "... ensure-stack.sh ..."`) and even this script's own
 # $() subshell forks carry the same cmdline string and phantom-match.
+# NOTE (fd-leak fix): `exec 200<>` fds ARE inherited by children (bash does
+# NOT mark them close-on-exec), so every detached child below spawns with an
+# explicit `200>&-` — otherwise a surviving child (Xvfb, wine, market-service)
+# keeps this flock held forever after the watchdog dies and no new watchdog
+# can ever start (silent `flock -n` exit). Verified live: Xvfb held the
+# orphaned lock exactly this way after its watchdog was killed.
 if command -v flock >/dev/null 2>&1; then
   exec 200<>"$LOCK_FILE" 2>/dev/null || true
   if [ -e "/proc/self/fd/200" ] && ! flock -n 200; then
@@ -105,13 +111,18 @@ svc_health() { curl -s -m 5 "$MARKET_SERVICE_URL" 2>/dev/null; }
 
 ensure_xvfb() {
   if xvfb_up; then return 0; fi
-  bash -c "setsid Xvfb $DISPLAY -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 </dev/null &"
+  # `200>&-` ON THE bash -c CALL: the command-scoped redirection closes the
+  # watchdog's lock fd in the spawned child AND every descendant (subshell,
+  # setsid, Xvfb) — the inner-string `200>&-` alone leaves the intermediate
+  # wrapper holding the fd (verified live: wrapper sat in do_wait on the
+  # service, keeping the flock after the watchdog died).
+  bash -c "setsid Xvfb $DISPLAY -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 </dev/null &" 200>&-
   sleep 1
   if xvfb_up; then wlog "xvfb: started :$DISPLAY"; else wlog "xvfb: FAILED to start :$DISPLAY"; fi
 }
 
 launch_terminal() { # double-fork: terminal survives this watchdog AND session cleanup
-  bash -c "setsid bash '$LAUNCHER' >> '$SCRIPT_DIR/launch.log' 2>&1 </dev/null &"
+  bash -c "setsid bash '$LAUNCHER' 200>&- >> '$SCRIPT_DIR/launch.log' 2>&1 </dev/null &" 200>&-
   sleep 2
 }
 
@@ -126,7 +137,7 @@ recover_terminal() { # terminal hung: full kill + fresh launch (auto-login)
 }
 
 relaunch_service() { # known-good pattern from worklog (task 6/7): intermediate-exit double-fork
-  bash -c "cd '$SERVICE_DIR' && setsid bun --hot src/index.ts >> service.log 2>&1 </dev/null &"
+  bash -c "cd '$SERVICE_DIR' && setsid bun --hot src/index.ts 200>&- >> service.log 2>&1 </dev/null &" 200>&-
 }
 
 wlog "watchdog started (pid $$, interval ${INTERVAL}s, repo $REPO_ROOT)"
@@ -198,5 +209,5 @@ while true; do
     tail -n 5000 "$STACK_LOG" > "$STACK_LOG.tmp" && mv -f "$STACK_LOG.tmp" "$STACK_LOG"
   fi
 
-  sleep "$INTERVAL"
+  sleep "$INTERVAL" 200>&- # lock fd closed here too: watchdog death releases the flock instantly
 done
