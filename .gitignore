@@ -66,3 +66,5 @@ mt5-linux/.watchdog.lock
 
 # Skills directory
 /skills/
+# never publish the local worklog (contains credentials history)
+worklog.md
